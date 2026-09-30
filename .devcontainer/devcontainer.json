@@ -1,0 +1,21 @@
+{
+  "name": "protolink",
+  "image": "rust:latest",
+  "remoteUser": "vscode",
+  "features": {
+    "ghcr.io/devcontainers/features/common-utils:2": {
+      "installZsh": "true",
+      "upgradePackages": "true",
+      "configureZshAsDefaultShell": "true"
+    },
+    "ghcr.io/devcontainers/features/git:1": {
+      "version": "latest",
+      "ppa": "false"
+    }
+  },
+  "postCreateCommand": [
+      "/bin/bash",
+      "-lc",
+      ".devcontainer/post-create-command.sh \"/workspaces/${localWorkspaceFolderBasename}\""
+  ]
+}
