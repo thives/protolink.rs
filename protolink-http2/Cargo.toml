@@ -1,0 +1,19 @@
+[package]
+name = "protolink-http2"
+version = "0.0.1"
+authors = [
+  "Thomas Ivesdal-Tronstad <>",
+]
+license = "MIT OR Apache-2.0"
+description = "Sans-IO, no_std + alloc HTTP/2 connection state machine used by protolink."
+repository = "https://github.com/thives/protolink.rs"
+keywords = ["http2", "embedded", "no_std", "sans-io"]
+edition = "2024"
+rust-version = "1.88"
+
+[dependencies]
+zerodds-http2 = { version = "1.0.0-rc.6", default-features = false, features = ["alloc"] }
+zerodds-hpack = { version = "1.0.0-rc.6", default-features = false, features = ["alloc"] }
+
+[features]
+std = []

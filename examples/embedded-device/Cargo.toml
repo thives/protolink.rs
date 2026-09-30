@@ -1,0 +1,21 @@
+[package]
+name = "embedded-device-example"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+description = "Embedded-style device telemetry and control over protolink gRPC."
+
+[dependencies]
+protolink = { path = "../../protolink", features = ["tokio", "blocking"] }
+micropb = { version = "0.6", features = ["alloc"] }
+tokio = { version = "1", features = ["rt", "macros", "net"] }
+
+[build-dependencies]
+protolink-grpc-gen = { path = "../../protolink-grpc-gen" }
+micropb-gen = "0.6"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "io-util", "net", "time"] }
+embedded-io-async = "0.7"
+embedded-io-adapters = { version = "0.7", features = ["tokio-1", "std"] }

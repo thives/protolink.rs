@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo check --release
+      - run: cargo check --release --workspace --all-features
 
   test:
     name: Run Tests
@@ -22,8 +22,18 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@nextest
       - run: |
-            cargo nextest r --all-features
-            cargo test --doc
+            cargo nextest r --workspace --all-features
+            cargo test --workspace --doc --all-features
+
+  miri:
+    name: Miri (ring buffer)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - run: cargo miri test --features portable-atomic --lib link::ring
 
   cross-check:
     name: Check Cross-Compilation
@@ -38,7 +48,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: "armv7-unknown-linux-gnueabihf, thumbv7em-none-eabihf"
-      - run: cargo check --release --target=${{matrix.target}} --no-default-features
+      - run: |
+            cargo check --release --target=${{matrix.target}} --no-default-features -p protolink -p protolink-grpc -p protolink-http2
+            cargo check --release --target=${{matrix.target}} --no-default-features --features async,blocking -p protolink -p protolink-grpc -p protolink-http2
 
   fmt:
     name: Check formatting
@@ -55,8 +67,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.87
-      - run: cargo check
+      - uses: dtolnay/rust-toolchain@1.88
+      - run: cargo check --workspace --all-features
 
   docs:
     name: Check Documentation Build
@@ -64,7 +76,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
-      - run: RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links -D missing_docs --cfg docsrs -Z unstable-options --generate-link-to-definition" cargo +nightly doc --all-features
+      - run: RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links -D missing_docs --cfg docsrs -Z unstable-options --generate-link-to-definition" cargo +nightly doc --workspace --all-features --no-deps
 
   clippy:
     name: Clippy
@@ -74,4 +86,4 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - run: cargo clippy -- -D warnings
+      - run: cargo clippy --workspace --all-features --all-targets -- -D warnings

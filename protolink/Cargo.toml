@@ -1,0 +1,64 @@
+[package]
+name = "protolink"
+version = "0.0.1"
+authors = [
+  "Thomas Ivesdal-Tronstad <>",
+]
+license = "MIT OR Apache-2.0"
+description = "Protolink is a gRPC framework that unifies embedded transports, framing, reliability, HTTP/2, gRPC bridging, and code generation."
+repository = "https://github.com/thives/protolink.rs"
+keywords = ["grpc", "embedded", "async", "protobuf", "proto"]
+edition = "2024"
+rust-version = "1.88"
+
+[dependencies]
+protolink-grpc = { version = "0.0.1", path = "../protolink-grpc" }
+embedded-io-async = { version = "0.7", optional = true }
+embedded-io = { version = "0.7", optional = true }
+cobs-io-async = { version = "0.0.3", default-features = false, features = ["embedded-io"], optional = true }
+arq-io-async = { version = "0.0.2", default-features = false, features = ["embedded-io"], optional = true }
+crc = { version = "3.4", optional = true }
+atomic-waker = { version = "1.1", optional = true }
+futures-util = { version = "0.3", optional = true, default-features = false }
+portable-atomic = { version = "1", optional = true, default-features = false }
+embedded-io-adapters = { version = "0.7", features = ["tokio-1"], optional = true }
+tokio = { version = "1", default-features = false, optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "io-util", "net", "time"] }
+critical-section = { version = "1", features = ["std"] }
+h2 = "0.4"
+http = "1"
+bytes = "1"
+
+[features]
+async = [
+    "dep:embedded-io-async",
+    "dep:cobs-io-async",
+    "dep:arq-io-async",
+    "dep:crc",
+    "dep:atomic-waker",
+]
+embedded-io = ["async"]
+blocking = ["dep:embedded-io"]
+tokio = ["std", "async", "dep:embedded-io-adapters", "dep:tokio"]
+portable-atomic = [
+    "async",
+    "dep:portable-atomic",
+    "atomic-waker/portable-atomic",
+    "futures-util/portable-atomic",
+]
+portable-atomic-critical-section = [
+    "portable-atomic",
+    "portable-atomic/critical-section",
+]
+std = [
+    "protolink-grpc/std",
+    "embedded-io-async?/std",
+    "embedded-io?/std",
+    "arq-io-async?/std",
+]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

@@ -1,0 +1,56 @@
+syntax = "proto3";
+
+package protolink.examples.embedded.device;
+
+message GetStatus {}
+
+message DeviceStatus {
+  uint64 uptime_ms = 1;
+  int32 temperature_milli_c = 2;
+  uint32 supply_millivolts = 3;
+}
+
+message SetOutput {
+  uint32 channel = 1;
+  bool enabled = 2;
+}
+
+message OutputState {
+  uint32 channel = 1;
+  bool enabled = 2;
+}
+
+message Restart {
+  uint32 delay_ms = 1;
+}
+
+message RestartAck {}
+
+message Command {
+  optional uint32 correlation_id = 1;
+  oneof command {
+    GetStatus get_status = 2;
+    SetOutput set_output = 3;
+    Restart restart = 4;
+  }
+}
+
+message Reply {
+  optional uint32 correlation_id = 1;
+  oneof reply {
+    DeviceStatus status = 2;
+    OutputState output_state = 3;
+    RestartAck restart_ack = 4;
+  }
+}
+
+message EventSubscribe {}
+
+message Event {
+  uint32 code = 1;
+}
+
+service Service {
+  rpc Command(Command) returns (Reply);
+  rpc EventSubscribe(EventSubscribe) returns (stream Event);
+}

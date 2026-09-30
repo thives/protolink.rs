@@ -1,13 +1,9 @@
-[package]
-name = "protolink"
-version = "0.0.1"
-authors = [
-  "Thomas Ivesdal-Tronstad <>",
+[workspace]
+members = [
+    "protolink",
+    "protolink-http2",
+    "protolink-grpc",
+    "protolink-grpc-gen",
+    "examples/embedded-device"
 ]
-license = "MIT OR Apache-2.0"
-description = "Protolink is a gRPC framework that unifies embedded transports, framing, reliability, HTTP/2, gRPC bridging, and code generation."
-repository = "https://github.com/thives/protolink.rs"
-keywords = ["grpc", "embedded", "io", "encoding", "async"]
-edition = "2024"
-rust-version = "1.87"
-
+resolver = "3"

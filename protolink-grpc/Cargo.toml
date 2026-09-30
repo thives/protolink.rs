@@ -1,0 +1,21 @@
+[package]
+name = "protolink-grpc"
+version = "0.0.1"
+authors = [
+  "Thomas Ivesdal-Tronstad <>",
+]
+license = "MIT OR Apache-2.0"
+description = "Sans-IO, no_std + alloc unary gRPC server/client core with micropb codec support."
+repository = "https://github.com/thives/protolink.rs"
+keywords = ["grpc", "embedded", "no_std", "protobuf", "micropb"]
+edition = "2024"
+rust-version = "1.88"
+
+[dependencies]
+protolink-http2 = { version = "0.0.1", path = "../protolink-http2" }
+micropb = { version = "0.6", default-features = false, features = ["alloc", "encode", "decode"], optional = true }
+
+[features]
+default = ["micropb"]
+micropb = ["dep:micropb"]
+std = ["protolink-http2/std"]

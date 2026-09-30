@@ -1,0 +1,20 @@
+[package]
+name = "protolink-grpc-gen"
+version = "0.0.1"
+authors = [
+  "Thomas Ivesdal-Tronstad <>",
+]
+license = "MIT OR Apache-2.0"
+description = "Generates protolink gRPC service traits, servers and clients for micropb messages."
+repository = "https://github.com/thives/protolink.rs"
+keywords = ["grpc", "protobuf", "micropb", "codegen", "embedded"]
+edition = "2024"
+rust-version = "1.88"
+
+[[bin]]
+name = "protolink-grpc-gen"
+path = "src/main.rs"
+
+[dependencies]
+protobuf = "3"
+protobuf-parse = "3"
