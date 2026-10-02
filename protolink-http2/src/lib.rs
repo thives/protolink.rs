@@ -12,12 +12,30 @@
 //! - partial-frame buffering across arbitrary read boundaries,
 //! - header blocks split over CONTINUATION frames, padding and priority fields,
 //! - send-side flow control (connection + stream windows, WINDOW_UPDATE),
-//! - receive-side window replenishment,
+//! - receive-side flow control, either replenished automatically or released by
+//!   the application ([`FlowControl::Manual`]),
 //! - RST_STREAM, GOAWAY and connection error handling.
 //!
 //! The [`Connection`] never performs I/O. Feed received bytes with
 //! [`Connection::recv`], drain produced events with [`Connection::poll_event`]
 //! and write [`Connection::pending_output`] to the transport.
+//!
+//! # Streaming and backpressure
+//!
+//! Long-lived streams need bounded buffering in both directions:
+//!
+//! - **Sending.** [`Connection::send_data`] never blocks; data beyond the
+//!   peer's flow-control window is queued inside the connection. Use
+//!   [`Connection::queued_send_bytes`] / [`Connection::send_capacity`] to apply
+//!   a high-water mark, and [`Connection::poll_send_ready`] to learn which
+//!   streams made progress after [`Connection::recv`].
+//! - **Receiving.** With [`FlowControl::Manual`], received DATA is only credited
+//!   back to the peer when the application calls
+//!   [`Connection::release_capacity`], so unconsumed data per stream is bounded
+//!   by [`Config::initial_window_size`] without stalling other streams.
+//! - **Closing.** [`Connection::reset_stream_after_flush`] sends RST_STREAM only
+//!   once all queued DATA and trailers have been written, as needed by a server
+//!   that finishes before the client half-closes.
 //!
 //! Server push is not supported (clients advertise `SETTINGS_ENABLE_PUSH = 0`).
 #![no_std]
@@ -29,7 +47,7 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;
 use core::fmt;
 
@@ -48,6 +66,8 @@ pub use zerodds_http2::{ErrorCode, StreamId};
 const FRAME_HEADER_LEN: usize = 9;
 const MAX_WINDOW: i64 = 0x7fff_ffff;
 const DEFAULT_MAX_FRAME_SIZE: u32 = 16_384;
+/// Initial flow-control window defined by RFC 9113 §6.9.2.
+const DEFAULT_WINDOW: i64 = 65_535;
 
 /// Which side of the connection this endpoint is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +76,26 @@ pub enum Role {
     Client,
     /// Accepts streams.
     Server,
+}
+
+/// How received DATA is credited back to the peer (receive-side flow control).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FlowControl {
+    /// Every received DATA frame is acknowledged with WINDOW_UPDATE frames as
+    /// soon as it is parsed, whether or not the application has consumed it.
+    /// The peer is never throttled.
+    #[default]
+    Automatic,
+    /// Receive windows are tracked per stream and per connection. Bytes
+    /// delivered in [`Event::Data`] are only credited back to the peer once
+    /// the application calls [`Connection::release_capacity`]. Overrunning a
+    /// stream window resets that stream with `FLOW_CONTROL_ERROR`; overrunning
+    /// the connection window is a connection error.
+    ///
+    /// Padding, DATA on closed or reset streams and DATA discarded by
+    /// [`Connection::reset_stream_after_flush`] are released automatically, as
+    /// is any capacity still held by a stream when it closes or is reset.
+    Manual,
 }
 
 /// Local connection limits, advertised to the peer in the initial SETTINGS frame.
@@ -67,6 +107,16 @@ pub struct Config {
     pub initial_window_size: u32,
     /// `SETTINGS_MAX_HEADER_LIST_SIZE`. Larger header lists reset the stream.
     pub max_header_list_size: u32,
+    /// Connection-level receive window. HTTP/2 starts every connection at
+    /// 65 535 bytes; larger values are announced with a WINDOW_UPDATE right
+    /// after our SETTINGS. Smaller values are treated as 65 535.
+    ///
+    /// With [`FlowControl::Manual`], set this to at least
+    /// `max_concurrent_streams * initial_window_size` so that one stream whose
+    /// data is not being consumed cannot starve the others.
+    pub connection_window_size: u32,
+    /// Receive-side flow-control mode.
+    pub flow_control: FlowControl,
 }
 
 impl Default for Config {
@@ -75,6 +125,8 @@ impl Default for Config {
             max_concurrent_streams: 8,
             initial_window_size: 65_535,
             max_header_list_size: 8 * 1024,
+            connection_window_size: 65_535,
+            flow_control: FlowControl::Automatic,
         }
     }
 }
@@ -169,15 +221,42 @@ struct Stream {
     state: StreamState,
     send_window: i64,
     outbound: VecDeque<Outbound>,
+    /// Our receive window as the peer sees it ([`FlowControl::Manual`] only).
+    recv_window: i64,
+    /// Bytes delivered in [`Event::Data`] but not yet released
+    /// ([`FlowControl::Manual`] only).
+    unreleased: usize,
+    /// Send RST_STREAM with this code once `outbound` has drained.
+    reset_after_flush: Option<ErrorCode>,
 }
 
 impl Stream {
-    fn new(send_window: i64) -> Self {
+    fn new(send_window: i64, recv_window: i64) -> Self {
         Self {
             state: StreamState::Idle,
             send_window,
             outbound: VecDeque::new(),
+            recv_window,
+            unreleased: 0,
+            reset_after_flush: None,
         }
+    }
+
+    fn can_send(&self) -> bool {
+        matches!(
+            self.state,
+            StreamState::Open | StreamState::HalfClosedRemote
+        ) && self.reset_after_flush.is_none()
+    }
+
+    fn queued_bytes(&self) -> usize {
+        self.outbound
+            .iter()
+            .map(|o| match o {
+                Outbound::Data { buf, offset, .. } => buf.len() - offset,
+                Outbound::Headers { .. } => 0,
+            })
+            .sum()
     }
 
     fn apply(&mut self, ev: StreamEvent) -> bool {
@@ -214,6 +293,12 @@ pub struct Connection {
     awaiting_peer_settings: bool,
     streams: BTreeMap<StreamId, Stream>,
     conn_send_window: i64,
+    /// Connection receive window as the peer sees it ([`FlowControl::Manual`] only).
+    conn_recv_window: i64,
+    /// The peer has acknowledged our SETTINGS.
+    local_settings_acked: bool,
+    /// Streams whose queued send data shrank since last reported.
+    send_ready: BTreeSet<StreamId>,
     next_local_id: StreamId,
     last_peer_id: StreamId,
     continuation: Option<PendingBlock>,
@@ -265,6 +350,9 @@ impl Connection {
             awaiting_peer_settings: true,
             streams: BTreeMap::new(),
             conn_send_window: 65_535,
+            conn_recv_window: DEFAULT_WINDOW,
+            local_settings_acked: false,
+            send_ready: BTreeSet::new(),
             next_local_id: if role == Role::Client { 1 } else { 2 },
             last_peer_id: 0,
             continuation: None,
@@ -297,6 +385,12 @@ impl Connection {
             });
         }
         conn.write_frame(FrameType::Settings, 0, 0, &encode_settings(&settings));
+        let conn_window = i64::from(config.connection_window_size).min(MAX_WINDOW);
+        if conn_window > DEFAULT_WINDOW {
+            let inc = (conn_window - DEFAULT_WINDOW) as u32;
+            conn.write_frame(FrameType::WindowUpdate, 0, 0, &encode_window_update(inc));
+            conn.conn_recv_window = conn_window;
+        }
         conn
     }
 
@@ -466,6 +560,9 @@ impl Connection {
         if id == 0 {
             return Err(self.fail(ErrorCode::ProtocolError, "DATA on stream 0"));
         }
+        if self.config.flow_control == FlowControl::Manual {
+            return self.on_data_manual(id, flags, payload);
+        }
         let flow_len = payload.len() as u32;
         if flow_len > self.config.initial_window_size.max(65_535) {
             return Err(self.fail(ErrorCode::FlowControlError, "receive window exceeded"));
@@ -497,15 +594,89 @@ impl Connection {
             self.reset(id, ErrorCode::StreamClosed);
             return Ok(());
         }
+        let discard = stream.reset_after_flush.is_some();
         if end_stream {
             stream.apply(StreamEvent::RecvEndStream);
-        } else if flow_len > 0 {
+        } else if flow_len > 0 && !discard {
             self.write_frame(
                 FrameType::WindowUpdate,
                 0,
                 id,
                 &encode_window_update(flow_len),
             );
+        }
+        if !discard {
+            self.events.push_back(Event::Data {
+                stream_id: id,
+                data: data.to_vec(),
+                end_stream,
+            });
+        }
+        self.cleanup(id);
+        Ok(())
+    }
+
+    /// [`FlowControl::Manual`] DATA handling: windows are tracked and only
+    /// replenished by [`release_capacity`](Self::release_capacity), except for
+    /// bytes the application never sees.
+    fn on_data_manual(&mut self, id: StreamId, flags: Flags, payload: &[u8]) -> Result<(), Error> {
+        let flow_len = payload.len();
+        if flow_len as i64 > self.conn_recv_window {
+            return Err(self.fail(
+                ErrorCode::FlowControlError,
+                "connection receive window exceeded",
+            ));
+        }
+        self.conn_recv_window -= flow_len as i64;
+        let data = match strip_padding(flags, payload) {
+            Some(d) => d,
+            None => return Err(self.fail(ErrorCode::ProtocolError, "invalid DATA padding")),
+        };
+        let end_stream = flags.has(Flags::END_STREAM);
+        let padding = flow_len - data.len();
+
+        let Some(stream) = self.streams.get_mut(&id) else {
+            if self.is_idle_stream(id) {
+                return Err(self.fail(ErrorCode::ProtocolError, "DATA on idle stream"));
+            }
+            // Closed or reset stream: discard.
+            self.release_connection(flow_len);
+            return Ok(());
+        };
+        if !stream.can_recv() {
+            self.release_connection(flow_len);
+            self.reset(id, ErrorCode::StreamClosed);
+            return Ok(());
+        }
+        if flow_len as i64 > stream.recv_window {
+            self.release_connection(flow_len);
+            self.reset(id, ErrorCode::FlowControlError);
+            return Ok(());
+        }
+        stream.recv_window -= flow_len as i64;
+        if end_stream {
+            stream.apply(StreamEvent::RecvEndStream);
+        }
+        if stream.reset_after_flush.is_some() {
+            // The application has finished with this stream; nobody will
+            // release these bytes.
+            self.release_connection(flow_len);
+            self.cleanup(id);
+            return Ok(());
+        }
+        stream.unreleased += data.len();
+        // Padding is never delivered, so credit it back straight away.
+        if padding > 0 {
+            if stream.can_recv() {
+                stream.recv_window += padding as i64;
+                self.write_frame(
+                    FrameType::WindowUpdate,
+                    0,
+                    id,
+                    &encode_window_update(padding as u32),
+                );
+            }
+            self.release_connection(padding);
         }
         self.events.push_back(Event::Data {
             stream_id: id,
@@ -605,8 +776,8 @@ impl Connection {
                 self.reset(id, ErrorCode::RefusedStream);
                 return Ok(());
             }
-            self.streams
-                .insert(id, Stream::new(i64::from(self.peer.initial_window_size)));
+            let stream = self.new_stream();
+            self.streams.insert(id, stream);
         }
 
         if list_size > self.config.max_header_list_size as usize {
@@ -645,7 +816,7 @@ impl Connection {
         let code = ErrorCode::from_u32(u32::from_be_bytes([
             payload[0], payload[1], payload[2], payload[3],
         ]));
-        if self.streams.remove(&id).is_some() {
+        if self.remove_stream(id) {
             self.events.push_back(Event::Reset {
                 stream_id: id,
                 error_code: code,
@@ -662,6 +833,7 @@ impl Connection {
             if !payload.is_empty() {
                 return Err(self.fail(ErrorCode::FrameSizeError, "SETTINGS ACK with payload"));
             }
+            self.on_settings_ack();
             return Ok(());
         }
         let settings = match decode_settings(payload) {
@@ -731,7 +903,7 @@ impl Connection {
             .filter(|s| !self.is_peer_initiated(*s) && *s > last)
             .collect();
         for s in refused {
-            self.streams.remove(&s);
+            self.remove_stream(s);
             self.events.push_back(Event::Reset {
                 stream_id: s,
                 error_code: ErrorCode::RefusedStream,
@@ -788,8 +960,8 @@ impl Connection {
         }
         let id = self.next_local_id;
         self.next_local_id += 2;
-        self.streams
-            .insert(id, Stream::new(i64::from(self.peer.initial_window_size)));
+        let stream = self.new_stream();
+        self.streams.insert(id, stream);
         self.send_headers(id, headers, end_stream)?;
         Ok(id)
     }
@@ -802,7 +974,7 @@ impl Connection {
         end_stream: bool,
     ) -> Result<(), Error> {
         let stream = self.streams.get_mut(&id).ok_or(Error::UnknownStream(id))?;
-        if !stream.apply(StreamEvent::SendHeaders) {
+        if stream.reset_after_flush.is_some() || !stream.apply(StreamEvent::SendHeaders) {
             return Err(Error::StreamClosed(id));
         }
         if end_stream {
@@ -818,6 +990,10 @@ impl Connection {
 
     /// Queue body bytes on a stream. Data beyond the peer's flow-control
     /// window stays queued until a WINDOW_UPDATE arrives.
+    ///
+    /// The queue is unbounded: callers producing a stream of messages should
+    /// check [`queued_send_bytes`](Self::queued_send_bytes) and stop producing
+    /// above their own high-water mark.
     pub fn send_data(
         &mut self,
         id: StreamId,
@@ -825,10 +1001,7 @@ impl Connection {
         end_stream: bool,
     ) -> Result<(), Error> {
         let stream = self.streams.get_mut(&id).ok_or(Error::UnknownStream(id))?;
-        if !matches!(
-            stream.state,
-            StreamState::Open | StreamState::HalfClosedRemote
-        ) {
+        if !stream.can_send() {
             return Err(Error::StreamClosed(id));
         }
         if end_stream {
@@ -844,12 +1017,107 @@ impl Connection {
     }
 
     /// Abort a stream with RST_STREAM. Queued outbound data is discarded.
+    ///
+    /// Use [`reset_stream_after_flush`](Self::reset_stream_after_flush) to
+    /// deliver queued data and trailers first.
     pub fn reset_stream(&mut self, id: StreamId, code: ErrorCode) -> Result<(), Error> {
         if !self.streams.contains_key(&id) {
             return Err(Error::UnknownStream(id));
         }
         self.reset(id, code);
         Ok(())
+    }
+
+    /// Send RST_STREAM once everything already queued on the stream (DATA and
+    /// trailers) has been written, e.g. `RST_STREAM(NO_ERROR)` after a server
+    /// sends its trailers before the client half-closed (RFC 9113 §8.1).
+    ///
+    /// If nothing is queued the stream is reset immediately. If the stream
+    /// closes normally first (the peer ends its side), no RST_STREAM is sent.
+    /// Until then, nothing more can be sent on the stream and further DATA
+    /// from the peer is discarded rather than reported. The usual
+    /// [`Event::Reset`] is emitted when the reset is finally sent; call
+    /// [`reset_stream`](Self::reset_stream) to abort immediately instead.
+    pub fn reset_stream_after_flush(&mut self, id: StreamId, code: ErrorCode) -> Result<(), Error> {
+        let stream = self.streams.get_mut(&id).ok_or(Error::UnknownStream(id))?;
+        stream.reset_after_flush = Some(code);
+        self.flush_stream(id);
+        Ok(())
+    }
+
+    /// Body bytes queued on the stream that have not been written to
+    /// [`pending_output`](Self::pending_output) yet, typically because the
+    /// peer's flow-control window is exhausted. `None` if the stream is
+    /// unknown.
+    pub fn queued_send_bytes(&self, id: StreamId) -> Option<usize> {
+        self.streams.get(&id).map(Stream::queued_bytes)
+    }
+
+    /// How many more body bytes [`send_data`](Self::send_data) could accept on
+    /// the stream and write out immediately under the current stream and
+    /// connection send windows. The connection window is shared, so this is
+    /// an upper bound when several streams are sending. `None` if the stream
+    /// is unknown; `Some(0)` if it is closed for sending.
+    pub fn send_capacity(&self, id: StreamId) -> Option<usize> {
+        let stream = self.streams.get(&id)?;
+        if !stream.can_send() {
+            return Some(0);
+        }
+        let window = self.conn_send_window.min(stream.send_window).max(0) as usize;
+        Some(window.saturating_sub(stream.queued_bytes()))
+    }
+
+    /// Next stream whose queued body data shrank because the peer granted
+    /// flow-control credit (WINDOW_UPDATE or SETTINGS) during
+    /// [`recv`](Self::recv), and which can still send. Each stream is reported
+    /// at most once per call to `recv`; check
+    /// [`queued_send_bytes`](Self::queued_send_bytes) to decide whether to
+    /// resume a producer.
+    pub fn poll_send_ready(&mut self) -> Option<StreamId> {
+        while let Some(id) = self.send_ready.pop_first() {
+            if self.streams.get(&id).is_some_and(Stream::can_send) {
+                return Some(id);
+            }
+        }
+        None
+    }
+
+    /// Credit `n` received body bytes on the stream back to the peer, after
+    /// the application has consumed data delivered in [`Event::Data`].
+    ///
+    /// Only meaningful with [`FlowControl::Manual`]; a no-op otherwise. `n` is
+    /// clamped to the bytes delivered and not yet released. Releasing on a
+    /// stream that has closed or been reset is a no-op, because its remaining
+    /// capacity was released automatically when it was removed.
+    pub fn release_capacity(&mut self, id: StreamId, n: usize) {
+        if self.config.flow_control != FlowControl::Manual || self.failed.is_some() {
+            return;
+        }
+        let Some(stream) = self.streams.get_mut(&id) else {
+            return;
+        };
+        let n = n.min(stream.unreleased);
+        if n == 0 {
+            return;
+        }
+        stream.unreleased -= n;
+        if stream.can_recv() {
+            stream.recv_window += n as i64;
+            self.write_frame(
+                FrameType::WindowUpdate,
+                0,
+                id,
+                &encode_window_update(n as u32),
+            );
+        }
+        self.release_connection(n);
+    }
+
+    /// Received body bytes delivered on the stream and not yet released with
+    /// [`release_capacity`](Self::release_capacity). Always `Some(0)` for a
+    /// known stream in [`FlowControl::Automatic`] mode.
+    pub fn unreleased_recv_bytes(&self, id: StreamId) -> Option<usize> {
+        self.streams.get(&id).map(|s| s.unreleased)
     }
 
     /// Start a graceful shutdown: no new peer streams are accepted, existing
@@ -879,7 +1147,7 @@ impl Connection {
 
     fn reset(&mut self, id: StreamId, code: ErrorCode) {
         self.write_frame(FrameType::RstStream, 0, id, &(code as u32).to_be_bytes());
-        if self.streams.remove(&id).is_some() {
+        if self.remove_stream(id) {
             self.events.push_back(Event::Reset {
                 stream_id: id,
                 error_code: code,
@@ -902,24 +1170,77 @@ impl Connection {
         }
     }
 
+    fn new_stream(&self) -> Stream {
+        // Until the peer acknowledges our SETTINGS it still assumes the
+        // default initial window; `on_settings_ack` applies the difference.
+        let recv_window = if self.local_settings_acked {
+            i64::from(self.config.initial_window_size)
+        } else {
+            DEFAULT_WINDOW
+        };
+        Stream::new(i64::from(self.peer.initial_window_size), recv_window)
+    }
+
+    fn on_settings_ack(&mut self) {
+        if self.local_settings_acked {
+            return;
+        }
+        self.local_settings_acked = true;
+        let delta = i64::from(self.config.initial_window_size) - DEFAULT_WINDOW;
+        for stream in self.streams.values_mut() {
+            stream.recv_window += delta;
+        }
+    }
+
+    /// Credit `n` bytes back to the peer's connection-level send window.
+    fn release_connection(&mut self, n: usize) {
+        if n == 0 || self.failed.is_some() {
+            return;
+        }
+        self.conn_recv_window += n as i64;
+        self.write_frame(
+            FrameType::WindowUpdate,
+            0,
+            0,
+            &encode_window_update(n as u32),
+        );
+    }
+
+    /// Forget a stream, returning connection-level receive capacity it still
+    /// held. Returns whether the stream existed.
+    fn remove_stream(&mut self, id: StreamId) -> bool {
+        let Some(stream) = self.streams.remove(&id) else {
+            return false;
+        };
+        self.send_ready.remove(&id);
+        self.release_connection(stream.unreleased);
+        true
+    }
+
     fn cleanup(&mut self, id: StreamId) {
         if let Some(s) = self.streams.get(&id)
             && s.state == StreamState::Closed
             && s.outbound.is_empty()
         {
-            self.streams.remove(&id);
+            self.remove_stream(id);
         }
     }
 
     fn flush_streams(&mut self) {
-        let ids: Vec<StreamId> = self
+        let ids: Vec<(StreamId, usize)> = self
             .streams
             .iter()
             .filter(|(_, s)| !s.outbound.is_empty())
-            .map(|(id, _)| *id)
+            .map(|(id, s)| (*id, s.queued_bytes()))
             .collect();
-        for id in ids {
+        for (id, before) in ids {
             self.flush_stream(id);
+            if let Some(s) = self.streams.get(&id)
+                && s.can_send()
+                && s.queued_bytes() < before
+            {
+                self.send_ready.insert(id);
+            }
         }
     }
 
@@ -981,6 +1302,14 @@ impl Connection {
                     self.write_frame(FrameType::Data, flags, id, &chunk);
                 }
             }
+        }
+        if let Some(s) = self.streams.get(&id)
+            && s.outbound.is_empty()
+            && s.state != StreamState::Closed
+            && let Some(code) = s.reset_after_flush
+        {
+            self.reset(id, code);
+            return;
         }
         self.cleanup(id);
     }

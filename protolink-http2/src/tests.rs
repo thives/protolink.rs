@@ -44,6 +44,59 @@ fn events(c: &mut Connection) -> Vec<Event> {
     core::iter::from_fn(|| c.poll_event()).collect()
 }
 
+/// `(type, flags, stream id, payload)` of every frame in `out`.
+fn frames(out: &[u8]) -> Vec<(u8, u8, StreamId, Vec<u8>)> {
+    let mut res = Vec::new();
+    let mut pos = 0;
+    while pos + 9 <= out.len() {
+        let len = (usize::from(out[pos]) << 16)
+            | (usize::from(out[pos + 1]) << 8)
+            | usize::from(out[pos + 2]);
+        let id = u32::from_be_bytes([out[pos + 5], out[pos + 6], out[pos + 7], out[pos + 8]]);
+        res.push((
+            out[pos + 3],
+            out[pos + 4],
+            id & 0x7fff_ffff,
+            out[pos + 9..pos + 9 + len].to_vec(),
+        ));
+        pos += 9 + len;
+    }
+    res
+}
+
+fn data_frame(id: StreamId, len: usize, flags: u8) -> Vec<u8> {
+    let mut f = vec![
+        (len >> 16) as u8,
+        (len >> 8) as u8,
+        len as u8,
+        FrameType::Data as u8,
+        flags,
+    ];
+    f.extend_from_slice(&id.to_be_bytes());
+    f.resize(9 + len, 0x5A);
+    f
+}
+
+fn data_len(ev: &[Event], id: StreamId) -> usize {
+    ev.iter()
+        .map(|e| match e {
+            Event::Data {
+                stream_id, data, ..
+            } if *stream_id == id => data.len(),
+            _ => 0,
+        })
+        .sum()
+}
+
+fn manual(initial_window_size: u32, connection_window_size: u32) -> Config {
+    Config {
+        initial_window_size,
+        connection_window_size,
+        flow_control: FlowControl::Manual,
+        ..Config::default()
+    }
+}
+
 #[test]
 fn unary_round_trip() {
     let mut c = Connection::client(Config::default());
@@ -227,4 +280,338 @@ fn goaway_refuses_unprocessed_local_streams() {
         c.open_stream(request_headers(), true),
         Err(Error::GoingAway)
     );
+}
+
+#[test]
+fn queued_send_bytes_track_window_updates() {
+    let mut c = Connection::client(Config::default());
+    let mut s = Connection::server(Config::default());
+    exchange(&mut c, &mut s);
+    let id = c.open_stream(request_headers(), false).unwrap();
+    assert_eq!(c.queued_send_bytes(id), Some(0));
+    assert_eq!(c.send_capacity(id), Some(65_535));
+
+    c.send_data(id, vec![1; 100_000], false).unwrap();
+    assert_eq!(c.queued_send_bytes(id), Some(100_000 - 65_535));
+    assert_eq!(c.send_capacity(id), Some(0));
+    assert_eq!(c.poll_send_ready(), None, "own sends are not reported");
+
+    // The server replenishes the windows; until the client sees that, the
+    // remainder stays queued.
+    pump(&mut c, &mut s, usize::MAX).unwrap();
+    assert_eq!(c.queued_send_bytes(id), Some(100_000 - 65_535));
+    pump(&mut s, &mut c, usize::MAX).unwrap();
+    assert_eq!(c.queued_send_bytes(id), Some(0));
+    assert_eq!(c.send_capacity(id), Some(65_535 - (100_000 - 65_535)));
+    assert_eq!(c.poll_send_ready(), Some(id));
+    assert_eq!(c.poll_send_ready(), None);
+
+    pump(&mut c, &mut s, usize::MAX).unwrap();
+    assert_eq!(data_len(&events(&mut s), id), 100_000);
+    assert_eq!(c.queued_send_bytes(99), None);
+    assert_eq!(c.send_capacity(99), None);
+}
+
+#[test]
+fn send_ready_not_reported_after_local_close() {
+    let mut c = Connection::client(Config::default());
+    let mut s = Connection::server(Config::default());
+    exchange(&mut c, &mut s);
+    let id = c.open_stream(request_headers(), false).unwrap();
+    c.send_data(id, vec![1; 100_000], true).unwrap();
+    assert_eq!(c.send_capacity(id), Some(0));
+    exchange(&mut c, &mut s);
+    assert_eq!(c.queued_send_bytes(id), Some(0));
+    assert_eq!(c.poll_send_ready(), None);
+}
+
+#[test]
+fn automatic_flow_control_is_unchanged() {
+    let mut c = Connection::client(Config::default());
+    let mut s = Connection::server(Config::default());
+    exchange(&mut c, &mut s);
+    let id = c.open_stream(request_headers(), false).unwrap();
+    c.send_data(id, vec![1; 1000], false).unwrap();
+    pump(&mut c, &mut s, usize::MAX).unwrap();
+    let updates: Vec<_> = frames(&s.take_output())
+        .into_iter()
+        .filter(|f| f.0 == FrameType::WindowUpdate as u8)
+        .map(|f| (f.2, f.3))
+        .collect();
+    assert_eq!(
+        updates,
+        vec![
+            (0, 1000u32.to_be_bytes().to_vec()),
+            (id, 1000u32.to_be_bytes().to_vec())
+        ]
+    );
+    assert_eq!(s.unreleased_recv_bytes(id), Some(0));
+    s.release_capacity(id, 1000);
+    assert!(!s.has_output(), "release_capacity is a no-op");
+}
+
+#[test]
+fn manual_flow_control_waits_for_release() {
+    let mut c = Connection::client(Config::default());
+    let mut s = Connection::server(manual(16_384, 1 << 20));
+    exchange(&mut c, &mut s);
+    let id = c.open_stream(request_headers(), false).unwrap();
+    c.send_data(id, vec![3; 50_000], true).unwrap();
+
+    let mut total = 0;
+    let mut rounds = 0;
+    loop {
+        exchange(&mut c, &mut s);
+        let ev = events(&mut s);
+        let n = data_len(&ev, id);
+        assert!(n <= 16_384, "received {n} bytes without release");
+        total += n;
+        if ev.iter().any(|e| {
+            matches!(
+                e,
+                Event::Data {
+                    end_stream: true,
+                    ..
+                }
+            )
+        }) {
+            break;
+        }
+        assert!(n > 0, "peer stalled");
+        assert_eq!(s.unreleased_recv_bytes(id), Some(n));
+        assert_eq!(c.queued_send_bytes(id), Some(50_000 - total));
+        s.release_capacity(id, n);
+        assert_eq!(s.unreleased_recv_bytes(id), Some(0));
+        rounds += 1;
+    }
+    assert_eq!(total, 50_000);
+    assert_eq!(rounds, 3);
+}
+
+#[test]
+fn manual_flow_control_stream_overrun_resets_stream() {
+    let mut c = Connection::client(Config::default());
+    let mut s = Connection::server(manual(100, 1 << 20));
+    exchange(&mut c, &mut s);
+    let id = c.open_stream(request_headers(), false).unwrap();
+    exchange(&mut c, &mut s);
+    events(&mut s);
+
+    // Exactly the advertised window is fine.
+    s.recv(&data_frame(id, 100, 0)).unwrap();
+    assert_eq!(data_len(&events(&mut s), id), 100);
+    s.take_output();
+
+    s.recv(&data_frame(id, 1, 0)).unwrap();
+    assert_eq!(
+        events(&mut s),
+        vec![Event::Reset {
+            stream_id: id,
+            error_code: ErrorCode::FlowControlError
+        }]
+    );
+    let out = frames(&s.take_output());
+    assert!(out.iter().any(|f| f.0 == FrameType::RstStream as u8
+        && f.2 == id
+        && f.3 == (ErrorCode::FlowControlError as u32).to_be_bytes()));
+    assert!(!s.is_closed());
+}
+
+#[test]
+fn manual_flow_control_connection_overrun_is_connection_error() {
+    let mut c = Connection::client(Config::default());
+    let mut s = Connection::server(manual(1 << 20, 65_535));
+    exchange(&mut c, &mut s);
+    let id = c.open_stream(request_headers(), false).unwrap();
+    exchange(&mut c, &mut s);
+    for _ in 0..3 {
+        s.recv(&data_frame(id, 16_384, 0)).unwrap();
+    }
+    s.recv(&data_frame(id, 65_535 - 3 * 16_384, 0)).unwrap();
+    let err = s.recv(&data_frame(id, 1, 0)).unwrap_err();
+    assert!(matches!(
+        err,
+        Error::Connection {
+            code: ErrorCode::FlowControlError,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn manual_flow_control_does_not_block_other_streams() {
+    let mut c = Connection::client(Config::default());
+    let mut s = Connection::server(manual(16_384, 1 << 20));
+    exchange(&mut c, &mut s);
+    let a = c.open_stream(request_headers(), false).unwrap();
+    let b = c.open_stream(request_headers(), false).unwrap();
+    c.send_data(a, vec![1; 100_000], false).unwrap();
+    c.send_data(b, vec![2; 10_000], true).unwrap();
+    exchange(&mut c, &mut s);
+    let ev = events(&mut s);
+    assert_eq!(data_len(&ev, a), 16_384);
+    assert_eq!(data_len(&ev, b), 10_000);
+}
+
+#[test]
+fn manual_flow_control_returns_connection_credit_on_reset() {
+    let mut c = Connection::client(Config::default());
+    let mut s = Connection::server(manual(65_535, 65_535));
+    exchange(&mut c, &mut s);
+    let a = c.open_stream(request_headers(), false).unwrap();
+    c.send_data(a, vec![1; 65_535], false).unwrap();
+    exchange(&mut c, &mut s);
+    assert_eq!(s.unreleased_recv_bytes(a), Some(65_535));
+    assert_eq!(c.send_capacity(a), Some(0));
+
+    c.reset_stream(a, ErrorCode::Cancel).unwrap();
+    exchange(&mut c, &mut s);
+    let b = c.open_stream(request_headers(), false).unwrap();
+    assert_eq!(c.send_capacity(b), Some(65_535));
+}
+
+#[test]
+fn manual_flow_control_credits_padding() {
+    let mut c = Connection::client(Config::default());
+    let mut s = Connection::server(manual(65_535, 65_535));
+    exchange(&mut c, &mut s);
+    let id = c.open_stream(request_headers(), false).unwrap();
+    exchange(&mut c, &mut s);
+    events(&mut s);
+    // 1 pad-length byte + 3 data bytes + 6 padding bytes.
+    let mut f = data_frame(id, 10, Flags::PADDED);
+    f[9] = 6;
+    s.recv(&f).unwrap();
+    assert_eq!(data_len(&events(&mut s), id), 3);
+    assert_eq!(s.unreleased_recv_bytes(id), Some(3));
+    let updates: Vec<_> = frames(&s.take_output())
+        .into_iter()
+        .filter(|f| f.0 == FrameType::WindowUpdate as u8)
+        .map(|f| f.2)
+        .collect();
+    assert_eq!(updates, vec![id, 0]);
+}
+
+#[test]
+fn manual_flow_control_applies_initial_window_on_settings_ack() {
+    let mut c = Connection::client(Config::default());
+    let mut s = Connection::server(manual(1000, 1 << 20));
+    // The client sends under the default 65 535 window before it has seen
+    // the server's smaller SETTINGS_INITIAL_WINDOW_SIZE.
+    let id = c.open_stream(request_headers(), false).unwrap();
+    c.send_data(id, vec![1; 5000], false).unwrap();
+    pump(&mut c, &mut s, usize::MAX).unwrap();
+    assert_eq!(data_len(&events(&mut s), id), 5000);
+    exchange(&mut c, &mut s);
+    assert_eq!(c.send_capacity(id), Some(0), "window is now -4000");
+
+    s.release_capacity(id, 5000);
+    exchange(&mut c, &mut s);
+    assert_eq!(c.send_capacity(id), Some(1000));
+    c.send_data(id, vec![1; 1000], false).unwrap();
+    exchange(&mut c, &mut s);
+    assert_eq!(data_len(&events(&mut s), id), 1000);
+    assert!(s.has_stream(id));
+}
+
+#[test]
+fn trailers_delivered_before_deferred_reset() {
+    let mut c = Connection::client(Config::default());
+    let mut s = Connection::server(Config::default());
+    exchange(&mut c, &mut s);
+    // The client never half-closes.
+    let id = c.open_stream(request_headers(), false).unwrap();
+    exchange(&mut c, &mut s);
+    events(&mut s);
+
+    s.send_headers(id, vec![hf(":status", "200")], false)
+        .unwrap();
+    s.send_data(id, vec![9; 150_000], false).unwrap();
+    s.send_headers(id, vec![hf("grpc-status", "0")], true)
+        .unwrap();
+    s.reset_stream_after_flush(id, ErrorCode::NoError).unwrap();
+    assert!(s.has_stream(id), "reset deferred while data is queued");
+    assert_eq!(
+        s.send_data(id, vec![1], false),
+        Err(Error::StreamClosed(id))
+    );
+    assert_eq!(s.send_capacity(id), Some(0));
+    // Request data arriving meanwhile is discarded.
+    c.send_data(id, b"late".to_vec(), false).unwrap();
+
+    exchange(&mut c, &mut s);
+    let ev = events(&mut c);
+    assert_eq!(data_len(&ev, id), 150_000);
+    let n = ev.len();
+    assert!(
+        matches!(&ev[n - 2], Event::Headers { end_stream: true, headers, .. }
+            if headers[0].name == "grpc-status"),
+        "{:?}",
+        ev[n - 2]
+    );
+    assert_eq!(
+        ev[n - 1],
+        Event::Reset {
+            stream_id: id,
+            error_code: ErrorCode::NoError
+        }
+    );
+    assert_eq!(
+        events(&mut s),
+        vec![Event::Reset {
+            stream_id: id,
+            error_code: ErrorCode::NoError
+        }]
+    );
+    assert!(!s.has_stream(id));
+    assert!(!c.has_stream(id));
+}
+
+#[test]
+fn deferred_reset_with_nothing_queued_is_immediate() {
+    let mut c = Connection::client(Config::default());
+    let mut s = Connection::server(Config::default());
+    exchange(&mut c, &mut s);
+    let id = c.open_stream(request_headers(), false).unwrap();
+    exchange(&mut c, &mut s);
+    events(&mut s);
+    s.send_headers(id, vec![hf(":status", "200")], false)
+        .unwrap();
+    s.reset_stream_after_flush(id, ErrorCode::Cancel).unwrap();
+    assert!(!s.has_stream(id));
+    let out = frames(&s.take_output());
+    assert_eq!(out.last().unwrap().0, FrameType::RstStream as u8);
+}
+
+#[test]
+fn deferred_reset_skipped_when_stream_closes_normally() {
+    let mut c = Connection::client(Config::default());
+    let mut s = Connection::server(Config::default());
+    exchange(&mut c, &mut s);
+    let id = c.open_stream(request_headers(), false).unwrap();
+    exchange(&mut c, &mut s);
+    s.send_headers(id, vec![hf(":status", "200")], false)
+        .unwrap();
+    s.send_data(id, vec![9; 100_000], false).unwrap();
+    s.send_headers(id, vec![hf("grpc-status", "0")], true)
+        .unwrap();
+    s.reset_stream_after_flush(id, ErrorCode::NoError).unwrap();
+    // The client half-closes before the server's queue drains.
+    c.send_data(id, vec![], true).unwrap();
+    exchange(&mut c, &mut s);
+    assert!(!s.has_stream(id));
+    assert!(
+        !events(&mut s)
+            .iter()
+            .any(|e| matches!(e, Event::Reset { .. }))
+    );
+    let ev = events(&mut c);
+    assert_eq!(data_len(&ev, id), 100_000);
+    assert!(matches!(
+        ev.last(),
+        Some(Event::Headers {
+            end_stream: true,
+            ..
+        })
+    ));
 }
