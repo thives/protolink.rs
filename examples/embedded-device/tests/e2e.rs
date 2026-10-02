@@ -408,7 +408,7 @@ async fn streaming_over_cobs_framing() {
     });
     with_timeout(async {
         let io = CobsFramed::new(FromTokio::new(b));
-        let mut client = ServiceClient::new(protolink::Client::new(io, ClientConfig::default()));
+        let client = ServiceClient::new(protolink::Client::new(io, ClientConfig::default()));
         let mut stream = client.command_stream().await.unwrap();
         for i in 0..10 {
             stream.send(&get_status(Some(i))).await.unwrap();

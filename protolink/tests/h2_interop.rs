@@ -654,7 +654,7 @@ mod streaming {
         let (a, b) = tokio::io::duplex(16 * 1024);
         spawn_h2_server(a);
         with_timeout(async {
-            let mut client = protolink::tokio::client(b, ClientConfig::default());
+            let client = protolink::tokio::client(b, ClientConfig::default());
 
             // Bidi: replies arrive byte by byte, before the half-close.
             let mut call = client.streaming("/echo.Echo/Chat").unwrap();

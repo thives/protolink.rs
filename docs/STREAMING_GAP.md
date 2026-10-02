@@ -157,7 +157,7 @@ The private `inbound.rs` wraps the decoder with manual flow control. Credit is w
 - When trailers arrive while the client is still sending, its side is reset with `NO_ERROR`.
 - `can_send` is false while earlier requests wait for the server's window, so producers can be paused.
 
-**Concurrency decision:** the core client supports any number of concurrent calls on one connection (tested). The async and blocking high-level clients currently run one call at a time: a streaming `Call` borrows the client mutably until it is dropped. Use the sans-IO `protolink_grpc::Client` directly to run calls concurrently on one connection. Concurrent calls on the high-level clients are planned; see [`TODO.md`](TODO.md) and [Known limitations](#known-limitations).
+**Concurrency decision:** the core client supports any number of concurrent calls on one connection (tested). The async and blocking high-level clients currently run one streaming call at a time: while a `Call` exists, starting another fails with `FAILED_PRECONDITION`. Use the sans-IO `protolink_grpc::Client` directly to run calls concurrently on one connection. Concurrent calls on the high-level clients are planned; see [`TODO.md`](TODO.md) and [Known limitations](#known-limitations).
 
 ### 4. Response status, trailers, errors, and cancellation (done)
 
@@ -196,14 +196,16 @@ The private `inbound.rs` wraps the decoder with manual flow control. Credit is w
   - `ErrorKind::TimedOut`/`Interrupted` read errors are treated as idle ticks, so a transport read timeout keeps `Pending` streams moving.
   - std's `WouldBlock` maps to `ErrorKind::Other` in `embedded-io` and must be remapped by the adapter. This is documented.
 - **`Client::streaming(path) -> Call`**, also exposed through `StreamingTransport` and `BlockingStreamingTransport`:
-  - One call is active at a time: the `Call` borrows the client mutably until it is dropped. Generated streaming methods take `&mut self` for the same reason.
+  - One call is active at a time; starting another while a `Call` exists fails with `FAILED_PRECONDITION`. `StreamingTransport::start`, `BlockingStreamingTransport::start` and the generated streaming methods take `&self`; unary calls take `&mut self`, so they can't run while a `Call` exists.
+  - The async client keeps its state behind a short-lived lock (a `Mutex` with `std`, a `RefCell` without) that is never held across an await. The transport is checked out for each I/O step and returned by a guard, also when the future is dropped. With `std` the client is `Sync` for a `Send` transport, so calls can be driven from spawned tasks.
+  - `inner()` was replaced by `with_inner(|client| ...)`.
   - `send` waits while earlier requests wait for the server's window, reading responses meanwhile. They stay buffered up to the call's window.
   - `message` reads until the next message or the end.
   - Dropping an unfinished `Call` cancels only that call, and the connection stays usable.
 
 ## Known limitations
 
-- **One streaming call at a time per client.** The async and blocking clients keep a streaming `Call` borrowing the client until it is dropped, so a second call can't start before the first ends. The sans-IO `protolink_grpc::Client` supports concurrent calls and can be driven directly.
+- **One streaming call at a time per client.** The async and blocking clients refuse to start a second streaming call (`FAILED_PRECONDITION`) while a `Call` exists. The sans-IO `protolink_grpc::Client` supports concurrent calls and can be driven directly.
 - **The drivers don't read while a transport write is blocked.** On a transport that buffers less than the data in flight, a bidi call that sends many requests without reading responses can block both peers in `write`. This affects tiny pipes or UART buffers without a reader task. HTTP/2 flow control bounds memory but not transport-level write blocking. The workaround is to interleave `message` with `send`, or give the transport enough buffering. This is documented on `Call`, and the e2e COBS test uses a 4 KiB pipe for this reason.
 - **Unknown paths are answered at `END_STREAM`.** A path no handler reports through `method_kind` is treated as unary, so `UNIMPLEMENTED` is sent once the client half-closes. A client streaming to an unknown method only learns that when it finishes sending.
 - **Blocking `serve` and `Pending` handlers.** Pending streams progress only when a read returns or times out (see §6).

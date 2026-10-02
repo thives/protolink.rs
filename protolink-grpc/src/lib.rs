@@ -162,9 +162,12 @@ impl<T: BlockingUnaryTransport + ?Sized> BlockingUnaryTransport for &mut T {
 /// Starts streaming gRPC calls on already-encoded protobuf bytes.
 ///
 /// Generated async clients use it for server-, client- and bidirectional
-/// streaming methods. The returned [`StreamingCall`] borrows the transport, so
-/// a transport has at most one active streaming call at a time; dropping the
-/// call before it completes cancels it.
+/// streaming methods. The returned [`StreamingCall`] borrows the transport;
+/// dropping the call before it completes cancels it.
+///
+/// `start` takes `&self`, so it is up to the implementation how many calls may
+/// be active on one transport at the same time, and what starting another one
+/// does.
 pub trait StreamingTransport {
     /// Handle of an active call.
     type Call<'a>: StreamingCall
@@ -172,7 +175,7 @@ pub trait StreamingTransport {
         Self: 'a;
 
     /// Start a call of `path` (`/package.Service/Method`).
-    fn start(&mut self, path: &str) -> impl Future<Output = Result<Self::Call<'_>, Status>>;
+    fn start(&self, path: &str) -> impl Future<Output = Result<Self::Call<'_>, Status>>;
 }
 
 /// An active streaming call started by a [`StreamingTransport`].
@@ -201,7 +204,7 @@ pub trait BlockingStreamingTransport {
         Self: 'a;
 
     /// Start a call of `path` (`/package.Service/Method`).
-    fn start(&mut self, path: &str) -> Result<Self::Call<'_>, Status>;
+    fn start(&self, path: &str) -> Result<Self::Call<'_>, Status>;
 }
 
 /// Blocking counterpart of [`StreamingCall`].
@@ -220,7 +223,7 @@ impl<T: StreamingTransport + ?Sized> StreamingTransport for &mut T {
     where
         Self: 'a;
 
-    fn start(&mut self, path: &str) -> impl Future<Output = Result<Self::Call<'_>, Status>> {
+    fn start(&self, path: &str) -> impl Future<Output = Result<Self::Call<'_>, Status>> {
         (**self).start(path)
     }
 }
@@ -231,7 +234,7 @@ impl<T: BlockingStreamingTransport + ?Sized> BlockingStreamingTransport for &mut
     where
         Self: 'a;
 
-    fn start(&mut self, path: &str) -> Result<Self::Call<'_>, Status> {
+    fn start(&self, path: &str) -> Result<Self::Call<'_>, Status> {
         (**self).start(path)
     }
 }

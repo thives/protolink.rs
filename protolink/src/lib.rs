@@ -42,8 +42,9 @@
 //! methods, which pull responses through a poll interface (see
 //! [`Handler`]). Streaming clients get a [`Call`] (or [`blocking::Call`])
 //! from [`Client::streaming`], or typed wrappers from generated clients. The
-//! drivers run one call at a time per client connection; the sans-IO
-//! [`grpc::Client`] supports concurrent calls.
+//! high-level clients run one streaming call at a time per connection (starting
+//! another fails with `FAILED_PRECONDITION`); the sans-IO [`grpc::Client`]
+//! supports concurrent calls.
 #![cfg_attr(not(feature = "std"), no_std)]
 // `deny` rather than `forbid` so that `link::ring`, the only module that needs
 // `unsafe`, can opt in locally.
@@ -66,6 +67,8 @@ pub use error::Error;
 mod asynch;
 #[cfg(feature = "async")]
 pub use asynch::{Call, Client, serve};
+#[cfg(feature = "async")]
+mod shared;
 
 #[cfg(feature = "async")]
 pub mod link;

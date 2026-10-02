@@ -3,7 +3,7 @@
 use alloc::vec::Vec;
 use core::future::{Future, poll_fn};
 use core::pin::pin;
-use core::task::Poll;
+use core::task::{Poll, Waker};
 
 use embedded_io_async::{Read, Write};
 
@@ -11,6 +11,7 @@ use crate::grpc::{
     self, CallId, ClientConfig, Handler, Next, ServerConfig, Status, StreamingCall,
     StreamingTransport, UnaryTransport,
 };
+use crate::shared::Shared;
 use crate::{Error, READ_CHUNK};
 
 /// Serve gRPC on one connection until the peer disconnects or the connection
@@ -94,56 +95,112 @@ where
 /// Async gRPC client on one connection.
 ///
 /// Implements [`UnaryTransport`] and [`StreamingTransport`], so it plugs
-/// straight into generated `<Service>Client`s. Calls are issued one at a time:
-/// a streaming [`Call`] borrows the client until it is dropped. Use the
-/// sans-IO [`grpc::Client`] directly to run calls concurrently on one
-/// connection.
+/// straight into generated `<Service>Client`s.
+///
+/// One streaming [`Call`] can be active at a time: starting another one while
+/// a call still exists fails with `FAILED_PRECONDITION`. Unary calls take
+/// `&mut self`, so they can't run while a [`Call`] exists. Use the sans-IO
+/// [`grpc::Client`] directly to run calls concurrently on one connection.
+///
+/// The transport is only checked out of the client while an operation uses
+/// it, and is returned when that operation completes or its future is
+/// dropped.
 #[derive(Debug)]
 pub struct Client<IO> {
-    io: IO,
+    shared: Shared<State<IO>>,
+}
+
+#[derive(Debug)]
+struct State<IO> {
     inner: grpc::Client,
-    current: Option<CallId>,
+    /// The transport, or `None` while an operation has it checked out.
+    io: Option<IO>,
+    /// Tasks waiting for the transport to be checked back in.
+    waiters: Vec<Waker>,
+    /// A unary call whose future was dropped before it completed.
+    stale_unary: Option<CallId>,
+    /// Number of existing [`Call`]s.
+    active_calls: usize,
+}
+
+/// The transport, checked out of a [`Client`]. Dropping the guard checks it
+/// back in and wakes the tasks waiting for it.
+struct IoGuard<'a, IO> {
+    client: &'a Client<IO>,
+    io: Option<IO>,
+}
+
+impl<IO> IoGuard<'_, IO> {
+    fn io(&mut self) -> &mut IO {
+        self.io
+            .as_mut()
+            .expect("the transport is held until the guard is dropped")
+    }
+}
+
+impl<IO> Drop for IoGuard<'_, IO> {
+    fn drop(&mut self) {
+        let io = self.io.take();
+        let waiters = self.client.shared.with(|s| {
+            s.io = io;
+            core::mem::take(&mut s.waiters)
+        });
+        for waiter in waiters {
+            waiter.wake();
+        }
+    }
 }
 
 impl<IO: Read + Write> Client<IO> {
     /// Create a client; the HTTP/2 preface is sent with the first call.
     pub fn new(io: IO, config: ClientConfig) -> Self {
         Self {
-            io,
-            inner: grpc::Client::new(config),
-            current: None,
+            shared: Shared::new(State {
+                inner: grpc::Client::new(config),
+                io: Some(io),
+                waiters: Vec::new(),
+                stale_unary: None,
+                active_calls: 0,
+            }),
         }
     }
 
     /// Perform one unary call.
     pub async fn unary(&mut self, path: &str, request: &[u8]) -> Result<Vec<u8>, Status> {
-        // A previous call whose future was dropped is cancelled.
-        if let Some(stale) = self.current.take() {
-            self.inner.cancel(stale);
-        }
-        let id = self.inner.start_unary(path, request)?;
-        self.current = Some(id);
-        loop {
-            if let Some(result) = self.inner.take_response(id) {
-                self.current = None;
-                return result;
-            }
-            self.write_output().await;
-            if self.inner.is_pending(id) {
-                self.read_input().await;
-            }
-        }
+        let id = self.shared.with(|s| {
+            cancel_stale_unary(s);
+            let id = s.inner.start_unary(path, request)?;
+            s.stale_unary = Some(id);
+            Ok::<_, Status>(id)
+        })?;
+        let result = self
+            .drive(|c| match c.take_response(id) {
+                Some(result) => Some(result),
+                None if c.is_pending(id) => None,
+                None => Some(Err(Status::cancelled("call is not active"))),
+            })
+            .await;
+        self.shared.with(|s| s.stale_unary = None);
+        result
     }
 
     /// Start a streaming call of `path` (`/package.Service/Method`).
     ///
     /// The request headers are sent with the first operation on the
     /// returned [`Call`]. Dropping the call before it completes cancels it.
-    pub fn streaming(&mut self, path: &str) -> Result<Call<'_, IO>, Status> {
-        if let Some(stale) = self.current.take() {
-            self.inner.cancel(stale);
-        }
-        let id = self.inner.start_streaming(path)?;
+    /// Fails with `FAILED_PRECONDITION` while another [`Call`] exists.
+    pub fn streaming(&self, path: &str) -> Result<Call<'_, IO>, Status> {
+        let id = self.shared.with(|s| {
+            if s.active_calls > 0 {
+                return Err(Status::failed_precondition(
+                    "another streaming call is active on this client",
+                ));
+            }
+            cancel_stale_unary(s);
+            let id = s.inner.start_streaming(path)?;
+            s.active_calls += 1;
+            Ok(id)
+        })?;
         Ok(Call {
             client: self,
             id,
@@ -151,49 +208,136 @@ impl<IO: Read + Write> Client<IO> {
         })
     }
 
-    /// Access the sans-IO client state.
-    pub fn inner(&self) -> &grpc::Client {
-        &self.inner
+    /// Run `f` with the sans-IO client state.
+    ///
+    /// `f` must not use this client or drop its [`Call`]s.
+    pub fn with_inner<R>(&self, f: impl FnOnce(&grpc::Client) -> R) -> R {
+        self.shared.with(|s| f(&s.inner))
     }
 
     /// Unwrap the transport.
     pub fn into_io(self) -> IO {
-        self.io
+        self.shared
+            .into_inner()
+            .io
+            .expect("the transport is checked in when no operation is running")
     }
 
-    /// Write all pending output. Transport failures fail every call.
-    async fn write_output(&mut self) {
-        while self.inner.has_output() {
-            match self.io.write(self.inner.pending_output()).await {
-                Ok(0) | Err(_) => {
-                    self.inner
-                        .fail_all(Status::unavailable("transport write failed"));
-                    return;
+    /// Check the transport out, waiting while another operation has it.
+    /// `done` is evaluated first, and whenever the client state may have
+    /// changed; if it returns a value, that is returned instead of the
+    /// transport.
+    async fn acquire<T>(
+        &self,
+        done: &mut impl FnMut(&mut grpc::Client) -> Option<T>,
+    ) -> Result<IoGuard<'_, IO>, T> {
+        let acquired = poll_fn(|cx| {
+            self.shared.with(|s| {
+                if let Some(value) = done(&mut s.inner) {
+                    return Poll::Ready(Err(value));
                 }
-                Ok(n) => self.inner.consume_output(n),
+                match s.io.take() {
+                    Some(io) => Poll::Ready(Ok(io)),
+                    None => {
+                        if !s.waiters.iter().any(|w| w.will_wake(cx.waker())) {
+                            s.waiters.push(cx.waker().clone());
+                        }
+                        Poll::Pending
+                    }
+                }
+            })
+        })
+        .await;
+        acquired.map(|io| IoGuard {
+            client: self,
+            io: Some(io),
+        })
+    }
+
+    /// Move the connection along (write pending output, read input) until
+    /// `step` returns a value.
+    async fn drive<T>(&self, mut step: impl FnMut(&mut grpc::Client) -> Option<T>) -> T {
+        loop {
+            let mut guard = match self.acquire(&mut step).await {
+                Ok(guard) => guard,
+                Err(value) => return value,
+            };
+            if self.write_all(guard.io()).await {
+                if let Some(value) = self.shared.with(|s| step(&mut s.inner)) {
+                    return value;
+                }
+                self.read_once(guard.io()).await;
             }
         }
-        if self.io.flush().await.is_err() {
-            self.inner
-                .fail_all(Status::unavailable("transport flush failed"));
+    }
+
+    /// Write all pending output.
+    async fn flush(&self) {
+        let mut done = |c: &mut grpc::Client| (!c.has_output()).then_some(());
+        if let Ok(mut guard) = self.acquire(&mut done).await {
+            self.write_all(guard.io()).await;
         }
+    }
+
+    /// Write all pending output and flush the transport. Transport failures
+    /// fail every call and return `false`.
+    ///
+    /// Output is copied out in chunks and only consumed once the transport
+    /// accepted it, so no borrow of the client state is held while the
+    /// transport is awaited.
+    async fn write_all(&self, io: &mut IO) -> bool {
+        let mut buf = [0u8; READ_CHUNK];
+        loop {
+            let n = self.shared.with(|s| {
+                let pending = s.inner.pending_output();
+                let n = pending.len().min(buf.len());
+                buf[..n].copy_from_slice(&pending[..n]);
+                n
+            });
+            if n == 0 {
+                break;
+            }
+            match io.write(&buf[..n]).await {
+                Ok(0) | Err(_) => {
+                    self.fail_all("transport write failed");
+                    return false;
+                }
+                Ok(written) => self.shared.with(|s| s.inner.consume_output(written)),
+            }
+        }
+        if io.flush().await.is_err() {
+            self.fail_all("transport flush failed");
+            return false;
+        }
+        true
     }
 
     /// Read once from the transport. Transport failures fail every call.
-    async fn read_input(&mut self) {
+    async fn read_once(&self, io: &mut IO) {
         let mut buf = [0u8; READ_CHUNK];
-        match self.io.read(&mut buf).await {
-            Ok(0) => self
-                .inner
-                .fail_all(Status::unavailable("connection closed")),
+        let result = io.read(&mut buf).await;
+        self.shared.with(|s| match result {
+            Ok(0) => s.inner.fail_all(Status::unavailable("connection closed")),
             Ok(n) => {
                 // Errors fail all pending calls inside the client.
-                let _ = self.inner.recv(&buf[..n]);
+                let _ = s.inner.recv(&buf[..n]);
             }
-            Err(_) => self
+            Err(_) => s
                 .inner
                 .fail_all(Status::unavailable("transport read failed")),
-        }
+        });
+    }
+
+    fn fail_all(&self, message: &'static str) {
+        self.shared
+            .with(|s| s.inner.fail_all(Status::unavailable(message)));
+    }
+}
+
+/// Cancel a unary call whose future was dropped.
+fn cancel_stale_unary<IO>(state: &mut State<IO>) {
+    if let Some(stale) = state.stale_unary.take() {
+        state.inner.cancel(stale);
     }
 }
 
@@ -213,7 +357,7 @@ impl<IO: Read + Write> StreamingTransport for Client<IO> {
     where
         Self: 'a;
 
-    fn start(&mut self, path: &str) -> impl Future<Output = Result<Self::Call<'_>, Status>> {
+    fn start(&self, path: &str) -> impl Future<Output = Result<Self::Call<'_>, Status>> {
         core::future::ready(self.streaming(path))
     }
 }
@@ -234,7 +378,7 @@ impl<IO: Read + Write> StreamingTransport for Client<IO> {
 /// Interleave `message` with `send`, or give the transport enough buffering.
 #[derive(Debug)]
 pub struct Call<'a, IO> {
-    client: &'a mut Client<IO>,
+    client: &'a Client<IO>,
     id: CallId,
     finished: Option<Result<(), Status>>,
 }
@@ -252,30 +396,40 @@ impl<IO: Read + Write> Call<'_, IO> {
         if self.finished.is_some() {
             return Ok(());
         }
+        let client = self.client;
         let id = self.id;
-        while !self.client.inner.can_send(id) {
-            self.client.write_output().await;
-            if self.client.inner.can_send(id) {
-                break;
+        client
+            .drive(|c| (c.can_send(id) || !c.is_pending(id)).then_some(()))
+            .await;
+        let queued = client.shared.with(|s| {
+            if !s.inner.is_pending(id) {
+                // Finished while waiting; the outcome is reported by `message`.
+                return Ok(false);
             }
-            self.client.read_input().await;
+            s.inner.send_message(id, message).map(|()| true)
+        })?;
+        if queued {
+            client.flush().await;
         }
-        if !self.client.inner.is_pending(id) {
-            // Finished while waiting; the outcome is reported by `message`.
-            return Ok(());
-        }
-        self.client.inner.send_message(id, message)?;
-        self.client.write_output().await;
         Ok(())
     }
 
     /// Half-close: no more request messages. Responses keep flowing.
     pub async fn close_send(&mut self) -> Result<(), Status> {
-        if self.finished.is_some() || !self.client.inner.is_pending(self.id) {
+        if self.finished.is_some() {
             return Ok(());
         }
-        self.client.inner.close_send(self.id)?;
-        self.client.write_output().await;
+        let client = self.client;
+        let id = self.id;
+        let queued = client.shared.with(|s| {
+            if !s.inner.is_pending(id) {
+                return Ok(false);
+            }
+            s.inner.close_send(id).map(|()| true)
+        })?;
+        if queued {
+            client.flush().await;
+        }
         Ok(())
     }
 
@@ -287,23 +441,21 @@ impl<IO: Read + Write> Call<'_, IO> {
             return result.clone().map(|()| None);
         }
         let id = self.id;
-        loop {
-            match self.client.inner.try_next(id) {
-                Some(Next::Message(m)) => return Ok(Some(m)),
-                Some(Next::Done(result)) => {
-                    self.finished = Some(result.clone());
-                    return result.map(|()| None);
+        let next = self
+            .client
+            .drive(|c| match c.try_next(id) {
+                Some(next) => Some(next),
+                None if !c.is_pending(id) => {
+                    Some(Next::Done(Err(Status::cancelled("call is not active"))))
                 }
-                None if !self.client.inner.is_pending(id) => {
-                    let status = Status::cancelled("call is not active");
-                    self.finished = Some(Err(status.clone()));
-                    return Err(status);
-                }
-                None => {}
-            }
-            self.client.write_output().await;
-            if self.client.inner.is_pending(id) {
-                self.client.read_input().await;
+                None => None,
+            })
+            .await;
+        match next {
+            Next::Message(m) => Ok(Some(m)),
+            Next::Done(result) => {
+                self.finished = Some(result.clone());
+                result.map(|()| None)
             }
         }
     }
@@ -311,9 +463,14 @@ impl<IO: Read + Write> Call<'_, IO> {
 
 impl<IO> Drop for Call<'_, IO> {
     fn drop(&mut self) {
-        if self.finished.is_none() {
-            self.client.inner.cancel(self.id);
-        }
+        let id = self.id;
+        let unfinished = self.finished.is_none();
+        self.client.shared.with(|s| {
+            if unfinished {
+                s.inner.cancel(id);
+            }
+            s.active_calls = s.active_calls.saturating_sub(1);
+        });
     }
 }
 

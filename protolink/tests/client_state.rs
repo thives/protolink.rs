@@ -1,0 +1,276 @@
+//! Behaviour of the high-level clients' shared state: the transport is checked
+//! out for each operation and always returned, calls are cleaned up when
+//! dropped, and (with `std`) the client and its futures are `Send`.
+#![cfg(feature = "tokio")]
+
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::future::Future;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+use std::task::{Context, Poll};
+use std::time::Duration;
+
+use protolink::grpc::{CallId, Code, Handler, MethodKind, Next, Status};
+use protolink::{ClientConfig, ServerConfig, StreamingTransport};
+
+const ECHO: &str = "/t.T/Echo";
+const CHAT: &str = "/t.T/Chat";
+
+async fn with_timeout<F: Future>(f: F) -> F::Output {
+    tokio::time::timeout(Duration::from_secs(10), f)
+        .await
+        .expect("test timed out")
+}
+
+/// `Echo` (unary) echoes the request. `Chat` (bidi) echoes every message and
+/// ends when the client half-closes.
+#[derive(Default)]
+struct Echoes {
+    queues: BTreeMap<CallId, VecDeque<Vec<u8>>>,
+    ended: BTreeSet<CallId>,
+    cancelled: Arc<AtomicUsize>,
+}
+
+impl Handler for Echoes {
+    fn call(&mut self, path: &str, request: &[u8]) -> Option<Result<Vec<u8>, Status>> {
+        (path == ECHO).then(|| Ok(request.to_vec()))
+    }
+
+    fn method_kind(&self, path: &str) -> Option<MethodKind> {
+        (path == CHAT).then_some(MethodKind::BidiStreaming)
+    }
+
+    fn on_message(&mut self, _: &str, call: CallId, message: &[u8]) -> Result<(), Status> {
+        self.queues
+            .entry(call)
+            .or_default()
+            .push_back(message.to_vec());
+        Ok(())
+    }
+
+    fn on_half_close(&mut self, _: &str, call: CallId) -> Result<(), Status> {
+        self.ended.insert(call);
+        Ok(())
+    }
+
+    fn poll_response(&mut self, _: &str, call: CallId, _: &mut Context<'_>) -> Poll<Next<Vec<u8>>> {
+        if let Some(message) = self.queues.get_mut(&call).and_then(VecDeque::pop_front) {
+            return Poll::Ready(Next::Message(message));
+        }
+        if self.ended.remove(&call) {
+            self.queues.remove(&call);
+            return Poll::Ready(Next::Done(Ok(())));
+        }
+        Poll::Pending
+    }
+
+    fn on_cancel(&mut self, _: &str, call: CallId) {
+        self.queues.remove(&call);
+        self.ended.remove(&call);
+        self.cancelled.fetch_add(1, SeqCst);
+    }
+}
+
+/// A client connected to an `Echoes` server, and the server's cancel counter.
+fn connect() -> (
+    protolink::Client<protolink::tokio::FromTokio<tokio::io::DuplexStream>>,
+    Arc<AtomicUsize>,
+) {
+    let (a, b) = tokio::io::duplex(16 * 1024);
+    let cancelled = Arc::new(AtomicUsize::new(0));
+    let mut handler = Echoes {
+        cancelled: cancelled.clone(),
+        ..Echoes::default()
+    };
+    tokio::spawn(async move {
+        let _ = protolink::tokio::serve(a, &mut handler, ServerConfig::default()).await;
+    });
+    (
+        protolink::tokio::client(b, ClientConfig::default()),
+        cancelled,
+    )
+}
+
+async fn wait_for(counter: &AtomicUsize, expected: usize) {
+    with_timeout(async {
+        while counter.load(SeqCst) != expected {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn second_streaming_call_is_refused_while_one_exists() {
+    let (client, _) = connect();
+    with_timeout(async {
+        let first = client.streaming(CHAT).unwrap();
+        let err = client.streaming(CHAT).err().expect("refused");
+        assert_eq!(err.code, Code::FailedPrecondition);
+        // The trait entry point behaves the same.
+        let err = StreamingTransport::start(&client, CHAT)
+            .await
+            .err()
+            .expect("refused");
+        assert_eq!(err.code, Code::FailedPrecondition);
+
+        drop(first);
+        let mut again = StreamingTransport::start(&client, CHAT).await.unwrap();
+        again.close_send().await.unwrap();
+        assert!(again.message().await.unwrap().is_none());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn dropping_a_pending_read_returns_the_transport() {
+    let (client, _) = connect();
+    with_timeout(async {
+        let mut call = client.streaming(CHAT).unwrap();
+        // Nothing was sent, so no reply can arrive: the read is pending and
+        // is dropped when the timeout elapses.
+        let timed_out = tokio::time::timeout(Duration::from_millis(30), call.message()).await;
+        assert!(timed_out.is_err());
+
+        // The same call is still usable.
+        call.send(b"hello").await.unwrap();
+        assert_eq!(call.message().await.unwrap().unwrap(), b"hello");
+        call.close_send().await.unwrap();
+        assert!(call.message().await.unwrap().is_none());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn dropped_call_is_cancelled_and_the_connection_stays_usable() {
+    let (mut client, cancelled) = connect();
+    with_timeout(async {
+        let mut call = client.streaming(CHAT).unwrap();
+        call.send(b"one").await.unwrap();
+        assert_eq!(call.message().await.unwrap().unwrap(), b"one");
+        drop(call);
+
+        // The reset is written with the next operation.
+        assert_eq!(client.unary(ECHO, b"after").await.unwrap(), b"after");
+        wait_for(&cancelled, 1).await;
+
+        let mut next = client.streaming(CHAT).unwrap();
+        next.send(b"two").await.unwrap();
+        assert_eq!(next.message().await.unwrap().unwrap(), b"two");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn dropped_unary_future_does_not_break_the_next_calls() {
+    let (mut client, _) = connect();
+    with_timeout(async {
+        {
+            // Polled exactly once: the request is written and the read is
+            // pending, because the server hasn't run yet. Then it is dropped.
+            let mut lost = std::pin::pin!(client.unary(ECHO, b"lost"));
+            let first = std::future::poll_fn(|cx| Poll::Ready(lost.as_mut().poll(cx))).await;
+            assert!(first.is_pending());
+        }
+
+        assert_eq!(client.unary(ECHO, b"kept").await.unwrap(), b"kept");
+        // A streaming call can follow as well.
+        let mut call = client.streaming(CHAT).unwrap();
+        call.send(b"x").await.unwrap();
+        assert_eq!(call.message().await.unwrap().unwrap(), b"x");
+        call.close_send().await.unwrap();
+        assert!(call.message().await.unwrap().is_none());
+    })
+    .await;
+}
+
+#[test]
+fn async_client_and_calls_are_send_and_sync() {
+    fn send<T: Send>() {}
+    fn sync<T: Sync>() {}
+    type Io = protolink::tokio::FromTokio<tokio::io::DuplexStream>;
+    send::<protolink::Client<Io>>();
+    sync::<protolink::Client<Io>>();
+    send::<protolink::Call<'static, Io>>();
+}
+
+#[tokio::test]
+async fn call_can_be_driven_from_a_spawned_task() {
+    let (client, _) = connect();
+    // `tokio::spawn` requires the whole future, including the call that
+    // borrows the client, to be `Send`.
+    let task = tokio::spawn(async move {
+        let mut call = client.streaming(CHAT).unwrap();
+        for i in 0..5u8 {
+            call.send(&[i]).await.unwrap();
+            assert_eq!(call.message().await.unwrap().unwrap(), [i]);
+        }
+        call.close_send().await.unwrap();
+        assert!(call.message().await.unwrap().is_none());
+    });
+    with_timeout(task).await.unwrap();
+}
+
+#[cfg(feature = "blocking")]
+mod blocking {
+    use core::convert::Infallible;
+
+    use embedded_io::{ErrorType, Read, Write};
+    use protolink::blocking::Client;
+    use protolink::grpc::Code;
+    use protolink::{BlockingStreamingTransport, ClientConfig};
+
+    /// A transport that is never used: starting a call does no I/O.
+    #[derive(Debug)]
+    struct Idle;
+
+    impl ErrorType for Idle {
+        type Error = Infallible;
+    }
+
+    impl Read for Idle {
+        fn read(&mut self, _: &mut [u8]) -> Result<usize, Infallible> {
+            Ok(0)
+        }
+    }
+
+    impl Write for Idle {
+        fn write(&mut self, buf: &[u8]) -> Result<usize, Infallible> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> Result<(), Infallible> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn second_streaming_call_is_refused_while_one_exists() {
+        let client = Client::new(Idle, ClientConfig::default());
+        let first = client.streaming("/t.T/Chat").unwrap();
+        assert_eq!(
+            client.streaming("/t.T/Chat").unwrap_err().code,
+            Code::FailedPrecondition
+        );
+        assert_eq!(
+            BlockingStreamingTransport::start(&client, "/t.T/Chat")
+                .unwrap_err()
+                .code,
+            Code::FailedPrecondition
+        );
+        drop(first);
+        assert!(client.streaming("/t.T/Chat").is_ok());
+    }
+
+    #[test]
+    fn with_inner_reads_the_sans_io_state() {
+        let client = Client::new(Idle, ClientConfig::default());
+        // The HTTP/2 preface is queued as soon as the client exists.
+        assert!(client.with_inner(|c| c.has_output()));
+        let call = client.streaming("/t.T/Chat").unwrap();
+        let id = call.id();
+        assert!(client.with_inner(|c| c.is_pending(id)));
+        drop(call);
+        assert!(!client.with_inner(|c| c.is_pending(id)));
+    }
+}

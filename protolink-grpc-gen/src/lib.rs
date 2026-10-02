@@ -841,14 +841,14 @@ fn gen_client(
         for m in methods.iter().filter(|m| m.kind != Kind::Unary) {
             let (n, func, req, resp, konst) = (&m.name, &m.func, &m.req, &m.resp, &m.konst);
             let start =
-                format!("__rt::{stream_bound}::start(&mut self.transport, {konst}){dot_await}?");
+                format!("__rt::{stream_bound}::start(&self.transport, {konst}){dot_await}?");
             match m.kind {
                 Kind::Server => {
                     let _ = writeln!(
                         w,
                         "        /// Call `{n}` (server streaming): send `request`, then read the\n        \
                          /// responses from the returned stream.\n        \
-                         pub {asyncness}fn {func}(&mut self, request: &{req}) -> Result<__rt::codec::{p}ServerStreaming<{call}, {resp}>, Status> {{\n            \
+                         pub {asyncness}fn {func}(&self, request: &{req}) -> Result<__rt::codec::{p}ServerStreaming<{call}, {resp}>, Status> {{\n            \
                          let request = __rt::codec::encode(request)?;\n            \
                          let mut call = {start};\n            \
                          __rt::{call_trait}::send(&mut call, &request){dot_await}?;\n            \
@@ -861,7 +861,7 @@ fn gen_client(
                         w,
                         "        /// Call `{n}` (client streaming): send requests on the returned\n        \
                          /// stream, then `finish` it to get the response.\n        \
-                         pub {asyncness}fn {func}(&mut self) -> Result<__rt::codec::{p}ClientStreaming<{call}, {req}, {resp}>, Status> {{\n            \
+                         pub {asyncness}fn {func}(&self) -> Result<__rt::codec::{p}ClientStreaming<{call}, {req}, {resp}>, Status> {{\n            \
                          Ok(__rt::codec::{p}ClientStreaming::new({start}))\n        }}"
                     );
                 }
@@ -870,7 +870,7 @@ fn gen_client(
                         w,
                         "        /// Call `{n}` (bidirectional streaming): send requests and read\n        \
                          /// responses on the returned stream.\n        \
-                         pub {asyncness}fn {func}(&mut self) -> Result<__rt::codec::{p}BidiStreaming<{call}, {req}, {resp}>, Status> {{\n            \
+                         pub {asyncness}fn {func}(&self) -> Result<__rt::codec::{p}BidiStreaming<{call}, {req}, {resp}>, Status> {{\n            \
                          Ok(__rt::codec::{p}BidiStreaming::new({start}))\n        }}"
                     );
                 }
@@ -1135,13 +1135,13 @@ service Service {
         let src = generate(&Generator::new());
         for line in [
             "impl<T: __rt::StreamingTransport> ServiceClient<T> {",
-            "pub async fn event_subscribe(&mut self, request: &super::a_::b_::EventSubscribe) -> Result<__rt::codec::ServerStreaming<<T as __rt::StreamingTransport>::Call<'_>, super::a_::b_::Event>, Status> {",
-            "pub async fn upload(&mut self) -> Result<__rt::codec::ClientStreaming<<T as __rt::StreamingTransport>::Call<'_>, super::a_::b_::Command, super::a_::b_::Reply>, Status> {",
-            "pub async fn chat(&mut self) -> Result<__rt::codec::BidiStreaming<<T as __rt::StreamingTransport>::Call<'_>, super::a_::b_::Command, super::a_::b_::Reply>, Status> {",
+            "pub async fn event_subscribe(&self, request: &super::a_::b_::EventSubscribe) -> Result<__rt::codec::ServerStreaming<<T as __rt::StreamingTransport>::Call<'_>, super::a_::b_::Event>, Status> {",
+            "pub async fn upload(&self) -> Result<__rt::codec::ClientStreaming<<T as __rt::StreamingTransport>::Call<'_>, super::a_::b_::Command, super::a_::b_::Reply>, Status> {",
+            "pub async fn chat(&self) -> Result<__rt::codec::BidiStreaming<<T as __rt::StreamingTransport>::Call<'_>, super::a_::b_::Command, super::a_::b_::Reply>, Status> {",
             "impl<T: __rt::BlockingStreamingTransport> ServiceBlockingClient<T> {",
-            "pub fn event_subscribe(&mut self, request: &super::a_::b_::EventSubscribe) -> Result<__rt::codec::BlockingServerStreaming<",
-            "pub fn upload(&mut self) -> Result<__rt::codec::BlockingClientStreaming<",
-            "pub fn chat(&mut self) -> Result<__rt::codec::BlockingBidiStreaming<",
+            "pub fn event_subscribe(&self, request: &super::a_::b_::EventSubscribe) -> Result<__rt::codec::BlockingServerStreaming<",
+            "pub fn upload(&self) -> Result<__rt::codec::BlockingClientStreaming<",
+            "pub fn chat(&self) -> Result<__rt::codec::BlockingBidiStreaming<",
             "__rt::BlockingStreamingCall::close_send(&mut call)?;",
         ] {
             assert!(src.contains(line), "missing `{line}`");
