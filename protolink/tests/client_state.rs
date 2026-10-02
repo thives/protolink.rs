@@ -46,6 +46,10 @@ impl Handler for Echoes {
         matches!(path, CHAT | GATE | OPEN).then_some(MethodKind::BidiStreaming)
     }
 
+    fn is_unknown_method(&self, path: &str) -> bool {
+        !matches!(path, ECHO | CHAT | GATE | OPEN)
+    }
+
     fn on_message(&mut self, path: &str, call: CallId, message: &[u8]) -> Result<(), Status> {
         if path == OPEN {
             self.open = true;
@@ -114,6 +118,25 @@ async fn wait_for(counter: &AtomicUsize, expected: usize) {
         while counter.load(SeqCst) != expected {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn unknown_streaming_path_is_answered_before_half_close() {
+    let (client, cancelled) = connect();
+    with_timeout(async {
+        let mut call = client.streaming("/t.T/Nope").unwrap();
+        call.send(b"hello").await.unwrap();
+        // No `close_send`: the status must not depend on it.
+        let err = call.message().await.unwrap_err();
+        assert_eq!(err.code, Code::Unimplemented);
+        drop(call);
+
+        let mut next = client.streaming(CHAT).unwrap();
+        next.send(b"still works").await.unwrap();
+        assert_eq!(next.message().await.unwrap().unwrap(), b"still works");
+        assert_eq!(cancelled.load(SeqCst), 0);
     })
     .await;
 }

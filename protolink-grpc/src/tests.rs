@@ -57,6 +57,39 @@ fn unknown_method_is_unimplemented() {
     assert_eq!(err.code, Code::Unimplemented);
 }
 
+/// Handler that reports exactly one path as known.
+struct Knows(&'static str);
+
+impl Handler for Knows {
+    fn call(&mut self, _: &str, _: &[u8]) -> Option<Result<Vec<u8>, Status>> {
+        None
+    }
+
+    fn is_unknown_method(&self, path: &str) -> bool {
+        path != self.0
+    }
+}
+
+#[test]
+fn tuple_handler_is_unknown_only_if_every_member_says_so() {
+    let pair = (Knows("/a"), Knows("/b"));
+    assert!(!pair.is_unknown_method("/a"));
+    assert!(!pair.is_unknown_method("/b"));
+    assert!(pair.is_unknown_method("/c"));
+
+    // A closure handler can't enumerate its paths.
+    let dynamic = (Knows("/a"), FnHandler(echo));
+    assert!(!dynamic.is_unknown_method("/c"));
+
+    // The `&mut H` impl forwards.
+    let mut knows = Knows("/a");
+    let forwarded = &mut knows;
+    assert!(!<&mut Knows as Handler>::is_unknown_method(
+        &forwarded, "/a"
+    ));
+    assert!(<&mut Knows as Handler>::is_unknown_method(&forwarded, "/c"));
+}
+
 #[test]
 fn oversized_response_is_resource_exhausted() {
     let err = call("/test.Echo/Big", b"").unwrap_err();

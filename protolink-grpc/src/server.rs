@@ -8,6 +8,7 @@ use protolink_http2::{
     Config, Connection, Error, ErrorCode, Event, FlowControl, HeaderField, StreamId,
 };
 
+use crate::handler::unimplemented;
 use crate::inbound::Inbound;
 use crate::status::encode_message;
 use crate::{CallId, DEFAULT_MAX_MESSAGE_SIZE, Handler, MethodKind, Next, Status, lpm};
@@ -204,6 +205,18 @@ impl Server {
                 } else if stream_id > self.last_call {
                     self.last_call = stream_id;
                     match validate_request(&headers) {
+                        Ok(path) if handler.is_unknown_method(&path) => {
+                            // Nothing will serve this call: answer now
+                            // instead of waiting for the client to finish
+                            // sending.
+                            self.send_status(
+                                stream_id,
+                                false,
+                                end_stream,
+                                Err(unimplemented(&path)),
+                            );
+                            return;
+                        }
                         Ok(path) => {
                             let kind = handler.method_kind(&path).unwrap_or(MethodKind::Unary);
                             self.calls.insert(
@@ -347,11 +360,9 @@ impl Server {
         let message = call.inbound.next(&mut self.conn, id);
         let path = call.path.clone();
         let result = truncated.and_then(|()| match message {
-            Some(Ok(msg)) => handler.call(&path, &msg).unwrap_or_else(|| {
-                Err(Status::unimplemented(alloc::format!(
-                    "unknown method {path}"
-                )))
-            }),
+            Some(Ok(msg)) => handler
+                .call(&path, &msg)
+                .unwrap_or_else(|| Err(unimplemented(&path))),
             Some(Err(e)) => Err(e),
             None => Err(Status::internal("missing request message")),
         });
@@ -548,8 +559,21 @@ impl Server {
         let Some(call) = self.calls.remove(&id) else {
             return;
         };
+        self.send_status(id, call.headers_sent, call.half_closed, result);
+    }
+
+    /// Send the final status of a stream: trailers after a response, or a
+    /// trailers-only response if no headers were sent. If the client is still
+    /// sending, the stream is reset with `NO_ERROR` after the output flushed.
+    fn send_status(
+        &mut self,
+        id: StreamId,
+        headers_sent: bool,
+        half_closed: bool,
+        result: Result<(), Status>,
+    ) {
         let mut fields = Vec::new();
-        if !call.headers_sent {
+        if !headers_sent {
             fields.push(field(":status", "200"));
             fields.push(field("content-type", "application/grpc"));
         }
@@ -563,7 +587,7 @@ impl Server {
             }
         }
         let _ = self.conn.send_headers(id, fields, true);
-        if !call.half_closed {
+        if !half_closed {
             let _ = self.conn.reset_stream_after_flush(id, ErrorCode::NoError);
         }
     }

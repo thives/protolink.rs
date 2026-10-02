@@ -604,6 +604,18 @@ impl Generator {
         }
         let _ = writeln!(w, "                _ => None,\n            }}\n        }}");
 
+        // Paths this service does not serve at all.
+        let known: Vec<&str> = methods.iter().map(|m| m.konst.as_str()).collect();
+        let body = if known.is_empty() {
+            "let _ = path;\n            true".to_owned()
+        } else {
+            format!("!matches!(path, {})", known.join(" | "))
+        };
+        let _ = writeln!(
+            w,
+            "\n        fn is_unknown_method(&self, path: &str) -> bool {{\n            {body}\n        }}"
+        );
+
         if streaming {
             let streams = || methods.iter().filter(|m| m.kind != Kind::Unary);
             let _ = writeln!(
@@ -1121,6 +1133,8 @@ service Service {
             "METHOD_UPLOAD => __rt::codec::poll_single(Service::poll_upload(&mut self.0, call, cx)),",
             "METHOD_CHAT => __rt::codec::poll_stream(Service::poll_chat(&mut self.0, call, cx)),",
             "METHOD_UPLOAD => Service::cancel_upload(&mut self.0, call),",
+            "fn is_unknown_method(&self, path: &str) -> bool {",
+            "!matches!(path, METHOD_COMMAND | METHOD_NESTED | METHOD_EVENT_SUBSCRIBE | METHOD_UPLOAD | METHOD_CHAT)",
         ] {
             assert!(src.contains(line), "missing `{line}`");
         }
@@ -1163,6 +1177,7 @@ service Service {
             )
         );
         assert!(src.contains("METHOD_GET => Some(__rt::MethodKind::Unary),"));
+        assert!(src.contains("!matches!(path, METHOD_GET)"));
         assert!(!src.contains("fn on_message"));
         assert!(!src.contains("fn poll_response"));
     }

@@ -136,6 +136,10 @@ impl Handler for Scripted {
         (path == "/s.S/Unary").then(|| Ok(request.to_vec()))
     }
 
+    fn is_unknown_method(&self, path: &str) -> bool {
+        path == "/s.S/Missing"
+    }
+
     fn method_kind(&self, path: &str) -> Option<MethodKind> {
         Some(match path {
             "/s.S/Unary" => MethodKind::Unary,
@@ -532,6 +536,81 @@ fn unknown_streaming_method_is_unimplemented() {
     assert_eq!(
         s.call("/s.S/Missing", &[b"a"]).1.unwrap_err().code,
         Code::Unimplemented
+    );
+    // Not recognized up front: answered once the request ended.
+    assert_eq!(
+        s.call("/s.S/Dynamic", &[b"a"]).1.unwrap_err().code,
+        Code::Unimplemented
+    );
+}
+
+#[test]
+fn unknown_method_is_answered_before_half_close() {
+    let mut s = setup();
+    let id = s.client.start_streaming("/s.S/Missing").unwrap();
+    s.client.send_message(id, b"a").unwrap();
+    s.pump();
+    assert!(!s.client.is_pending(id));
+    assert_eq!(s.server.active_calls(), 0);
+    assert!(s.handler.cancelled.is_empty());
+    // Later sends and the half-close are discarded.
+    assert_eq!(s.client.send_message(id, b"more"), Ok(()));
+    assert_eq!(s.client.close_send(id), Ok(()));
+    assert_eq!(
+        drain(&mut s.client, id).1.unwrap().unwrap_err().code,
+        Code::Unimplemented
+    );
+    s.pump();
+    // The connection stays usable.
+    assert_eq!(s.call("/s.S/Count", &[&[2]]), (msgs(&[&[1], &[2]]), Ok(())));
+}
+
+#[test]
+fn unclassified_path_waits_for_half_close() {
+    let mut s = setup();
+    let id = s.client.start_streaming("/s.S/Dynamic").unwrap();
+    s.client.send_message(id, b"a").unwrap();
+    s.pump();
+    assert!(s.client.is_pending(id));
+    assert_eq!(drain(&mut s.client, id), (Vec::new(), None));
+    s.client.close_send(id).unwrap();
+    s.pump();
+    assert_eq!(
+        drain(&mut s.client, id).1.unwrap().unwrap_err().code,
+        Code::Unimplemented
+    );
+}
+
+#[test]
+fn unknown_method_is_a_trailers_only_response() {
+    let (mut conn, mut server, mut handler) = raw_setup();
+    let id = conn
+        .open_stream(request_headers("/s.S/Missing"), false)
+        .unwrap();
+    conn.send_data(id, lpm::encode(b"x"), false).unwrap();
+    raw_exchange(&mut conn, &mut server, &mut handler);
+    let ev = raw_events(&mut conn);
+    assert!(
+        matches!(&ev[0], Event::Headers { headers, end_stream: true, .. }
+            if headers.iter().any(|h| h.name == "grpc-status" && h.value == "12")),
+        "{ev:?}"
+    );
+    assert_eq!(server.active_calls(), 0);
+}
+
+#[test]
+fn unknown_unary_request_in_one_chunk_is_unimplemented() {
+    let (mut conn, mut server, mut handler) = raw_setup();
+    let id = conn
+        .open_stream(request_headers("/s.S/Missing"), false)
+        .unwrap();
+    conn.send_data(id, lpm::encode(b"x"), true).unwrap();
+    raw_exchange(&mut conn, &mut server, &mut handler);
+    let ev = raw_events(&mut conn);
+    assert!(
+        matches!(&ev[0], Event::Headers { headers, end_stream: true, .. }
+            if headers.iter().any(|h| h.name == "grpc-status" && h.value == "12")),
+        "{ev:?}"
     );
 }
 

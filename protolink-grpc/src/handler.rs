@@ -9,7 +9,10 @@ use crate::{CallId, MethodKind, Next, Status};
 ///
 /// `call` returns `None` when the path is not handled, which lets handlers be
 /// combined: a tuple `(A, B, ...)` of handlers tries each in order. The server
-/// answers unhandled paths with `UNIMPLEMENTED`.
+/// answers unhandled paths with `UNIMPLEMENTED` once the client has sent its
+/// request, unless the handler recognizes the path as unknown up front (see
+/// [`is_unknown_method`](Self::is_unknown_method)), in which case the answer
+/// is sent as soon as the request headers arrive.
 ///
 /// # Streaming calls
 ///
@@ -57,6 +60,22 @@ pub trait Handler {
     /// Handle the unary call `path` with the encoded `request` message.
     fn call(&mut self, path: &str, request: &[u8]) -> Option<Result<Vec<u8>, Status>>;
 
+    /// Whether this handler knows that it serves nothing at `path`, neither
+    /// unary nor streaming. The server then answers `UNIMPLEMENTED` as soon
+    /// as the request headers arrive, so a streaming client learns about it
+    /// without having to half-close first.
+    ///
+    /// The default is `false`: the path may still be served dynamically
+    /// through [`call`](Self::call), so the server waits for the request to
+    /// end. Return `true` only if [`call`](Self::call) would return `None` and
+    /// [`method_kind`](Self::method_kind) would return `None` for `path`.
+    /// Generated `*Server` wrappers implement this; a tuple of handlers
+    /// reports `true` only if every member does.
+    fn is_unknown_method(&self, path: &str) -> bool {
+        let _ = path;
+        false
+    }
+
     /// The kind of method served at `path`, or `None` if it is not handled
     /// here. Paths reported as `None` or [`MethodKind::Unary`] are served
     /// through [`call`](Self::call).
@@ -94,13 +113,17 @@ pub trait Handler {
     }
 }
 
-fn unimplemented(path: &str) -> Status {
+pub(crate) fn unimplemented(path: &str) -> Status {
     Status::unimplemented(alloc::format!("unknown method {path}"))
 }
 
 impl<H: Handler + ?Sized> Handler for &mut H {
     fn call(&mut self, path: &str, request: &[u8]) -> Option<Result<Vec<u8>, Status>> {
         (**self).call(path, request)
+    }
+
+    fn is_unknown_method(&self, path: &str) -> bool {
+        (**self).is_unknown_method(path)
     }
 
     fn method_kind(&self, path: &str) -> Option<MethodKind> {
@@ -146,7 +169,7 @@ macro_rules! tuple_handler {
     ($($name:ident),+) => {
         /// Unary calls try each handler in order. Streaming calls go to the
         /// first handler whose [`method_kind`](Handler::method_kind) knows
-        /// the path.
+        /// the path. A path is unknown up front only if every handler says so.
         impl<$($name: Handler),+> Handler for ($($name,)+) {
             #[allow(non_snake_case)]
             fn call(&mut self, path: &str, request: &[u8]) -> Option<Result<Vec<u8>, Status>> {
@@ -157,6 +180,12 @@ macro_rules! tuple_handler {
                     }
                 )+
                 None
+            }
+
+            #[allow(non_snake_case)]
+            fn is_unknown_method(&self, path: &str) -> bool {
+                let ($($name,)+) = self;
+                true $(&& $name.is_unknown_method(path))+
             }
 
             #[allow(non_snake_case)]
