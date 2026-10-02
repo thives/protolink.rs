@@ -5,12 +5,13 @@ use alloc::vec::Vec;
 
 use protolink_http2::{Config, Connection, Error, ErrorCode, Event, FlowControl, HeaderField};
 
+use crate::compression::Compression;
 use crate::inbound::Inbound;
 use crate::status::decode_message;
 use crate::{CallId, Code, DEFAULT_MAX_MESSAGE_SIZE, Next, Status, lpm};
 
 /// Client configuration.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ClientConfig {
     /// HTTP/2 connection limits.
     ///
@@ -21,10 +22,16 @@ pub struct ClientConfig {
     /// `calls * initial_window_size` so that one call whose responses are not
     /// being read cannot stall the others.
     pub http2: Config,
-    /// Largest accepted response and sent request message, in bytes.
+    /// Largest accepted response and sent request message, in bytes. Compressed
+    /// messages count by their decompressed size.
     pub max_message_size: usize,
     /// `:authority` sent with every request.
     pub authority: String,
+    /// Message compression. Off by default.
+    ///
+    /// If [`Compression::send`] is set, every request is compressed with it,
+    /// so the server must support that encoding.
+    pub compression: Compression,
 }
 
 impl Default for ClientConfig {
@@ -36,6 +43,7 @@ impl Default for ClientConfig {
             },
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
             authority: "localhost".into(),
+            compression: Compression::NONE,
         }
     }
 }
@@ -76,17 +84,20 @@ pub struct Client {
     done: BTreeMap<CallId, Result<Vec<u8>, Status>>,
     max_message_size: usize,
     authority: String,
+    compression: Compression,
 }
 
 impl Client {
     /// New client connection. The HTTP/2 preface is queued immediately.
     pub fn new(config: ClientConfig) -> Self {
+        config.compression.debug_validate();
         Self {
             conn: Connection::client(config.http2),
             calls: BTreeMap::new(),
             done: BTreeMap::new(),
             max_message_size: config.max_message_size,
             authority: config.authority,
+            compression: config.compression,
         }
     }
 
@@ -97,9 +108,14 @@ impl Client {
         }
         let id = self.open(path, true)?;
         self.conn
-            .send_data(id, lpm::encode(request), true)
+            .send_data(id, self.frame(request), true)
             .map_err(|_| Status::internal("failed to queue request"))?;
         Ok(id)
+    }
+
+    /// Wrap a request message for sending, compressing it if configured.
+    fn frame(&self, message: &[u8]) -> Vec<u8> {
+        lpm::frame(message, self.compression.send, self.compression.min_size)
     }
 
     /// Start a streaming call of `path`. Requests are sent with
@@ -110,7 +126,7 @@ impl Client {
     }
 
     fn open(&mut self, path: &str, unary: bool) -> Result<CallId, Status> {
-        let headers = vec![
+        let mut headers = vec![
             field(":method", "POST"),
             field(":scheme", "http"),
             field(":path", path),
@@ -119,6 +135,12 @@ impl Client {
             field("te", "trailers"),
             field("user-agent", "protolink"),
         ];
+        if let Some(codec) = self.compression.send {
+            headers.push(field("grpc-encoding", codec.name()));
+        }
+        if let Some(accept) = self.compression.accept_header() {
+            headers.push(field("grpc-accept-encoding", &accept));
+        }
         let id = self.conn.open_stream(headers, false).map_err(|e| match e {
             Error::GoingAway => Status::unavailable("connection is going away"),
             _ => Status::unavailable("connection failed"),
@@ -155,7 +177,7 @@ impl Client {
             return Err(Status::failed_precondition("request stream already closed"));
         }
         self.conn
-            .send_data(id, lpm::encode(message), false)
+            .send_data(id, self.frame(message), false)
             .map_err(|_| Status::internal("failed to queue request"))
     }
 
@@ -197,6 +219,11 @@ impl Client {
             Some(Ok(msg)) => return Some(Next::Message(msg)),
             Some(Err(status)) => {
                 self.calls.remove(&id);
+                // A message that fails to decompress is only found here, with
+                // the stream possibly still open.
+                if self.conn.has_stream(id) {
+                    let _ = self.conn.reset_stream(id, ErrorCode::Cancel);
+                }
                 return Some(Next::Done(Err(status)));
             }
             None => {}
@@ -347,6 +374,19 @@ impl Client {
                         return;
                     }
                     if !end_stream {
+                        // The message encoding is announced in the response
+                        // headers, before any message.
+                        match self
+                            .compression
+                            .decoder_for(header(&headers, "grpc-encoding"))
+                        {
+                            Ok(codec) => call.inbound.set_codec(codec),
+                            Err(_) => self.terminate(
+                                stream_id,
+                                Err(Status::internal("unsupported response grpc-encoding")),
+                                Some(ErrorCode::Cancel),
+                            ),
+                        }
                         return;
                     }
                 }

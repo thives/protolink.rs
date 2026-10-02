@@ -8,13 +8,14 @@ use protolink_http2::{
     Config, Connection, Error, ErrorCode, Event, FlowControl, HeaderField, StreamId,
 };
 
+use crate::compression::{Codec, Compression};
 use crate::handler::unimplemented;
 use crate::inbound::Inbound;
 use crate::status::encode_message;
 use crate::{CallId, DEFAULT_MAX_MESSAGE_SIZE, Handler, MethodKind, Next, Status, lpm};
 
 /// Server configuration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub struct ServerConfig {
     /// HTTP/2 connection limits.
     ///
@@ -26,7 +27,13 @@ pub struct ServerConfig {
     /// `max_concurrent_streams` on small targets.
     pub http2: Config,
     /// Largest accepted request and produced response message, in bytes.
+    /// Compressed messages count by their decompressed size.
     pub max_message_size: usize,
+    /// Message compression. Off by default.
+    ///
+    /// Requests in any [`Compression::accept`] encoding are decoded. Responses
+    /// are compressed with [`Compression::send`] when the client accepts it.
+    pub compression: Compression,
 }
 
 impl Default for ServerConfig {
@@ -41,6 +48,7 @@ impl Default for ServerConfig {
                 ..http2
             },
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+            compression: Compression::NONE,
         }
     }
 }
@@ -58,6 +66,8 @@ struct Call {
     requests: usize,
     /// Response HEADERS were sent.
     headers_sent: bool,
+    /// Encoding of the response messages, negotiated from the request.
+    response_codec: Option<&'static dyn Codec>,
 }
 
 /// Sans-IO gRPC server for one connection.
@@ -84,16 +94,19 @@ pub struct Server {
     /// trailers or belong to finished calls.
     last_call: StreamId,
     max_message_size: usize,
+    compression: Compression,
 }
 
 impl Server {
     /// New server connection. Our HTTP/2 SETTINGS are queued immediately.
     pub fn new(config: ServerConfig) -> Self {
+        config.compression.debug_validate();
         Self {
             conn: Connection::server(config.http2),
             calls: BTreeMap::new(),
             last_call: 0,
             max_message_size: config.max_message_size,
+            compression: config.compression,
         }
     }
 
@@ -218,17 +231,42 @@ impl Server {
                             return;
                         }
                         Ok(path) => {
+                            // The request's encoding must be one we can
+                            // decode; the client is told which ones we can.
+                            let Ok(request_codec) = self
+                                .compression
+                                .decoder_for(header(&headers, "grpc-encoding"))
+                            else {
+                                let mut extra = Vec::new();
+                                if let Some(accept) = self.compression.accept_header() {
+                                    extra.push(field("grpc-accept-encoding", &accept));
+                                }
+                                self.send_status_with(
+                                    stream_id,
+                                    false,
+                                    end_stream,
+                                    Err(Status::unimplemented("unsupported grpc-encoding")),
+                                    extra,
+                                );
+                                return;
+                            };
+                            let response_codec = self
+                                .compression
+                                .encoder_for(header(&headers, "grpc-accept-encoding"));
+                            let mut inbound = Inbound::new(self.max_message_size);
+                            inbound.set_codec(request_codec);
                             let kind = handler.method_kind(&path).unwrap_or(MethodKind::Unary);
                             self.calls.insert(
                                 stream_id,
                                 Call {
                                     path,
                                     kind,
-                                    inbound: Inbound::new(self.max_message_size),
+                                    inbound,
                                     half_closed: end_stream,
                                     end_delivered: false,
                                     requests: 0,
                                     headers_sent: false,
+                                    response_codec,
                                 },
                             );
                         }
@@ -332,7 +370,16 @@ impl Server {
     /// waits for the transport.
     fn backed_up(&self, id: StreamId) -> bool {
         self.conn.queued_send_bytes(id).unwrap_or(0) > 0
-            || self.conn.pending_output().len() > self.max_message_size + lpm::HEADER_LEN
+            || self.conn.pending_output().len() > self.max_wire_message() + lpm::HEADER_LEN
+    }
+
+    /// Largest response message on the wire, prefix excluded.
+    fn max_wire_message(&self) -> usize {
+        if self.compression.send.is_some() {
+            lpm::wire_limit(self.max_message_size)
+        } else {
+            self.max_message_size
+        }
     }
 
     fn drive_unary<H: Handler + ?Sized>(&mut self, id: StreamId, handler: &mut H) {
@@ -522,7 +569,9 @@ impl Server {
         if !self.send_headers(id) {
             return false;
         }
-        if self.conn.send_data(id, lpm::encode(msg), false).is_err() {
+        let codec = self.calls.get(&id).and_then(|call| call.response_codec);
+        let framed = lpm::frame(msg, codec, self.compression.min_size);
+        if self.conn.send_data(id, framed, false).is_err() {
             self.calls.remove(&id);
             let _ = self.conn.reset_stream(id, ErrorCode::InternalError);
             return false;
@@ -540,10 +589,16 @@ impl Server {
             return true;
         }
         call.headers_sent = true;
-        let headers = vec![
+        let mut headers = vec![
             field(":status", "200"),
             field("content-type", "application/grpc"),
         ];
+        if let Some(codec) = call.response_codec {
+            headers.push(field("grpc-encoding", codec.name()));
+        }
+        if let Some(accept) = self.compression.accept_header() {
+            headers.push(field("grpc-accept-encoding", &accept));
+        }
         if self.conn.send_headers(id, headers, false).is_err() {
             self.calls.remove(&id);
             let _ = self.conn.reset_stream(id, ErrorCode::InternalError);
@@ -572,10 +627,24 @@ impl Server {
         half_closed: bool,
         result: Result<(), Status>,
     ) {
+        self.send_status_with(id, headers_sent, half_closed, result, Vec::new());
+    }
+
+    /// [`send_status`](Self::send_status) with `extra` header fields in a
+    /// trailers-only response (ignored if the headers were already sent).
+    fn send_status_with(
+        &mut self,
+        id: StreamId,
+        headers_sent: bool,
+        half_closed: bool,
+        result: Result<(), Status>,
+        extra: Vec<HeaderField>,
+    ) {
         let mut fields = Vec::new();
         if !headers_sent {
             fields.push(field(":status", "200"));
             fields.push(field("content-type", "application/grpc"));
+            fields.extend(extra);
         }
         match result {
             Ok(()) => fields.push(field("grpc-status", "0")),
@@ -631,4 +700,11 @@ fn field(name: &str, value: &str) -> HeaderField {
         name: name.into(),
         value: value.into(),
     }
+}
+
+fn header<'a>(headers: &'a [HeaderField], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|h| h.name == name)
+        .map(|h| h.value.as_str())
 }

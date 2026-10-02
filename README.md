@@ -126,11 +126,59 @@ can't run while a streaming call exists.
 See [`examples/embedded-device`](examples/embedded-device) for a complete, tested embedded-device
 example, including a TCP server (`just example-server`) that can be queried with `grpcurl`.
 
+## Compression
+
+Message compression (`grpc-encoding` / `grpc-accept-encoding`) is off by default. Turn it on with
+`Compression` in `ClientConfig` / `ServerConfig`:
+
+```rust
+use protolink::{Compression, ServerConfig};
+
+let config = ServerConfig {
+    compression: Compression::gzip(), // needs the `miniz-oxide` feature
+    ..ServerConfig::default()
+};
+```
+
+The algorithm is behind two traits in `protolink::compression`, so a target can use what it already has:
+
+| Trait | Implement it for | Gives you |
+|---|---|---|
+| `Deflate` | a raw DEFLATE library: miniz in a microcontroller's ROM, zlib, a hardware block | `Gzip<D>`, the `gzip` encoding, with header, CRC-32 and size trailer handled for you |
+| `Codec` | any other algorithm (one `grpc-encoding` value) | that encoding |
+
+`Deflate` is two methods, `deflate` and `inflate` (plus an optional `crc32` override for a ROM CRC). A
+backend that can only decompress returns `CodecError::Unsupported` from `deflate` and leaves
+`Compression::send` unset: it then accepts compressed requests and answers uncompressed.
+
+```rust
+use protolink::Compression;
+use protolink::compression::{Codec, Gzip};
+
+// `RomMiniz` implements `Deflate` on top of the ROM routines.
+static GZIP: Gzip<RomMiniz> = Gzip::new(RomMiniz);
+static ACCEPT: [&dyn Codec; 1] = [&GZIP];
+let compression = Compression::new(&ACCEPT).send(&GZIP);
+```
+
+The `miniz-oxide` feature adds the stock pure-Rust backend (`MinizOxide`, the ready-made `GZIP` and
+`Compression::gzip()`); it is not enabled by default, and its compressor needs a lot of working memory.
+
+- A server compresses a response only if the client lists the encoding in `grpc-accept-encoding`. A
+  client compresses every request with `Compression::send`, so only set it for a server that supports it.
+  A server answers an unsupported `grpc-encoding` with `UNIMPLEMENTED` and its `grpc-accept-encoding`.
+- Messages shorter than `Compression::min_size` (64 bytes by default), and messages that do not get
+  smaller, are sent uncompressed.
+- `max_message_size` limits the *decompressed* size, so a small message that expands is rejected with
+  `RESOURCE_EXHAUSTED` instead of being allocated. A `Codec` must honour the `limit` it is given.
+- Compressed messages stay compressed while they wait to be taken, and flow-control credit is counted
+  in bytes on the wire.
+
 ## Compatibility profile
 
 Supported:
 - unary, server-streaming, client-streaming and bidirectional streaming RPCs
-- uncompressed protobuf payloads
+- protobuf payloads, optionally compressed with a pluggable codec (see [Compression](#compression))
 - `application/grpc` (and `+proto`) content types
 - `grpc-status` / `grpc-message` (percent-encoded), trailers-only error responses
 - bounded message sizes (4 KiB default, configurable) and bounded buffering under HTTP/2 flow control
@@ -138,7 +186,7 @@ Supported:
 
 Not supported:
 
-- compression, deadlines (`grpc-timeout` is ignored), custom metadata
+- deadlines (`grpc-timeout` is ignored), custom metadata
 - reflection, health checking, interceptors, TLS
 
 Interoperability is tested against the `h2` crate (the HTTP/2 stack under hyper and tonic).

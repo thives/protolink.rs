@@ -30,6 +30,7 @@ critical-section = { version = "1", features = ["std"] }
 h2 = "0.4"
 http = "1"
 bytes = "1"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [features]
 async = [
@@ -52,6 +53,8 @@ portable-atomic-critical-section = [
     "portable-atomic",
     "portable-atomic/critical-section",
 ]
+# Stock DEFLATE backend and ready-made gzip codec, see `protolink::compression`.
+miniz-oxide = ["protolink-grpc/miniz-oxide"]
 std = [
     "protolink-grpc/std",
     "embedded-io-async?/std",

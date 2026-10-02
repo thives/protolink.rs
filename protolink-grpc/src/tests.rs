@@ -178,7 +178,7 @@ fn wrong_content_type_is_415() {
 }
 
 #[test]
-fn compressed_message_is_unimplemented() {
+fn compressed_message_without_encoding_is_internal() {
     let ev = raw_request(
         vec![
             hf(":method", "POST"),
@@ -188,9 +188,11 @@ fn compressed_message_is_unimplemented() {
         ],
         &[1, 0, 0, 0, 0],
     );
+    // The flag needs a `grpc-encoding` the call agreed on (see
+    // `tests_compression`).
     assert!(
         matches!(&ev[0], Event::Headers { headers, end_stream: true, .. }
-            if headers.iter().any(|h| h.name == "grpc-status" && h.value == "12")),
+            if headers.iter().any(|h| h.name == "grpc-status" && h.value == "13")),
         "{ev:?}"
     );
 }

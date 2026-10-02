@@ -8,7 +8,7 @@ This document treats “full gRPC streaming” as supporting all three streaming
 - **Client-streaming:** zero or more requests, one response after the client half-closes.
 - **Bidirectional streaming:** zero or more requests and responses, independently flowing until either side closes.
 
-This scope is specifically about streaming RPCs. It does not imply support for other currently unsupported gRPC features such as compression, deadlines, custom metadata, reflection, health checking, or TLS.
+This scope is specifically about streaming RPCs. It does not imply support for other currently unsupported gRPC features such as deadlines, custom metadata, reflection, health checking, or TLS.
 
 ## Current state (2026-10-02)
 

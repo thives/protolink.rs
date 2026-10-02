@@ -131,6 +131,7 @@ jobs:
       - run: |
             cargo check --release --target=${{matrix.target}} --no-default-features -p protolink -p protolink-grpc -p protolink-http2
             cargo check --release --target=${{matrix.target}} --no-default-features --features async,blocking -p protolink -p protolink-grpc -p protolink-http2
+            cargo check --release --target=${{matrix.target}} --no-default-features --features miniz-oxide -p protolink-grpc
 
   features:
     name: Check feature combinations

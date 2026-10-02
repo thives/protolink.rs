@@ -29,14 +29,22 @@
 //! consumed the messages they carry. A server stops pulling responses from a
 //! call while one of its messages waits for the peer's flow-control window.
 //!
+//! ## Compression
+//!
+//! Message compression (`grpc-encoding` / `grpc-accept-encoding`) is optional
+//! and off by default. The algorithm is pluggable through the
+//! [`compression::Codec`] and [`compression::Deflate`] traits, so a target can
+//! use a DEFLATE implementation it already has, such as one in ROM; the
+//! `miniz-oxide` feature provides a stock one. See [`compression`].
+//!
 //! ## Compatibility profile
 //!
-//! Supported: unary and streaming RPCs, uncompressed protobuf payloads,
-//! `application/grpc[+proto]`, `grpc-status`/`grpc-message`, trailers-only
-//! responses, bounded message sizes.
+//! Supported: unary and streaming RPCs, protobuf payloads (optionally
+//! compressed), `application/grpc[+proto]`, `grpc-status`/`grpc-message`,
+//! trailers-only responses, bounded message sizes.
 //!
-//! Not supported: compression, deadlines (`grpc-timeout` is ignored), custom
-//! metadata, reflection, health checking.
+//! Not supported: deadlines (`grpc-timeout` is ignored), custom metadata,
+//! reflection, health checking.
 #![no_std]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -49,6 +57,7 @@ extern crate std;
 mod client;
 #[cfg(feature = "micropb")]
 pub mod codec;
+pub mod compression;
 mod handler;
 mod inbound;
 pub mod lpm;
@@ -58,6 +67,7 @@ pub mod status;
 pub use protolink_http2 as http2;
 
 pub use client::{Client, ClientConfig};
+pub use compression::Compression;
 pub use handler::{FnHandler, Handler};
 pub use server::{Server, ServerConfig};
 pub use status::{Code, Status};
@@ -241,5 +251,7 @@ impl<T: BlockingStreamingTransport + ?Sized> BlockingStreamingTransport for &mut
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_compression;
 #[cfg(test)]
 mod tests_streaming;

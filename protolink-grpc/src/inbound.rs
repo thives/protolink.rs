@@ -6,7 +6,8 @@ use alloc::vec::Vec;
 use protolink_http2::{Connection, StreamId};
 
 use crate::Status;
-use crate::lpm::{self, Decoder};
+use crate::compression::Codec;
+use crate::lpm::Decoder;
 
 /// Decodes the messages of one call and credits received bytes back to the
 /// peer (with [`FlowControl::Manual`](protolink_http2::FlowControl::Manual))
@@ -17,6 +18,11 @@ use crate::lpm::{self, Decoder};
 /// is waiting, so a message larger than the stream window can still arrive.
 /// Buffering per call is therefore bounded by about
 /// `initial_window_size + max_message_size`, whatever the peer does.
+///
+/// Credit is counted in bytes as received, so for compressed messages it is
+/// their compressed size. Compressed messages stay compressed until taken;
+/// taking one briefly holds it and its decompressed form (at most
+/// `max_message_size`) at the same time.
 #[derive(Debug)]
 pub(crate) struct Inbound {
     decoder: Decoder,
@@ -35,6 +41,12 @@ impl Inbound {
         }
     }
 
+    /// The codec for compressed messages. Must be set before the first
+    /// [`push`](Self::push).
+    pub(crate) fn set_codec(&mut self, codec: Option<&'static dyn Codec>) {
+        self.decoder.set_codec(codec);
+    }
+
     /// Buffer a DATA payload.
     pub(crate) fn push(&mut self, conn: &mut Connection, id: StreamId, data: &[u8]) {
         self.held += data.len();
@@ -48,15 +60,19 @@ impl Inbound {
         conn: &mut Connection,
         id: StreamId,
     ) -> Option<Result<Vec<u8>, Status>> {
-        let item = self.decoder.next()?;
-        if let Ok(msg) = &item {
-            let n = msg.len() + lpm::HEADER_LEN;
-            let already = n.min(self.credited);
-            self.credited -= already;
-            let release = (n - already).min(self.held);
-            self.held -= release;
-            conn.release_capacity(id, release);
-        }
+        let item = match self.decoder.next_framed()? {
+            Ok((msg, wire_len)) => {
+                let already = wire_len.min(self.credited);
+                self.credited -= already;
+                let release = (wire_len - already).min(self.held);
+                self.held -= release;
+                conn.release_capacity(id, release);
+                Ok(msg)
+            }
+            // The call ends; the stream's remaining credit is released when
+            // it is closed or reset.
+            Err(status) => Err(status),
+        };
         self.release_partial(conn, id);
         Some(item)
     }

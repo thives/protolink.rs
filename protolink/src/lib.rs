@@ -61,8 +61,8 @@ extern crate alloc;
 pub use protolink_grpc as grpc;
 pub use protolink_grpc::{
     BlockingStreamingCall, BlockingStreamingTransport, BlockingUnaryTransport, CallId,
-    ClientConfig, Code, Handler, MethodKind, Next, ServerConfig, Status, StreamingCall,
-    StreamingTransport, UnaryTransport,
+    ClientConfig, Code, Compression, Handler, MethodKind, Next, ServerConfig, Status,
+    StreamingCall, StreamingTransport, UnaryTransport, compression,
 };
 
 mod error;

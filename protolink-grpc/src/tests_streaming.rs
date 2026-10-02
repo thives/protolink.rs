@@ -88,10 +88,10 @@ fn decoder_rejects_oversized_message_from_its_prefix() {
 }
 
 #[test]
-fn decoder_rejects_compressed_messages() {
+fn decoder_rejects_compressed_messages_without_a_codec() {
     let mut d = lpm::Decoder::new(8);
     d.push(&[1, 0, 0, 0, 1, 0]);
-    assert_eq!(d.next().unwrap().unwrap_err().code, Code::Unimplemented);
+    assert_eq!(d.next().unwrap().unwrap_err().code, Code::Internal);
 }
 
 // ---------------------------------------------------------------------------
