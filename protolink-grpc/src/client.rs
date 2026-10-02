@@ -2,13 +2,41 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::time::Duration;
 
 use protolink_http2::{Config, Connection, Error, ErrorCode, Event, FlowControl, HeaderField};
 
 use crate::compression::Compression;
 use crate::inbound::Inbound;
 use crate::status::decode_message;
-use crate::{CallId, Code, DEFAULT_MAX_MESSAGE_SIZE, Next, Status, lpm};
+use crate::{CallId, Code, DEFAULT_MAX_MESSAGE_SIZE, Next, Status, lpm, timeout};
+
+/// Per-call options.
+///
+/// The default is no timeout (apart from [`ClientConfig::default_timeout`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CallOptions {
+    /// Time the whole call may take, from the moment it is started until its
+    /// final status. It is sent to the server as `grpc-timeout`, and the call
+    /// fails locally with `DEADLINE_EXCEEDED` when it runs out (see
+    /// [`Client::tick`]). Overrides [`ClientConfig::default_timeout`].
+    pub timeout: Option<Duration>,
+}
+
+impl CallOptions {
+    /// Options with no timeout of their own.
+    pub const fn new() -> Self {
+        Self { timeout: None }
+    }
+
+    /// Options with a call `timeout`.
+    pub const fn timeout(timeout: Duration) -> Self {
+        Self {
+            timeout: Some(timeout),
+        }
+    }
+}
 
 /// Client configuration.
 #[derive(Debug, Clone)]
@@ -32,6 +60,9 @@ pub struct ClientConfig {
     /// If [`Compression::send`] is set, every request is compressed with it,
     /// so the server must support that encoding.
     pub compression: Compression,
+    /// Timeout of calls that don't set [`CallOptions::timeout`]. `None` (the
+    /// default) sends no `grpc-timeout`, so calls never expire by themselves.
+    pub default_timeout: Option<Duration>,
 }
 
 impl Default for ClientConfig {
@@ -44,6 +75,7 @@ impl Default for ClientConfig {
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
             authority: "localhost".into(),
             compression: Compression::NONE,
+            default_timeout: None,
         }
     }
 }
@@ -51,6 +83,9 @@ impl Default for ClientConfig {
 #[derive(Debug)]
 struct Call {
     unary: bool,
+    /// When the call runs out of time, on the client's clock (see
+    /// [`Client::tick`]).
+    deadline: Option<Duration>,
     headers_received: bool,
     inbound: Inbound,
     /// Final status, once known. Reported after every received message.
@@ -77,6 +112,17 @@ struct Call {
 /// credited back to the server then (with
 /// [`FlowControl::Manual`], the default), so a consumer that stops reading
 /// stalls the server instead of growing memory.
+///
+/// # Deadlines
+///
+/// The client never reads a clock. The caller reports the time with
+/// [`tick`](Self::tick), a monotonic [`Duration`] since any fixed point, and
+/// learns when to call it next from [`next_deadline`](Self::next_deadline).
+/// A call started with a timeout (see [`CallOptions`]) sends it as
+/// `grpc-timeout` and fails with `DEADLINE_EXCEEDED` once a `tick` reaches its
+/// deadline. Call `tick` before starting a call, so that its deadline counts
+/// from the right moment. A streaming call still returns the messages it had
+/// already received before the failure.
 #[derive(Debug)]
 pub struct Client {
     conn: Connection,
@@ -85,6 +131,9 @@ pub struct Client {
     max_message_size: usize,
     authority: String,
     compression: Compression,
+    default_timeout: Option<Duration>,
+    /// Latest time reported through [`Client::tick`].
+    now: Duration,
 }
 
 impl Client {
@@ -98,15 +147,30 @@ impl Client {
             max_message_size: config.max_message_size,
             authority: config.authority,
             compression: config.compression,
+            default_timeout: config.default_timeout,
+            now: Duration::ZERO,
         }
     }
 
     /// Queue a unary call of `path` with the encoded `request` message.
     pub fn start_unary(&mut self, path: &str, request: &[u8]) -> Result<CallId, Status> {
+        self.start_unary_with(path, request, &CallOptions::default())
+    }
+
+    /// [`start_unary`](Self::start_unary) with per-call `options`.
+    ///
+    /// Fails with `DEADLINE_EXCEEDED`, without sending anything, if the
+    /// timeout is zero.
+    pub fn start_unary_with(
+        &mut self,
+        path: &str,
+        request: &[u8],
+        options: &CallOptions,
+    ) -> Result<CallId, Status> {
         if request.len() > self.max_message_size {
             return Err(Status::resource_exhausted("request message too large"));
         }
-        let id = self.open(path, true)?;
+        let id = self.open(path, true, options)?;
         self.conn
             .send_data(id, self.frame(request), true)
             .map_err(|_| Status::internal("failed to queue request"))?;
@@ -122,19 +186,41 @@ impl Client {
     /// [`send_message`](Self::send_message) and responses read with
     /// [`try_next`](Self::try_next).
     pub fn start_streaming(&mut self, path: &str) -> Result<CallId, Status> {
-        self.open(path, false)
+        self.start_streaming_with(path, &CallOptions::default())
     }
 
-    fn open(&mut self, path: &str, unary: bool) -> Result<CallId, Status> {
+    /// [`start_streaming`](Self::start_streaming) with per-call `options`.
+    ///
+    /// The timeout covers the whole call, not each message. Fails with
+    /// `DEADLINE_EXCEEDED`, without sending anything, if it is zero.
+    pub fn start_streaming_with(
+        &mut self,
+        path: &str,
+        options: &CallOptions,
+    ) -> Result<CallId, Status> {
+        self.open(path, false, options)
+    }
+
+    fn open(&mut self, path: &str, unary: bool, options: &CallOptions) -> Result<CallId, Status> {
+        let timeout = options.timeout.or(self.default_timeout);
+        if timeout == Some(Duration::ZERO) {
+            return Err(Status::deadline_exceeded("timeout is zero"));
+        }
         let mut headers = vec![
             field(":method", "POST"),
             field(":scheme", "http"),
             field(":path", path),
             field(":authority", &self.authority),
+        ];
+        // The spec asks for the timeout right after the pseudo-headers.
+        if let Some(timeout) = timeout {
+            headers.push(field("grpc-timeout", &timeout::format(timeout)));
+        }
+        headers.extend([
             field("content-type", "application/grpc"),
             field("te", "trailers"),
             field("user-agent", "protolink"),
-        ];
+        ]);
         if let Some(codec) = self.compression.send {
             headers.push(field("grpc-encoding", codec.name()));
         }
@@ -149,6 +235,7 @@ impl Client {
             id,
             Call {
                 unary,
+                deadline: timeout.map(|t| self.now.saturating_add(t)),
                 headers_received: false,
                 inbound: Inbound::new(self.max_message_size),
                 status: None,
@@ -246,6 +333,46 @@ impl Client {
             self.fail_all(Status::unavailable("connection error"));
         }
         result
+    }
+
+    /// Report the current time and fail every call whose deadline has been
+    /// reached with `DEADLINE_EXCEEDED`, resetting its stream with `CANCEL`.
+    /// Write [`pending_output`](Self::pending_output) afterwards.
+    ///
+    /// `now` is a monotonic time since any fixed point, in the same unit and
+    /// from the same clock on every call. Earlier values than one already
+    /// reported are ignored.
+    pub fn tick(&mut self, now: Duration) {
+        self.now = self.now.max(now);
+        let expired: Vec<CallId> = self
+            .calls
+            .iter()
+            .filter(|(_, c)| c.status.is_none() && c.deadline.is_some_and(|d| d <= self.now))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in expired {
+            self.terminate(
+                id,
+                Err(Status::deadline_exceeded("deadline exceeded")),
+                Some(ErrorCode::Cancel),
+            );
+        }
+    }
+
+    /// Latest time reported through [`tick`](Self::tick).
+    pub fn now(&self) -> Duration {
+        self.now
+    }
+
+    /// When the earliest deadline of a call still waiting for its final status
+    /// is reached, on the clock given to [`tick`](Self::tick). `None` if no
+    /// such call has a deadline.
+    pub fn next_deadline(&self) -> Option<Duration> {
+        self.calls
+            .values()
+            .filter(|c| c.status.is_none())
+            .filter_map(|c| c.deadline)
+            .min()
     }
 
     /// Result of a finished unary call, removing it from the client.

@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use protolink::grpc::{CallId, Code, Handler, MethodKind, Next, Status};
-use protolink::{ClientConfig, ServerConfig, StreamingTransport};
+use protolink::grpc::{CallContext, CallId, Code, Handler, MethodKind, Next, Status};
+use protolink::{CallOptions, ClientConfig, ServerConfig, StreamingTransport};
 
 const ECHO: &str = "/t.T/Echo";
 const CHAT: &str = "/t.T/Chat";
@@ -38,7 +38,8 @@ struct Echoes {
 }
 
 impl Handler for Echoes {
-    fn call(&mut self, path: &str, request: &[u8]) -> Option<Result<Vec<u8>, Status>> {
+    fn call(&mut self, ctx: &CallContext<'_>, request: &[u8]) -> Option<Result<Vec<u8>, Status>> {
+        let path = ctx.path;
         (path == ECHO).then(|| Ok(request.to_vec()))
     }
 
@@ -50,7 +51,9 @@ impl Handler for Echoes {
         !matches!(path, ECHO | CHAT | GATE | OPEN)
     }
 
-    fn on_message(&mut self, path: &str, call: CallId, message: &[u8]) -> Result<(), Status> {
+    fn on_message(&mut self, ctx: &CallContext<'_>, message: &[u8]) -> Result<(), Status> {
+        let path = ctx.path;
+        let call = ctx.id;
         if path == OPEN {
             self.open = true;
         } else {
@@ -62,17 +65,15 @@ impl Handler for Echoes {
         Ok(())
     }
 
-    fn on_half_close(&mut self, _: &str, call: CallId) -> Result<(), Status> {
+    fn on_half_close(&mut self, ctx: &CallContext<'_>) -> Result<(), Status> {
+        let call = ctx.id;
         self.ended.insert(call);
         Ok(())
     }
 
-    fn poll_response(
-        &mut self,
-        path: &str,
-        call: CallId,
-        _: &mut Context<'_>,
-    ) -> Poll<Next<Vec<u8>>> {
+    fn poll_response(&mut self, ctx: &CallContext<'_>, _: &mut Context<'_>) -> Poll<Next<Vec<u8>>> {
+        let path = ctx.path;
+        let call = ctx.id;
         if let Some(message) = self.queues.get_mut(&call).and_then(VecDeque::pop_front) {
             return Poll::Ready(Next::Message(message));
         }
@@ -86,7 +87,8 @@ impl Handler for Echoes {
         Poll::Pending
     }
 
-    fn on_cancel(&mut self, _: &str, call: CallId) {
+    fn on_cancel(&mut self, ctx: &CallContext<'_>) {
+        let call = ctx.id;
         self.queues.remove(&call);
         self.ended.remove(&call);
         self.cancelled.fetch_add(1, SeqCst);
@@ -95,7 +97,10 @@ impl Handler for Echoes {
 
 /// A client connected to an `Echoes` server, and the server's cancel counter.
 fn connect() -> (
-    protolink::Client<protolink::tokio::FromTokio<tokio::io::DuplexStream>>,
+    protolink::Client<
+        protolink::tokio::FromTokio<tokio::io::DuplexStream>,
+        protolink::tokio::TokioTimer,
+    >,
     Arc<AtomicUsize>,
 ) {
     let (a, b) = tokio::io::duplex(16 * 1024);
@@ -147,7 +152,9 @@ async fn concurrent_calls_start_and_interleave_on_one_client() {
     with_timeout(async {
         // Both starting entry points accept a second call.
         let mut first = client.streaming(CHAT).unwrap();
-        let mut second = StreamingTransport::start(&client, CHAT).await.unwrap();
+        let mut second = StreamingTransport::start(&client, CHAT, CallOptions::default())
+            .await
+            .unwrap();
         for i in 0..5u8 {
             first.send(&[1, i]).await.unwrap();
             second.send(&[2, i]).await.unwrap();
@@ -393,7 +400,7 @@ mod blocking {
 
     use embedded_io::{ErrorType, Read, Write};
     use protolink::blocking::Client;
-    use protolink::{BlockingStreamingTransport, ClientConfig};
+    use protolink::{BlockingStreamingTransport, CallOptions, ClientConfig};
 
     /// A transport that is never used: starting a call does no I/O.
     #[derive(Debug)]
@@ -423,7 +430,9 @@ mod blocking {
     fn concurrent_calls_start_on_one_client() {
         let client = Client::new(Idle, ClientConfig::default());
         let first = client.streaming("/t.T/Chat").unwrap();
-        let second = BlockingStreamingTransport::start(&client, "/t.T/Chat").unwrap();
+        let second =
+            BlockingStreamingTransport::start(&client, "/t.T/Chat", CallOptions::default())
+                .unwrap();
         assert_ne!(first.id(), second.id());
         drop(first);
         assert!(client.with_inner(|c| c.is_pending(second.id())));

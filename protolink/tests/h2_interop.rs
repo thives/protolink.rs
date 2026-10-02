@@ -35,11 +35,27 @@ async fn h2_call(
     path: &str,
     body: Bytes,
 ) -> (http::StatusCode, Vec<u8>, HeaderMap) {
-    let req = Request::post(format!("http://localhost{path}"))
+    h2_call_with(sender, path, body, &[]).await
+}
+
+/// [`h2_call`] with extra request headers.
+async fn h2_call_with(
+    sender: &mut h2::client::SendRequest<Bytes>,
+    path: &str,
+    body: Bytes,
+    extra: &[(&str, &str)],
+) -> (http::StatusCode, Vec<u8>, HeaderMap) {
+    let mut req = Request::post(format!("http://localhost{path}"))
         .header("content-type", "application/grpc")
         .header("te", "trailers")
         .body(())
         .unwrap();
+    for (name, value) in extra {
+        req.headers_mut().insert(
+            http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+            value.parse().unwrap(),
+        );
+    }
     let (resp, mut stream) = sender
         .clone()
         .ready()
@@ -167,7 +183,9 @@ mod streaming {
 
     use bytes::Bytes;
     use http::{HeaderMap, Request, Response};
-    use protolink::grpc::{CallId, Code, FnHandler, Handler, MethodKind, Next, Status};
+    use protolink::grpc::{
+        CallContext, CallId, Code, FnHandler, Handler, MethodKind, Next, Status,
+    };
     use protolink::{ClientConfig, ServerConfig};
 
     use super::{handler, lpm, with_timeout};
@@ -213,7 +231,7 @@ mod streaming {
     }
 
     impl Handler for Streams {
-        fn call(&mut self, _: &str, _: &[u8]) -> Option<Result<Vec<u8>, Status>> {
+        fn call(&mut self, _: &CallContext<'_>, _: &[u8]) -> Option<Result<Vec<u8>, Status>> {
             None
         }
 
@@ -226,7 +244,9 @@ mod streaming {
             }
         }
 
-        fn on_message(&mut self, path: &str, call: CallId, msg: &[u8]) -> Result<(), Status> {
+        fn on_message(&mut self, ctx: &CallContext<'_>, msg: &[u8]) -> Result<(), Status> {
+            let path = ctx.path;
+            let call = ctx.id;
             let mut calls = self.calls.lock().unwrap();
             let state = calls.entry(call).or_default();
             match path {
@@ -245,7 +265,9 @@ mod streaming {
             Ok(())
         }
 
-        fn on_half_close(&mut self, path: &str, call: CallId) -> Result<(), Status> {
+        fn on_half_close(&mut self, ctx: &CallContext<'_>) -> Result<(), Status> {
+            let path = ctx.path;
+            let call = ctx.id;
             let mut calls = self.calls.lock().unwrap();
             let state = calls.entry(call).or_default();
             match path {
@@ -261,10 +283,11 @@ mod streaming {
 
         fn poll_response(
             &mut self,
-            path: &str,
-            call: CallId,
+            ctx: &CallContext<'_>,
             cx: &mut Context<'_>,
         ) -> Poll<Next<Vec<u8>>> {
+            let path = ctx.path;
+            let call = ctx.id;
             if path == "/echo.Echo/Wait" {
                 let mut feed = self.feed.lock().unwrap();
                 if let Some(item) = feed.items.pop_front() {
@@ -292,7 +315,9 @@ mod streaming {
             }
         }
 
-        fn on_cancel(&mut self, path: &str, call: CallId) {
+        fn on_cancel(&mut self, ctx: &CallContext<'_>) {
+            let path = ctx.path;
+            let call = ctx.id;
             self.calls.lock().unwrap().remove(&call);
             self.cancelled.lock().unwrap().push(path.to_owned());
         }
@@ -731,6 +756,195 @@ mod streaming {
             assert_eq!(call.message().await.unwrap().as_deref(), Some(&b"bye"[..]));
             let err = call.message().await.unwrap_err();
             assert_eq!(err.code, Code::Unavailable);
+        })
+        .await;
+    }
+}
+
+// --- Deadlines ---------------------------------------------------------------
+
+mod deadlines {
+    use std::task::{Context, Poll};
+    use std::time::Duration;
+
+    use bytes::Bytes;
+    use http::{HeaderMap, Response};
+    use protolink::grpc::{CallContext, Code, Handler, MethodKind, Next, Status};
+    use protolink::{CallOptions, ClientConfig, ServerConfig};
+
+    use super::{h2_call_with, handler, lpm, with_timeout};
+
+    const QUIET: &str = "/t.T/Quiet";
+
+    /// A server-streaming method that never answers, plus the echo methods.
+    struct QuietEcho;
+
+    impl Handler for QuietEcho {
+        fn call(&mut self, ctx: &CallContext<'_>, req: &[u8]) -> Option<Result<Vec<u8>, Status>> {
+            handler(ctx.path, req)
+        }
+
+        fn method_kind(&self, path: &str) -> Option<MethodKind> {
+            (path == QUIET).then_some(MethodKind::ServerStreaming)
+        }
+
+        fn on_message(&mut self, _: &CallContext<'_>, _: &[u8]) -> Result<(), Status> {
+            Ok(())
+        }
+
+        fn poll_response(
+            &mut self,
+            _: &CallContext<'_>,
+            _: &mut Context<'_>,
+        ) -> Poll<Next<Vec<u8>>> {
+            Poll::Pending
+        }
+    }
+
+    /// An h2 client connected to a protolink server (with a timer).
+    async fn h2_client() -> h2::client::SendRequest<Bytes> {
+        let (a, b) = tokio::io::duplex(16 * 1024);
+        tokio::spawn(async move {
+            let _ = protolink::tokio::serve(a, &mut QuietEcho, ServerConfig::default()).await;
+        });
+        let (sender, conn) = h2::client::handshake(b).await.unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        sender
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn h2_client_timeout_expires_a_quiet_call() {
+        with_timeout(async {
+            let mut sender = h2_client().await;
+            let (status, body, trailers) =
+                h2_call_with(&mut sender, QUIET, lpm(b"x"), &[("grpc-timeout", "100m")]).await;
+            assert_eq!(status, 200);
+            assert!(body.is_empty());
+            assert_eq!(trailers["grpc-status"], "4", "DEADLINE_EXCEEDED");
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn h2_client_zero_timeout_is_already_expired() {
+        with_timeout(async {
+            let mut sender = h2_client().await;
+            let (_, _, trailers) =
+                h2_call_with(&mut sender, QUIET, lpm(b"x"), &[("grpc-timeout", "0n")]).await;
+            assert_eq!(trailers["grpc-status"], "4");
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn h2_client_malformed_timeout_is_rejected() {
+        with_timeout(async {
+            let mut sender = h2_client().await;
+            for bad in ["10x", "10", "S", "123456789S", "-5S", "5 S"] {
+                let (_, body, trailers) = h2_call_with(
+                    &mut sender,
+                    "/echo.Echo/Echo",
+                    lpm(b"x"),
+                    &[("grpc-timeout", bad)],
+                )
+                .await;
+                assert!(body.is_empty(), "{bad}");
+                assert_eq!(trailers["grpc-status"], "3", "INVALID_ARGUMENT for {bad:?}");
+            }
+            // The connection is still fine.
+            let (_, body, trailers) =
+                h2_call_with(&mut sender, "/echo.Echo/Echo", lpm(b"ok"), &[]).await;
+            assert_eq!(body, lpm(b"ok"));
+            assert_eq!(trailers["grpc-status"], "0");
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn h2_client_generous_timeout_does_not_disturb_a_call() {
+        with_timeout(async {
+            let mut sender = h2_client().await;
+            for timeout in ["5S", "1H", "99999999n", "1m"] {
+                let (_, body, trailers) = h2_call_with(
+                    &mut sender,
+                    "/echo.Echo/Echo",
+                    lpm(b"fast"),
+                    &[("grpc-timeout", timeout)],
+                )
+                .await;
+                assert_eq!(body, lpm(b"fast"), "{timeout}");
+                assert_eq!(trailers["grpc-status"], "0", "{timeout}");
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn protolink_client_sends_grpc_timeout_and_resets_on_expiry() {
+        let (a, b) = tokio::io::duplex(16 * 1024);
+        let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (reset_tx, mut reset_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut conn = h2::server::handshake(a).await.unwrap();
+            while let Some(req) = conn.accept().await {
+                let (req, mut respond) = req.unwrap();
+                let path = req.uri().path().to_owned();
+                let timeout = req
+                    .headers()
+                    .get("grpc-timeout")
+                    .map(|v| v.to_str().unwrap().to_owned());
+                seen_tx.send((path.clone(), timeout)).unwrap();
+                let reset_tx = reset_tx.clone();
+                tokio::spawn(async move {
+                    if path == "/echo.Echo/Hang" {
+                        // Never answer; report how the client ends the stream.
+                        let reason = std::future::poll_fn(|cx| respond.poll_reset(cx))
+                            .await
+                            .unwrap();
+                        reset_tx.send(reason).unwrap();
+                        return;
+                    }
+                    let mut body = req.into_body();
+                    while let Some(chunk) = body.data().await {
+                        let chunk = chunk.unwrap();
+                        body.flow_control().release_capacity(chunk.len()).unwrap();
+                    }
+                    let resp = Response::builder()
+                        .status(200)
+                        .header("content-type", "application/grpc")
+                        .body(())
+                        .unwrap();
+                    let mut send = respond.send_response(resp, false).unwrap();
+                    send.send_data(lpm(b"ok"), false).unwrap();
+                    let mut trailers = HeaderMap::new();
+                    trailers.insert("grpc-status", "0".parse().unwrap());
+                    send.send_trailers(trailers).unwrap();
+                });
+            }
+        });
+        with_timeout(async {
+            let mut client = protolink::tokio::client(b, ClientConfig::default());
+            let err = client
+                .unary_with(
+                    "/echo.Echo/Hang",
+                    b"",
+                    CallOptions::timeout(Duration::from_millis(300)),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, Code::DeadlineExceeded);
+            // The next operation writes the reset of the expired call.
+            assert_eq!(client.unary("/echo.Echo/Echo", b"").await.unwrap(), b"ok");
+
+            let (path, timeout) = seen_rx.recv().await.unwrap();
+            assert_eq!(path, "/echo.Echo/Hang");
+            assert_eq!(timeout.as_deref(), Some("300000u"));
+            let (path, timeout) = seen_rx.recv().await.unwrap();
+            assert_eq!(path, "/echo.Echo/Echo");
+            assert_eq!(timeout, None, "no timeout, no header");
+            assert_eq!(reset_rx.recv().await.unwrap(), h2::Reason::CANCEL);
         })
         .await;
     }

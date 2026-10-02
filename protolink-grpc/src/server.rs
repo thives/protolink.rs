@@ -3,6 +3,7 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::task::{Context, Poll};
+use core::time::Duration;
 
 use protolink_http2::{
     Config, Connection, Error, ErrorCode, Event, FlowControl, HeaderField, StreamId,
@@ -12,7 +13,9 @@ use crate::compression::{Codec, Compression};
 use crate::handler::unimplemented;
 use crate::inbound::Inbound;
 use crate::status::encode_message;
-use crate::{CallId, DEFAULT_MAX_MESSAGE_SIZE, Handler, MethodKind, Next, Status, lpm};
+use crate::{
+    CallContext, CallId, DEFAULT_MAX_MESSAGE_SIZE, Handler, MethodKind, Next, Status, lpm, timeout,
+};
 
 /// Server configuration.
 #[derive(Debug, Clone, Copy)]
@@ -57,6 +60,9 @@ impl Default for ServerConfig {
 struct Call {
     path: String,
     kind: MethodKind,
+    /// When the call runs out of time, on the server's clock (see
+    /// [`Server::tick`]), from the request's `grpc-timeout`.
+    deadline: Option<Duration>,
     inbound: Inbound,
     /// The client ended its side of the stream (END_STREAM received).
     half_closed: bool,
@@ -68,6 +74,17 @@ struct Call {
     headers_sent: bool,
     /// Encoding of the response messages, negotiated from the request.
     response_codec: Option<&'static dyn Codec>,
+}
+
+impl Call {
+    /// What handlers are told about this call.
+    fn ctx(&self, id: StreamId) -> CallContext<'_> {
+        CallContext {
+            path: &self.path,
+            id,
+            deadline: self.deadline,
+        }
+    }
 }
 
 /// Sans-IO gRPC server for one connection.
@@ -86,6 +103,20 @@ struct Call {
 /// all while the call's responses are backed up; undelivered requests keep
 /// their flow-control credit, which stops the client. Memory therefore stays
 /// bounded however slowly the client reads.
+///
+/// # Deadlines
+///
+/// The server never reads a clock. The caller reports the time with
+/// [`tick`](Self::tick), a monotonic [`Duration`] since any fixed point, and
+/// learns when to call it next from [`next_deadline`](Self::next_deadline).
+/// A request's `grpc-timeout` is a relative budget that starts when its
+/// headers are received, at the time last reported to `tick`, so call `tick`
+/// before [`recv`](Self::recv). Once a `tick` reaches a call's deadline, the
+/// call ends with `DEADLINE_EXCEEDED`; streaming calls are reported to
+/// [`Handler::on_cancel`]. A call that is already expired when it would be
+/// dispatched never reaches the handler. A unary handler that is running
+/// can't be interrupted. A request without `grpc-timeout` has no deadline, and
+/// a malformed one is answered with `INVALID_ARGUMENT`.
 #[derive(Debug)]
 pub struct Server {
     conn: Connection,
@@ -95,6 +126,8 @@ pub struct Server {
     last_call: StreamId,
     max_message_size: usize,
     compression: Compression,
+    /// Latest time reported through [`Server::tick`].
+    now: Duration,
 }
 
 impl Server {
@@ -107,7 +140,60 @@ impl Server {
             last_call: 0,
             max_message_size: config.max_message_size,
             compression: config.compression,
+            now: Duration::ZERO,
         }
+    }
+
+    /// Report the current time and end every call whose deadline has been
+    /// reached with `DEADLINE_EXCEEDED`. Streaming calls are reported to
+    /// [`Handler::on_cancel`]. Write [`pending_output`](Self::pending_output)
+    /// afterwards.
+    ///
+    /// `now` is a monotonic time since any fixed point, in the same unit and
+    /// from the same clock on every call. Earlier values than one already
+    /// reported are ignored.
+    pub fn tick<H: Handler + ?Sized>(&mut self, now: Duration, handler: &mut H) {
+        self.now = self.now.max(now);
+        let expired: Vec<StreamId> = self
+            .calls
+            .iter()
+            .filter(|(_, c)| c.deadline.is_some_and(|d| d <= self.now))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in expired {
+            self.expire(id, handler);
+        }
+    }
+
+    /// Latest time reported through [`tick`](Self::tick).
+    pub fn now(&self) -> Duration {
+        self.now
+    }
+
+    /// When the earliest deadline of an active call is reached, on the clock
+    /// given to [`tick`](Self::tick). `None` if no active call has one.
+    pub fn next_deadline(&self) -> Option<Duration> {
+        self.calls.values().filter_map(|c| c.deadline).min()
+    }
+
+    /// End the call with `DEADLINE_EXCEEDED`.
+    fn expire<H: Handler + ?Sized>(&mut self, id: StreamId, handler: &mut H) {
+        let Some(kind) = self.calls.get(&id).map(|c| c.kind) else {
+            return;
+        };
+        let status = Status::deadline_exceeded("deadline exceeded");
+        if kind == MethodKind::Unary {
+            self.finish(id, Err(status));
+        } else {
+            self.abort(id, status, handler);
+        }
+    }
+
+    fn is_expired(&self, id: StreamId) -> bool {
+        self.calls
+            .get(&id)
+            .and_then(|c| c.deadline)
+            .is_some_and(|d| d <= self.now)
     }
 
     /// Process received bytes: dispatch complete unary requests and deliver
@@ -152,7 +238,7 @@ impl Server {
                 let _ = self.conn.reset_stream(id, ErrorCode::Cancel);
             }
             if call.kind != MethodKind::Unary {
-                handler.on_cancel(&call.path, id);
+                handler.on_cancel(&call.ctx(id));
             }
         }
     }
@@ -231,6 +317,24 @@ impl Server {
                             return;
                         }
                         Ok(path) => {
+                            // A malformed timeout can't be honored, and
+                            // ignoring it would silently run the call
+                            // without the deadline the client asked for.
+                            let timeout = match header(&headers, "grpc-timeout") {
+                                None => None,
+                                Some(value) => match timeout::parse(value) {
+                                    Some(timeout) => Some(timeout),
+                                    None => {
+                                        self.send_status(
+                                            stream_id,
+                                            false,
+                                            end_stream,
+                                            Err(Status::invalid_argument("malformed grpc-timeout")),
+                                        );
+                                        return;
+                                    }
+                                },
+                            };
                             // The request's encoding must be one we can
                             // decode; the client is told which ones we can.
                             let Ok(request_codec) = self
@@ -261,6 +365,7 @@ impl Server {
                                 Call {
                                     path,
                                     kind,
+                                    deadline: timeout.map(|t| self.now.saturating_add(t)),
                                     inbound,
                                     half_closed: end_stream,
                                     end_delivered: false,
@@ -307,7 +412,7 @@ impl Server {
                 if let Some(call) = self.calls.remove(&stream_id)
                     && call.kind != MethodKind::Unary
                 {
-                    handler.on_cancel(&call.path, stream_id);
+                    handler.on_cancel(&call.ctx(stream_id));
                 }
             }
             Event::GoAway { .. } => {}
@@ -333,6 +438,10 @@ impl Server {
             let Some(kind) = self.calls.get(&id).map(|c| c.kind) else {
                 return;
             };
+            if self.is_expired(id) {
+                self.expire(id, handler);
+                return;
+            }
             let progressed = match kind {
                 MethodKind::Unary => {
                     self.drive_unary(id, handler);
@@ -406,9 +515,14 @@ impl Server {
         let truncated = call.inbound.finish();
         let message = call.inbound.next(&mut self.conn, id);
         let path = call.path.clone();
+        let ctx = CallContext {
+            path: &path,
+            id,
+            deadline: call.deadline,
+        };
         let result = truncated.and_then(|()| match message {
             Some(Ok(msg)) => handler
-                .call(&path, &msg)
+                .call(&ctx, &msg)
                 .unwrap_or_else(|| Err(unimplemented(&path))),
             Some(Err(e)) => Err(e),
             None => Err(Status::internal("missing request message")),
@@ -460,7 +574,12 @@ impl Server {
                     }
                     call.requests += 1;
                     let path = call.path.clone();
-                    if let Err(status) = handler.on_message(&path, id, &msg) {
+                    let ctx = CallContext {
+                        path: &path,
+                        id,
+                        deadline: call.deadline,
+                    };
+                    if let Err(status) = handler.on_message(&ctx, &msg) {
                         self.finish(id, Err(status));
                         return true;
                     }
@@ -483,7 +602,12 @@ impl Server {
                     }
                     call.end_delivered = true;
                     let path = call.path.clone();
-                    if let Err(status) = handler.on_half_close(&path, id) {
+                    let ctx = CallContext {
+                        path: &path,
+                        id,
+                        deadline: call.deadline,
+                    };
+                    if let Err(status) = handler.on_half_close(&ctx) {
                         self.finish(id, Err(status));
                     }
                     return true;
@@ -513,14 +637,19 @@ impl Server {
                 return progressed;
             }
             let path = call.path.clone();
-            let Poll::Ready(next) = handler.poll_response(&path, id, cx) else {
+            let ctx = CallContext {
+                path: &path,
+                id,
+                deadline: call.deadline,
+            };
+            let Poll::Ready(next) = handler.poll_response(&ctx, cx) else {
                 // The handler is working on the call: send the response
                 // headers now, so that peers which wait for them before
                 // streaming (or to see the call accepted) are not stalled.
                 // Calls that fail immediately still get a trailers-only
                 // response.
                 if !self.send_headers(id) {
-                    handler.on_cancel(&path, id);
+                    handler.on_cancel(&ctx);
                     return true;
                 }
                 return progressed;
@@ -537,7 +666,7 @@ impl Server {
                         return true;
                     }
                     if !self.send_message(id, &msg) {
-                        handler.on_cancel(&path, id);
+                        handler.on_cancel(&ctx);
                         return true;
                     }
                     if kind == MethodKind::ClientStreaming {
@@ -663,11 +792,16 @@ impl Server {
 
     /// End a streaming call the handler did not finish itself.
     fn abort<H: Handler + ?Sized>(&mut self, id: StreamId, status: Status, handler: &mut H) {
-        let Some(path) = self.calls.get(&id).map(|c| c.path.clone()) else {
+        let Some((path, deadline)) = self.calls.get(&id).map(|c| (c.path.clone(), c.deadline))
+        else {
             return;
         };
         self.finish(id, Err(status));
-        handler.on_cancel(&path, id);
+        handler.on_cancel(&CallContext {
+            path: &path,
+            id,
+            deadline,
+        });
     }
 }
 

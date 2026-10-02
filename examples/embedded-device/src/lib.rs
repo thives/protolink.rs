@@ -33,7 +33,7 @@ use device::{
     BatchSummary, Command, Command_, DeviceStatus, Event, EventSubscribe, OutputState, Reply,
     Reply_, RestartAck,
 };
-use protolink::{CallId, Next, Status};
+use protolink::{CallContext, CallId, Next, Status};
 
 /// Event code recorded when an output changes state.
 pub const EVENT_OUTPUT_CHANGED: u32 = 1;
@@ -122,17 +122,27 @@ impl Device {
 }
 
 impl Service for Device {
-    fn command(&mut self, request: Command) -> Result<Reply, Status> {
+    fn command(&mut self, _: &CallContext<'_>, request: Command) -> Result<Reply, Status> {
         self.execute(request)
     }
 
-    fn event_subscribe(&mut self, call: CallId, _request: EventSubscribe) -> Result<(), Status> {
+    fn event_subscribe(
+        &mut self,
+        ctx: &CallContext<'_>,
+        _request: EventSubscribe,
+    ) -> Result<(), Status> {
+        let call = ctx.id;
         let snapshot = self.events.iter().copied().collect();
         self.calls.subscriptions.insert(call, snapshot);
         Ok(())
     }
 
-    fn poll_event_subscribe(&mut self, call: CallId, _cx: &mut Context<'_>) -> Poll<Next<Event>> {
+    fn poll_event_subscribe(
+        &mut self,
+        ctx: &CallContext<'_>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Next<Event>> {
+        let call = ctx.id;
         let next = self
             .calls
             .subscriptions
@@ -147,11 +157,13 @@ impl Service for Device {
         })
     }
 
-    fn cancel_event_subscribe(&mut self, call: CallId) {
+    fn cancel_event_subscribe(&mut self, ctx: &CallContext<'_>) {
+        let call = ctx.id;
         self.calls.subscriptions.remove(&call);
     }
 
-    fn command_batch(&mut self, call: CallId, request: Command) -> Result<(), Status> {
+    fn command_batch(&mut self, ctx: &CallContext<'_>, request: Command) -> Result<(), Status> {
+        let call = ctx.id;
         let accepted = self.execute(request).is_ok();
         let summary = self.calls.batches.entry(call).or_default();
         if accepted {
@@ -164,18 +176,21 @@ impl Service for Device {
 
     fn poll_command_batch(
         &mut self,
-        call: CallId,
+        ctx: &CallContext<'_>,
         _cx: &mut Context<'_>,
     ) -> Poll<Result<BatchSummary, Status>> {
+        let call = ctx.id;
         // An empty batch has no state yet.
         Poll::Ready(Ok(self.calls.batches.remove(&call).unwrap_or_default()))
     }
 
-    fn cancel_command_batch(&mut self, call: CallId) {
+    fn cancel_command_batch(&mut self, ctx: &CallContext<'_>) {
+        let call = ctx.id;
         self.calls.batches.remove(&call);
     }
 
-    fn command_stream(&mut self, call: CallId, request: Command) -> Result<(), Status> {
+    fn command_stream(&mut self, ctx: &CallContext<'_>, request: Command) -> Result<(), Status> {
+        let call = ctx.id;
         if self
             .calls
             .streams
@@ -195,13 +210,19 @@ impl Service for Device {
         Ok(())
     }
 
-    fn end_command_stream(&mut self, call: CallId) -> Result<(), Status> {
+    fn end_command_stream(&mut self, ctx: &CallContext<'_>) -> Result<(), Status> {
+        let call = ctx.id;
         let stream = self.calls.streams.entry(call).or_default();
         stream.end.get_or_insert(Ok(()));
         Ok(())
     }
 
-    fn poll_command_stream(&mut self, call: CallId, _cx: &mut Context<'_>) -> Poll<Next<Reply>> {
+    fn poll_command_stream(
+        &mut self,
+        ctx: &CallContext<'_>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Next<Reply>> {
+        let call = ctx.id;
         // Readiness only changes when a command or the half-close arrives,
         // after which the server polls again, so no waker is needed.
         let Some(stream) = self.calls.streams.get_mut(&call) else {
@@ -219,7 +240,8 @@ impl Service for Device {
         }
     }
 
-    fn cancel_command_stream(&mut self, call: CallId) {
+    fn cancel_command_stream(&mut self, ctx: &CallContext<'_>) {
+        let call = ctx.id;
         self.calls.streams.remove(&call);
     }
 }

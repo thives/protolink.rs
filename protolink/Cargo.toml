@@ -25,7 +25,7 @@ embedded-io-adapters = { version = "0.7", features = ["tokio-1"], optional = tru
 tokio = { version = "1", default-features = false, optional = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "io-util", "net", "time"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "io-util", "net", "time", "test-util", "sync"] }
 critical-section = { version = "1", features = ["std"] }
 h2 = "0.4"
 http = "1"
@@ -42,7 +42,7 @@ async = [
 ]
 embedded-io = ["async"]
 blocking = ["dep:embedded-io"]
-tokio = ["std", "async", "dep:embedded-io-adapters", "dep:tokio"]
+tokio = ["std", "async", "dep:embedded-io-adapters", "dep:tokio", "tokio/time"]
 portable-atomic = [
     "async",
     "dep:portable-atomic",

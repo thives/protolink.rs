@@ -58,7 +58,7 @@ pub mod proto {
 }
 
 impl proto::service::Service for MyDevice {
-    fn command(&mut self, request: Command) -> Result<Reply, protolink::Status> { /* ... */ }
+    fn command(&mut self, ctx: &protolink::CallContext<'_>, request: Command) -> Result<Reply, protolink::Status> { /* ... */ }
 }
 
 // Server, on any embedded_io_async::{Read, Write} transport:
@@ -76,12 +76,13 @@ For an RPC `Method`, the generated trait has:
 
 | Shape | Trait methods |
 |---|---|
-| unary | `method(request) -> Result<Resp, Status>` |
-| server streaming | `method(call, request)`, `poll_method(call, cx) -> Poll<Next<Resp>>`, `cancel_method(call)` |
-| client streaming | `method(call, request)` per message, `poll_method(call, cx) -> Poll<Result<Resp, Status>>`, `cancel_method(call)` |
-| bidirectional | `method(call, request)` per message, `end_method(call)`, `poll_method(call, cx) -> Poll<Next<Resp>>`, `cancel_method(call)` |
+| unary | `method(ctx, request) -> Result<Resp, Status>` |
+| server streaming | `method(ctx, request)`, `poll_method(ctx, cx) -> Poll<Next<Resp>>`, `cancel_method(ctx)` |
+| client streaming | `method(ctx, request)` per message, `poll_method(ctx, cx) -> Poll<Result<Resp, Status>>`, `cancel_method(ctx)` |
+| bidirectional | `method(ctx, request)` per message, `end_method(ctx)`, `poll_method(ctx, cx) -> Poll<Next<Resp>>`, `cancel_method(ctx)` |
 
-Servers stay sans-IO and executor-agnostic: calls are identified by a `CallId`, request messages are
+Servers stay sans-IO and executor-agnostic: every method gets a `CallContext` with the method path, a
+`CallId` that identifies the call and its `deadline`; request messages are
 delivered as they arrive, and responses are pulled with `poll_*` (wake `cx` when a pending response
 becomes ready). Streaming methods default to `UNIMPLEMENTED`, so adding one to a `.proto` does not
 break existing implementations.
@@ -125,6 +126,74 @@ can't run while a streaming call exists.
 
 See [`examples/embedded-device`](examples/embedded-device) for a complete, tested embedded-device
 example, including a TCP server (`just example-server`) that can be queried with `grpcurl`.
+
+## Deadlines
+
+gRPC deadlines are supported: a client sends the time it is willing to wait as `grpc-timeout`, and the
+call ends with `DEADLINE_EXCEEDED` when it runs out, on both sides. See
+[`docs/DEADLINES.md`](docs/DEADLINES.md) for the design and the details below.
+
+```rust
+use std::time::Duration;
+use protolink::{CallOptions, ClientConfig};
+
+// One call:
+let reply = client
+    .command_with_options(&request, CallOptions::timeout(Duration::from_millis(500)))
+    .await?;
+let stream = client.command_stream_with_options(CallOptions::timeout(Duration::from_secs(30))).await?;
+
+// Every call that doesn't set its own:
+let config = ClientConfig { default_timeout: Some(Duration::from_secs(2)), ..Default::default() };
+```
+
+Every generated client method has a `<method>_with_options` variant. The timeout covers the whole call,
+not each message. A zero timeout fails at once with `DEADLINE_EXCEEDED` without sending anything.
+
+On the server, every handler method gets a `CallContext` with the call's `deadline`; `ctx.remaining(now)`
+turns it into a budget for work the handler starts. Expired streaming calls are reported to `on_cancel`.
+
+**Time source.** The sans-IO cores never read a clock: the driver reports time with `tick(now)` and
+learns when to wake with `next_deadline()`. The drivers need a clock to enforce deadlines, and without
+one still *send* `grpc-timeout` (so the server enforces it) but never expire a call themselves:
+
+| Driver | Enforce deadlines with |
+|---|---|
+| tokio | nothing to do: `protolink::tokio::{client, serve}` use `TokioTimer` |
+| async (`embedded-io`) | `Client::with_timer(io, config, timer)`, `serve_with_timer(io, handler, config, timer)`, for a `protolink::Timer` |
+| blocking | `blocking::Client::with_clock(io, config, clock)`, `serve_with_clock`, `serve_wakeable_with_clock`, for a `protolink::Clock` and an `io` that implements `blocking::ReadTimeout` |
+
+`Clock` is `now() -> Duration` (monotonic, since any fixed point); `Timer` adds
+`sleep_until(deadline) -> impl Future<Output = ()>`. On `no_std`, implement them on the platform timer:
+
+```rust
+impl protolink::Clock for EmbassyTimer {
+    fn now(&self) -> Duration { Duration::from_micros(embassy_time::Instant::now().as_micros()) }
+}
+impl protolink::Timer for EmbassyTimer {
+    fn sleep_until(&self, deadline: Duration) -> impl Future<Output = ()> {
+        embassy_time::Timer::at(embassy_time::Instant::from_micros(deadline.as_micros() as u64))
+    }
+}
+```
+
+(`protolink::Timer` is not `protolink::link::Timer`, the ARQ retransmission timer.)
+
+Things to know:
+
+- **A running unary handler can't be preempted.** `Handler::call` is synchronous, so a handler that
+  overruns its deadline still returns its response, which a client with its own deadline no longer waits
+  for. Long-running handlers should check `ctx.remaining(now)`.
+- **A cancel-safe `read` is required** whenever a timer is used, also for a unary-only server or a client
+  with one call: the driver drops its pending read when a deadline is reached (the same requirement as
+  streaming handlers and concurrent calls; tokio streams, `CobsFramed` and the `link` stack qualify).
+- **Blocking drivers bound the read with a read timeout.** They set it to the time left before each read
+  (`blocking::ReadTimeout`, or `WakeableRead::read_or_wake_timeout`) and treat `ErrorKind::TimedOut` as an
+  idle tick. Without that hook a deadline is only noticed when a read returns. `std` sockets report
+  timeouts as `WouldBlock`, which `embedded-io` maps to `ErrorKind::Other`; map it to `TimedOut`.
+- When a client's call expires, buffered messages are still delivered before the status, the stream is
+  reset with `RST_STREAM(CANCEL)`, and the reset is written by the next operation on the client.
+- A malformed `grpc-timeout` is answered with `INVALID_ARGUMENT`.
 
 ## Compression
 
@@ -182,11 +251,12 @@ Supported:
 - `application/grpc` (and `+proto`) content types
 - `grpc-status` / `grpc-message` (percent-encoded), trailers-only error responses
 - bounded message sizes (4 KiB default, configurable) and bounded buffering under HTTP/2 flow control
+- deadlines: `grpc-timeout` is sent and enforced, with `DEADLINE_EXCEEDED` (see [Deadlines](#deadlines))
 - HTTP/2 h2c with preface, SETTINGS/PING acks, flow control, CONTINUATION, GOAWAY
 
 Not supported:
 
-- deadlines (`grpc-timeout` is ignored), custom metadata
+- custom metadata
 - reflection, health checking, interceptors, TLS
 
 Interoperability is tested against the `h2` crate (the HTTP/2 stack under hyper and tonic).
@@ -198,7 +268,7 @@ composed-link, and embedded-device end-to-end tests are enabled in `tests/link.r
 `examples/embedded-device/tests/e2e.rs`. COBS framing alone (`protolink::link::CobsFramed`) is also tested.
 
 ARQ retransmits on a timeout, so it needs a time source (the `arq_io_async::Timer` trait, re-exported
-as `protolink::link::Timer`):
+as `protolink::link::Timer`, which is not the `protolink::Timer` used for [deadlines](#deadlines)):
 
 | Constructor | Requires | Timer |
 |---|---|---|

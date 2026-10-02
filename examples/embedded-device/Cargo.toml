@@ -16,6 +16,6 @@ protolink-grpc-gen = { path = "../../protolink-grpc-gen" }
 micropb-gen = "0.6"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "macros", "io-util", "net", "time"] }
+tokio = { version = "1", features = ["rt", "macros", "io-util", "net", "time", "test-util"] }
 embedded-io-async = "0.7"
 embedded-io-adapters = { version = "0.7", features = ["tokio-1", "std"] }

@@ -15,16 +15,16 @@
 //! ## Streaming methods
 //!
 //! Servers are sans-IO and executor-agnostic: each streaming call is
-//! identified by a `CallId`, request messages are delivered to the service
+//! identified by the `CallId` in its `CallContext`, request messages are delivered to the service
 //! as they arrive, and responses are pulled with a `poll_<method>` function
 //! taking a [`Context`](core::task::Context). For an RPC `Method`:
 //!
 //! | Shape | Trait methods |
 //! |---|---|
-//! | unary | `method(request) -> Result<Resp, Status>` |
-//! | server streaming | `method(call, request)`, `poll_method(call, cx) -> Poll<Next<Resp>>`, `cancel_method(call)` |
-//! | client streaming | `method(call, request)` per message, `poll_method(call, cx) -> Poll<Result<Resp, Status>>` after the client half-closes, `cancel_method(call)` |
-//! | bidirectional | `method(call, request)` per message, `end_method(call)` on half-close, `poll_method(call, cx) -> Poll<Next<Resp>>`, `cancel_method(call)` |
+//! | unary | `method(ctx, request) -> Result<Resp, Status>` |
+//! | server streaming | `method(ctx, request)`, `poll_method(ctx, cx) -> Poll<Next<Resp>>`, `cancel_method(ctx)` |
+//! | client streaming | `method(ctx, request)` per message, `poll_method(ctx, cx) -> Poll<Result<Resp, Status>>` after the client half-closes, `cancel_method(ctx)` |
+//! | bidirectional | `method(ctx, request)` per message, `end_method(ctx)` on half-close, `poll_method(ctx, cx) -> Poll<Next<Resp>>`, `cancel_method(ctx)` |
 //!
 //! Streaming methods have default implementations that answer
 //! `UNIMPLEMENTED`, so adding a streaming RPC to a `.proto` does not break
@@ -354,6 +354,7 @@ impl Generator {
                     kind: Kind::of(m),
                     konst: format!("METHOD_{}", s.to_uppercase()),
                     func: rust_fn_ident(&s),
+                    with_options: format!("{s}_with_options"),
                     poll: format!("poll_{s}"),
                     end: format!("end_{s}"),
                     cancel: format!("cancel_{s}"),
@@ -437,7 +438,7 @@ impl Generator {
             let _ = writeln!(
                 w,
                 "    ///\n    \
-                 /// Streaming calls are identified by a `CallId`, unique per connection.\n    \
+                 /// Every method gets a `CallContext` (path, `CallId` unique per connection, deadline).\n    \
                  /// Request messages are delivered as they arrive and responses are\n    \
                  /// pulled with the `poll_*` methods; on `Poll::Pending`, wake `cx` once a\n    \
                  /// response may be ready. Unless overridden, streaming methods answer\n    \
@@ -459,8 +460,8 @@ impl Generator {
                 let _ = writeln!(
                     w,
                     "        /// {doc}\n        \
-                     fn {func}(&mut self, call: __rt::CallId, request: {req}) -> Result<(), Status> {{\n            \
-                     let _ = (call, request);\n            \
+                     fn {func}(&mut self, ctx: &__rt::CallContext<'_>, request: {req}) -> Result<(), Status> {{\n            \
+                     let _ = (ctx, request);\n            \
                      Err({unimpl})\n        }}\n"
                 );
             };
@@ -470,8 +471,8 @@ impl Generator {
                     "        /// {doc}\n        \
                      /// Return `Next::Message` for each response, then `Next::Done` with\n        \
                      /// the final status.\n        \
-                     fn {poll}(&mut self, call: __rt::CallId, cx: &mut Context<'_>) -> Poll<__rt::Next<{resp}>> {{\n            \
-                     let _ = (call, cx);\n            \
+                     fn {poll}(&mut self, ctx: &__rt::CallContext<'_>, cx: &mut Context<'_>) -> Poll<__rt::Next<{resp}>> {{\n            \
+                     let _ = (ctx, cx);\n            \
                      Poll::Ready(__rt::Next::Done(Err({unimpl})))\n        }}\n"
                 );
             };
@@ -480,8 +481,8 @@ impl Generator {
                     w,
                     "        /// A `{n}` call ended without the service finishing it (cancelled,\n        \
                      /// reset, malformed or the connection closed): release its state.\n        \
-                     fn {cancel}(&mut self, call: __rt::CallId) {{\n            \
-                     let _ = call;\n        }}"
+                     fn {cancel}(&mut self, ctx: &__rt::CallContext<'_>) {{\n            \
+                     let _ = ctx;\n        }}"
                 );
             };
             match m.kind {
@@ -489,7 +490,7 @@ impl Generator {
                     let _ = writeln!(
                         w,
                         "        /// Handle `{n}`.\n        \
-                         fn {func}(&mut self, request: {req}) -> Result<{resp}, Status>;"
+                         fn {func}(&mut self, ctx: &__rt::CallContext<'_>, request: {req}) -> Result<{resp}, Status>;"
                     );
                 }
                 Kind::Server => {
@@ -514,8 +515,8 @@ impl Generator {
                         w,
                         "        /// The response of a `{n}` call, polled once the client has sent\n        \
                          /// all of its requests.\n        \
-                         fn {poll}(&mut self, call: __rt::CallId, cx: &mut Context<'_>) -> Poll<Result<{resp}, Status>> {{\n            \
-                         let _ = (call, cx);\n            \
+                         fn {poll}(&mut self, ctx: &__rt::CallContext<'_>, cx: &mut Context<'_>) -> Poll<Result<{resp}, Status>> {{\n            \
+                         let _ = (ctx, cx);\n            \
                          Poll::Ready(Err({unimpl}))\n        }}\n"
                     );
                     cancel_fn(w);
@@ -531,8 +532,8 @@ impl Generator {
                     let _ = writeln!(
                         w,
                         "        /// The client finished sending requests on a `{n}` call.\n        \
-                         fn {end}(&mut self, call: __rt::CallId) -> Result<(), Status> {{\n            \
-                         let _ = call;\n            \
+                         fn {end}(&mut self, ctx: &__rt::CallContext<'_>) -> Result<(), Status> {{\n            \
+                         let _ = ctx;\n            \
                          Ok(())\n        }}\n"
                     );
                     poll_stream(
@@ -565,14 +566,14 @@ impl Generator {
         // Unary dispatch.
         let _ = writeln!(
             w,
-            "        fn call(&mut self, path: &str, request: &[u8]) -> Option<Result<Vec<u8>, Status>> {{\n            \
-             match path {{"
+            "        fn call(&mut self, ctx: &__rt::CallContext<'_>, request: &[u8]) -> Option<Result<Vec<u8>, Status>> {{\n            \
+             match ctx.path {{"
         );
         for m in methods {
             if m.kind == Kind::Unary {
                 let _ = writeln!(
                     w,
-                    "                {} => Some(__rt::codec::unary(request, |req| {name}::{}(&mut self.0, req))),",
+                    "                {} => Some(__rt::codec::unary(request, |req| {name}::{}(&mut self.0, ctx, req))),",
                     m.konst, m.func
                 );
             } else {
@@ -620,13 +621,13 @@ impl Generator {
             let streams = || methods.iter().filter(|m| m.kind != Kind::Unary);
             let _ = writeln!(
                 w,
-                "\n        fn on_message(&mut self, path: &str, call: __rt::CallId, message: &[u8]) -> Result<(), Status> {{\n            \
-                 match path {{"
+                "\n        fn on_message(&mut self, ctx: &__rt::CallContext<'_>, message: &[u8]) -> Result<(), Status> {{\n            \
+                 match ctx.path {{"
             );
             for m in streams() {
                 let _ = writeln!(
                     w,
-                    "                {} => __rt::codec::message(message, |req| {name}::{}(&mut self.0, call, req)),",
+                    "                {} => __rt::codec::message(message, |req| {name}::{}(&mut self.0, ctx, req)),",
                     m.konst, m.func
                 );
             }
@@ -637,13 +638,13 @@ impl Generator {
 
             let _ = writeln!(
                 w,
-                "\n        fn on_half_close(&mut self, path: &str, call: __rt::CallId) -> Result<(), Status> {{\n            \
-                 match path {{"
+                "\n        fn on_half_close(&mut self, ctx: &__rt::CallContext<'_>) -> Result<(), Status> {{\n            \
+                 match ctx.path {{"
             );
             for m in streams().filter(|m| m.kind == Kind::Bidi) {
                 let _ = writeln!(
                     w,
-                    "                {} => {name}::{}(&mut self.0, call),",
+                    "                {} => {name}::{}(&mut self.0, ctx),",
                     m.konst, m.end
                 );
             }
@@ -654,8 +655,8 @@ impl Generator {
 
             let _ = writeln!(
                 w,
-                "\n        fn poll_response(&mut self, path: &str, call: __rt::CallId, cx: &mut Context<'_>) -> Poll<__rt::Next<Vec<u8>>> {{\n            \
-                 match path {{"
+                "\n        fn poll_response(&mut self, ctx: &__rt::CallContext<'_>, cx: &mut Context<'_>) -> Poll<__rt::Next<Vec<u8>>> {{\n            \
+                 match ctx.path {{"
             );
             for m in streams() {
                 let helper = if m.kind == Kind::Client {
@@ -665,7 +666,7 @@ impl Generator {
                 };
                 let _ = writeln!(
                     w,
-                    "                {} => __rt::codec::{helper}({name}::{}(&mut self.0, call, cx)),",
+                    "                {} => __rt::codec::{helper}({name}::{}(&mut self.0, ctx, cx)),",
                     m.konst, m.poll
                 );
             }
@@ -676,13 +677,13 @@ impl Generator {
 
             let _ = writeln!(
                 w,
-                "\n        fn on_cancel(&mut self, path: &str, call: __rt::CallId) {{\n            \
-                 match path {{"
+                "\n        fn on_cancel(&mut self, ctx: &__rt::CallContext<'_>) {{\n            \
+                 match ctx.path {{"
             );
             for m in streams() {
                 let _ = writeln!(
                     w,
-                    "                {} => {name}::{}(&mut self.0, call),",
+                    "                {} => {name}::{}(&mut self.0, ctx),",
                     m.konst, m.cancel
                 );
             }
@@ -698,6 +699,7 @@ struct M {
     kind: Kind,
     konst: String,
     func: String,
+    with_options: String,
     poll: String,
     end: String,
     cancel: String,
@@ -709,12 +711,18 @@ impl M {
     /// Names of the trait methods generated for this RPC.
     fn trait_fns(&self) -> Vec<String> {
         match self.kind {
-            Kind::Unary => vec![self.func.clone()],
+            Kind::Unary => vec![self.func.clone(), self.with_options.clone()],
             Kind::Server | Kind::Client => {
-                vec![self.func.clone(), self.poll.clone(), self.cancel.clone()]
+                vec![
+                    self.func.clone(),
+                    self.with_options.clone(),
+                    self.poll.clone(),
+                    self.cancel.clone(),
+                ]
             }
             Kind::Bidi => vec![
                 self.func.clone(),
+                self.with_options.clone(),
                 self.end.clone(),
                 self.poll.clone(),
                 self.cancel.clone(),
@@ -837,12 +845,20 @@ fn gen_client(
         for m in methods.iter().filter(|m| m.kind == Kind::Unary) {
             let _ = writeln!(
                 w,
-                "        /// Call `{}`.\n        \
-                 pub {asyncness}fn {}(&mut self, request: &{}) -> Result<{}, Status> {{\n            \
+                "        /// Call `{n}`.\n        \
+                 pub {asyncness}fn {func}(&mut self, request: &{req}) -> Result<{resp}, Status> {{\n            \
+                 self.{with}(request, __rt::CallOptions::default()){dot_await}\n        }}\n\n        \
+                 /// Call `{n}` with per-call `options`, for example a timeout.\n        \
+                 pub {asyncness}fn {with}(&mut self, request: &{req}, options: __rt::CallOptions) -> Result<{resp}, Status> {{\n            \
                  let request = __rt::codec::encode(request)?;\n            \
-                 let reply = __rt::{unary_bound}::unary(&mut self.transport, {}, &request){dot_await}?;\n            \
+                 let reply = __rt::{unary_bound}::unary(&mut self.transport, {konst}, &request, options){dot_await}?;\n            \
                  __rt::codec::decode_response(&reply)\n        }}",
-                m.name, m.func, m.req, m.resp, m.konst
+                n = m.name,
+                func = m.func,
+                with = m.with_options,
+                req = m.req,
+                resp = m.resp,
+                konst = m.konst,
             );
         }
         let _ = writeln!(w, "    }}");
@@ -852,8 +868,10 @@ fn gen_client(
         let _ = writeln!(w, "\n    impl<T: __rt::{stream_bound}> {name}{ty}<T> {{");
         for m in methods.iter().filter(|m| m.kind != Kind::Unary) {
             let (n, func, req, resp, konst) = (&m.name, &m.func, &m.req, &m.resp, &m.konst);
-            let start =
-                format!("__rt::{stream_bound}::start(&self.transport, {konst}){dot_await}?");
+            let with = &m.with_options;
+            let start = format!(
+                "__rt::{stream_bound}::start(&self.transport, {konst}, options){dot_await}?"
+            );
             match m.kind {
                 Kind::Server => {
                     let _ = writeln!(
@@ -861,6 +879,9 @@ fn gen_client(
                         "        /// Call `{n}` (server streaming): send `request`, then read the\n        \
                          /// responses from the returned stream.\n        \
                          pub {asyncness}fn {func}(&self, request: &{req}) -> Result<__rt::codec::{p}ServerStreaming<{call}, {resp}>, Status> {{\n            \
+                         self.{with}(request, __rt::CallOptions::default()){dot_await}\n        }}\n\n        \
+                         /// Call `{n}` with per-call `options`, for example a timeout.\n        \
+                         pub {asyncness}fn {with}(&self, request: &{req}, options: __rt::CallOptions) -> Result<__rt::codec::{p}ServerStreaming<{call}, {resp}>, Status> {{\n            \
                          let request = __rt::codec::encode(request)?;\n            \
                          let mut call = {start};\n            \
                          __rt::{call_trait}::send(&mut call, &request){dot_await}?;\n            \
@@ -874,6 +895,9 @@ fn gen_client(
                         "        /// Call `{n}` (client streaming): send requests on the returned\n        \
                          /// stream, then `finish` it to get the response.\n        \
                          pub {asyncness}fn {func}(&self) -> Result<__rt::codec::{p}ClientStreaming<{call}, {req}, {resp}>, Status> {{\n            \
+                         self.{with}(__rt::CallOptions::default()){dot_await}\n        }}\n\n        \
+                         /// Call `{n}` with per-call `options`, for example a timeout.\n        \
+                         pub {asyncness}fn {with}(&self, options: __rt::CallOptions) -> Result<__rt::codec::{p}ClientStreaming<{call}, {req}, {resp}>, Status> {{\n            \
                          Ok(__rt::codec::{p}ClientStreaming::new({start}))\n        }}"
                     );
                 }
@@ -883,6 +907,9 @@ fn gen_client(
                         "        /// Call `{n}` (bidirectional streaming): send requests and read\n        \
                          /// responses on the returned stream.\n        \
                          pub {asyncness}fn {func}(&self) -> Result<__rt::codec::{p}BidiStreaming<{call}, {req}, {resp}>, Status> {{\n            \
+                         self.{with}(__rt::CallOptions::default()){dot_await}\n        }}\n\n        \
+                         /// Call `{n}` with per-call `options`, for example a timeout.\n        \
+                         pub {asyncness}fn {with}(&self, options: __rt::CallOptions) -> Result<__rt::codec::{p}BidiStreaming<{call}, {req}, {resp}>, Status> {{\n            \
                          Ok(__rt::codec::{p}BidiStreaming::new({start}))\n        }}"
                     );
                 }
@@ -1073,8 +1100,13 @@ service Service {
         let src = generate(&Generator::new());
         assert!(src.contains("pub const METHOD_COMMAND: &str = \"/a.b.Service/Command\";"));
         assert!(src.contains("pub const METHODS: &[&str] = &[METHOD_COMMAND, METHOD_NESTED, METHOD_EVENT_SUBSCRIBE, METHOD_UPLOAD, METHOD_CHAT];"));
-        assert!(src.contains("fn command(&mut self, request: super::a_::b_::Command) -> Result<super::a_::b_::Reply, Status>;"));
+        assert!(src.contains("fn command(&mut self, ctx: &__rt::CallContext<'_>, request: super::a_::b_::Command) -> Result<super::a_::b_::Reply, Status>;"));
         assert!(src.contains("request: super::a_::b_::Command_::Inner"));
+        // The call context, with the deadline, reaches the service method.
+        assert!(src.contains(
+            "__rt::codec::unary(request, |req| Service::command(&mut self.0, ctx, req))"
+        ));
+        assert!(src.contains("fn call(&mut self, ctx: &__rt::CallContext<'_>, request: &[u8])"));
         assert!(src.contains("pub async fn command(&mut self, request: &super::a_::b_::Command)"));
         assert!(src.contains("pub struct ServiceBlockingClient<T>"));
     }
@@ -1090,32 +1122,36 @@ service Service {
         );
         // Server streaming.
         assert!(src.contains(&format!(
-            "fn event_subscribe(&mut self, call: __rt::CallId, request: {req}) -> Result<(), Status> {{"
+            "fn event_subscribe(&mut self, ctx: &__rt::CallContext<'_>, request: {req}) -> Result<(), Status> {{"
         )));
         assert!(src.contains(&format!(
-            "fn poll_event_subscribe(&mut self, call: __rt::CallId, cx: &mut Context<'_>) -> Poll<__rt::Next<{event}>> {{"
+            "fn poll_event_subscribe(&mut self, ctx: &__rt::CallContext<'_>, cx: &mut Context<'_>) -> Poll<__rt::Next<{event}>> {{"
         )));
-        assert!(src.contains("fn cancel_event_subscribe(&mut self, call: __rt::CallId) {"));
+        assert!(
+            src.contains("fn cancel_event_subscribe(&mut self, ctx: &__rt::CallContext<'_>) {")
+        );
         // Client streaming.
         assert!(src.contains(&format!(
-            "fn upload(&mut self, call: __rt::CallId, request: {cmd}) -> Result<(), Status> {{"
+            "fn upload(&mut self, ctx: &__rt::CallContext<'_>, request: {cmd}) -> Result<(), Status> {{"
         )));
         assert!(src.contains(&format!(
-            "fn poll_upload(&mut self, call: __rt::CallId, cx: &mut Context<'_>) -> Poll<Result<{reply}, Status>> {{"
+            "fn poll_upload(&mut self, ctx: &__rt::CallContext<'_>, cx: &mut Context<'_>) -> Poll<Result<{reply}, Status>> {{"
         )));
-        assert!(src.contains("fn cancel_upload(&mut self, call: __rt::CallId) {"));
+        assert!(src.contains("fn cancel_upload(&mut self, ctx: &__rt::CallContext<'_>) {"));
         // Bidirectional.
         assert!(src.contains(&format!(
-            "fn chat(&mut self, call: __rt::CallId, request: {cmd}) -> Result<(), Status> {{"
+            "fn chat(&mut self, ctx: &__rt::CallContext<'_>, request: {cmd}) -> Result<(), Status> {{"
         )));
-        assert!(src.contains("fn end_chat(&mut self, call: __rt::CallId) -> Result<(), Status> {"));
+        assert!(src.contains(
+            "fn end_chat(&mut self, ctx: &__rt::CallContext<'_>) -> Result<(), Status> {"
+        ));
         assert!(src.contains(&format!(
-            "fn poll_chat(&mut self, call: __rt::CallId, cx: &mut Context<'_>) -> Poll<__rt::Next<{reply}>> {{"
+            "fn poll_chat(&mut self, ctx: &__rt::CallContext<'_>, cx: &mut Context<'_>) -> Poll<__rt::Next<{reply}>> {{"
         )));
-        assert!(src.contains("fn cancel_chat(&mut self, call: __rt::CallId) {"));
+        assert!(src.contains("fn cancel_chat(&mut self, ctx: &__rt::CallContext<'_>) {"));
         // Streaming methods default to UNIMPLEMENTED; unary ones are required.
         assert!(src.contains("Err(Status::unimplemented(\"`Upload` is not implemented\"))"));
-        assert!(!src.contains("fn command(&mut self, request: super::a_::b_::Command) -> Result<super::a_::b_::Reply, Status> {"));
+        assert!(!src.contains("fn command(&mut self, ctx: &__rt::CallContext<'_>, request: super::a_::b_::Command) -> Result<super::a_::b_::Reply, Status> {"));
     }
 
     #[test]
@@ -1127,12 +1163,12 @@ service Service {
             "METHOD_UPLOAD => Some(__rt::MethodKind::ClientStreaming),",
             "METHOD_CHAT => Some(__rt::MethodKind::BidiStreaming),",
             "METHOD_EVENT_SUBSCRIBE => Some(Err(Status::unimplemented(\"`EventSubscribe` is a streaming method\"))),",
-            "METHOD_UPLOAD => __rt::codec::message(message, |req| Service::upload(&mut self.0, call, req)),",
-            "METHOD_CHAT => Service::end_chat(&mut self.0, call),",
-            "METHOD_EVENT_SUBSCRIBE => __rt::codec::poll_stream(Service::poll_event_subscribe(&mut self.0, call, cx)),",
-            "METHOD_UPLOAD => __rt::codec::poll_single(Service::poll_upload(&mut self.0, call, cx)),",
-            "METHOD_CHAT => __rt::codec::poll_stream(Service::poll_chat(&mut self.0, call, cx)),",
-            "METHOD_UPLOAD => Service::cancel_upload(&mut self.0, call),",
+            "METHOD_UPLOAD => __rt::codec::message(message, |req| Service::upload(&mut self.0, ctx, req)),",
+            "METHOD_CHAT => Service::end_chat(&mut self.0, ctx),",
+            "METHOD_EVENT_SUBSCRIBE => __rt::codec::poll_stream(Service::poll_event_subscribe(&mut self.0, ctx, cx)),",
+            "METHOD_UPLOAD => __rt::codec::poll_single(Service::poll_upload(&mut self.0, ctx, cx)),",
+            "METHOD_CHAT => __rt::codec::poll_stream(Service::poll_chat(&mut self.0, ctx, cx)),",
+            "METHOD_UPLOAD => Service::cancel_upload(&mut self.0, ctx),",
             "fn is_unknown_method(&self, path: &str) -> bool {",
             "!matches!(path, METHOD_COMMAND | METHOD_NESTED | METHOD_EVENT_SUBSCRIBE | METHOD_UPLOAD | METHOD_CHAT)",
         ] {
@@ -1157,6 +1193,25 @@ service Service {
             "pub fn upload(&self) -> Result<__rt::codec::BlockingClientStreaming<",
             "pub fn chat(&self) -> Result<__rt::codec::BlockingBidiStreaming<",
             "__rt::BlockingStreamingCall::close_send(&mut call)?;",
+            "pub async fn event_subscribe_with_options(&self, request: &super::a_::b_::EventSubscribe, options: __rt::CallOptions) -> Result<",
+            "pub async fn upload_with_options(&self, options: __rt::CallOptions) -> Result<",
+            "pub fn chat_with_options(&self, options: __rt::CallOptions) -> Result<",
+            "__rt::StreamingTransport::start(&self.transport, METHOD_CHAT, options).await?",
+            "__rt::BlockingStreamingTransport::start(&self.transport, METHOD_CHAT, options)?",
+            "self.chat_with_options(__rt::CallOptions::default()).await",
+        ] {
+            assert!(src.contains(line), "missing `{line}`");
+        }
+    }
+
+    #[test]
+    fn generates_unary_clients_with_options() {
+        let src = generate(&Generator::new());
+        for line in [
+            "pub async fn command_with_options(&mut self, request: &super::a_::b_::Command, options: __rt::CallOptions) -> Result<",
+            "self.command_with_options(request, __rt::CallOptions::default()).await",
+            "__rt::UnaryTransport::unary(&mut self.transport, METHOD_COMMAND, &request, options).await?",
+            "__rt::BlockingUnaryTransport::unary(&mut self.transport, METHOD_COMMAND, &request, options)?",
         ] {
             assert!(src.contains(line), "missing `{line}`");
         }
@@ -1173,7 +1228,7 @@ service Service {
             .unwrap();
         assert!(
             src.contains(
-                "fn get(&mut self, request: super::p_::M) -> Result<super::p_::M, Status>;"
+                "fn get(&mut self, ctx: &__rt::CallContext<'_>, request: super::p_::M) -> Result<super::p_::M, Status>;"
             )
         );
         assert!(src.contains("METHOD_GET => Some(__rt::MethodKind::Unary),"));
@@ -1196,6 +1251,17 @@ service Service {
             "{msg}"
         );
         assert!(msg.contains("`poll_feed`"), "{msg}");
+    }
+
+    #[test]
+    fn rejects_with_options_collisions() {
+        let proto = "package p; message M {}\n\
+                     service S {\n\
+                       rpc Get(M) returns (M);\n\
+                       rpc GetWithOptions(M) returns (M);\n\
+                     }";
+        let err = Generator::new().generate(&[parse(proto)]).unwrap_err();
+        assert!(err.to_string().contains("`get_with_options`"), "{err}");
     }
 
     #[test]

@@ -30,6 +30,8 @@
 //!   ARQ atomics on targets that need a portable implementation. On targets without native
 //!   compare-and-swap, also enable `portable-atomic-critical-section` and link a platform-provided
 //!   critical-section implementation.
+//! - Deadlines: [`Timer`] / [`Clock`] let the drivers enforce `grpc-timeout`;
+//!   see below.
 //! - `std`: `std` support in dependencies, including [`link::reliable`] (which
 //!   uses `std`'s clock for ARQ retransmission timeouts). Without it, use
 //!   [`link::reliable_with_timer`] and supply a platform timer.
@@ -50,6 +52,28 @@
 //! write, which needs a cancel-safe `read` (see [`Client`]); the blocking
 //! client can't interrupt a read, so interleave sends before blocking on a
 //! response. The sans-IO [`grpc::Client`] is available for direct scheduling.
+//!
+//! ## Deadlines
+//!
+//! A call's timeout ([`CallOptions`], [`ClientConfig::default_timeout`]) is
+//! sent to the server as `grpc-timeout`, and generated clients have a
+//! `<method>_with_options` variant of every method. Enforcing it needs a time
+//! source, which the sans-IO cores don't have; the drivers take one:
+//!
+//! - tokio: [`tokio::serve`] and [`tokio::client`] use
+//!   [`tokio::TokioTimer`].
+//! - async: [`Client::with_timer`] and [`serve_with_timer`] take a [`Timer`].
+//! - blocking: [`blocking::Client::with_clock`], [`blocking::serve_with_clock`]
+//!   and [`blocking::serve_wakeable_with_clock`] take a [`Clock`], and the
+//!   transport sets a read timeout through [`blocking::ReadTimeout`].
+//!
+//! Without a time source ([`NoTimer`], the default of [`Client::new`] and
+//! [`serve`]) calls still carry `grpc-timeout` but are never expired locally.
+//! With a timer the transport `read` must be cancel-safe, even without
+//! streaming: a pending read is dropped when a deadline is reached. A unary
+//! handler that is already running can't be preempted; it can check
+//! [`CallContext::remaining`]. [`Timer`] is unrelated to
+//! `link::Timer`, the ARQ retransmission timer.
 #![cfg_attr(not(feature = "std"), no_std)]
 // `deny` rather than `forbid` so that `link::ring`, the only module that needs
 // `unsafe`, can opt in locally.
@@ -60,10 +84,13 @@ extern crate alloc;
 
 pub use protolink_grpc as grpc;
 pub use protolink_grpc::{
-    BlockingStreamingCall, BlockingStreamingTransport, BlockingUnaryTransport, CallId,
-    ClientConfig, Code, Compression, Handler, MethodKind, Next, ServerConfig, Status,
+    BlockingStreamingCall, BlockingStreamingTransport, BlockingUnaryTransport, CallContext, CallId,
+    CallOptions, ClientConfig, Code, Compression, Handler, MethodKind, Next, ServerConfig, Status,
     StreamingCall, StreamingTransport, UnaryTransport, compression,
 };
+
+mod timer;
+pub use timer::{Clock, NoTimer, Timer};
 
 mod error;
 pub use error::Error;
@@ -71,7 +98,7 @@ pub use error::Error;
 #[cfg(feature = "async")]
 mod asynch;
 #[cfg(feature = "async")]
-pub use asynch::{Call, Client, serve};
+pub use asynch::{Call, Client, serve, serve_with_timer};
 #[cfg(feature = "async")]
 mod shared;
 

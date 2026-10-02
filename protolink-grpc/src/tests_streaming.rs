@@ -132,7 +132,8 @@ struct Scripted {
 }
 
 impl Handler for Scripted {
-    fn call(&mut self, path: &str, request: &[u8]) -> Option<Result<Vec<u8>, Status>> {
+    fn call(&mut self, ctx: &CallContext<'_>, request: &[u8]) -> Option<Result<Vec<u8>, Status>> {
+        let path = ctx.path;
         (path == "/s.S/Unary").then(|| Ok(request.to_vec()))
     }
 
@@ -151,7 +152,9 @@ impl Handler for Scripted {
         })
     }
 
-    fn on_message(&mut self, path: &str, call: CallId, message: &[u8]) -> Result<(), Status> {
+    fn on_message(&mut self, ctx: &CallContext<'_>, message: &[u8]) -> Result<(), Status> {
+        let path = ctx.path;
+        let call = ctx.id;
         let st = self.calls.entry(call).or_default();
         st.requests += 1;
         match path {
@@ -166,7 +169,8 @@ impl Handler for Scripted {
         Ok(())
     }
 
-    fn on_half_close(&mut self, _path: &str, call: CallId) -> Result<(), Status> {
+    fn on_half_close(&mut self, ctx: &CallContext<'_>) -> Result<(), Status> {
+        let call = ctx.id;
         self.half_closed.push(call);
         self.calls.entry(call).or_default().ended = true;
         Ok(())
@@ -174,10 +178,11 @@ impl Handler for Scripted {
 
     fn poll_response(
         &mut self,
-        path: &str,
-        call: CallId,
+        ctx: &CallContext<'_>,
         cx: &mut Context<'_>,
     ) -> Poll<Next<Vec<u8>>> {
+        let path = ctx.path;
+        let call = ctx.id;
         self.polls += 1;
         let st = self.calls.entry(call).or_default();
         let next = match path {
@@ -230,7 +235,8 @@ impl Handler for Scripted {
         Poll::Ready(next)
     }
 
-    fn on_cancel(&mut self, _path: &str, call: CallId) {
+    fn on_cancel(&mut self, ctx: &CallContext<'_>) {
+        let call = ctx.id;
         self.cancelled.push(call);
         self.calls.remove(&call);
     }

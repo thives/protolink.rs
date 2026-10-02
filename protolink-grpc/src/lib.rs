@@ -37,14 +37,23 @@
 //! use a DEFLATE implementation it already has, such as one in ROM; the
 //! `miniz-oxide` feature provides a stock one. See [`compression`].
 //!
+//! ## Deadlines
+//!
+//! A call's timeout ([`CallOptions::timeout`], [`ClientConfig::default_timeout`])
+//! is sent as `grpc-timeout`, and both sides end the call with
+//! `DEADLINE_EXCEEDED` when it runs out. The cores never read a clock: the
+//! caller reports time with [`Client::tick`] / [`Server::tick`] (a monotonic
+//! [`Duration`](core::time::Duration) since any fixed point) and learns when to
+//! wake up from `next_deadline`. A server's [`Handler`] methods get the call's
+//! deadline in [`CallContext`]. The I/O drivers in `protolink` do the ticking.
+//!
 //! ## Compatibility profile
 //!
 //! Supported: unary and streaming RPCs, protobuf payloads (optionally
 //! compressed), `application/grpc[+proto]`, `grpc-status`/`grpc-message`,
-//! trailers-only responses, bounded message sizes.
+//! trailers-only responses, bounded message sizes, deadlines (`grpc-timeout`).
 //!
-//! Not supported: deadlines (`grpc-timeout` is ignored), custom metadata,
-//! reflection, health checking.
+//! Not supported: custom metadata, reflection, health checking.
 #![no_std]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -63,12 +72,13 @@ mod inbound;
 pub mod lpm;
 mod server;
 pub mod status;
+mod timeout;
 
 pub use protolink_http2 as http2;
 
-pub use client::{Client, ClientConfig};
+pub use client::{CallOptions, Client, ClientConfig};
 pub use compression::Compression;
-pub use handler::{FnHandler, Handler};
+pub use handler::{CallContext, FnHandler, Handler};
 pub use server::{Server, ServerConfig};
 pub use status::{Code, Status};
 
@@ -143,6 +153,7 @@ pub trait UnaryTransport {
         &mut self,
         path: &str,
         request: &[u8],
+        options: CallOptions,
     ) -> impl Future<Output = Result<Vec<u8>, Status>>;
 }
 
@@ -150,7 +161,12 @@ pub trait UnaryTransport {
 pub trait BlockingUnaryTransport {
     /// Call `path` (`/package.Service/Method`) with `request` and return the
     /// encoded response message.
-    fn unary(&mut self, path: &str, request: &[u8]) -> Result<Vec<u8>, Status>;
+    fn unary(
+        &mut self,
+        path: &str,
+        request: &[u8],
+        options: CallOptions,
+    ) -> Result<Vec<u8>, Status>;
 }
 
 impl<T: UnaryTransport + ?Sized> UnaryTransport for &mut T {
@@ -158,14 +174,20 @@ impl<T: UnaryTransport + ?Sized> UnaryTransport for &mut T {
         &mut self,
         path: &str,
         request: &[u8],
+        options: CallOptions,
     ) -> impl Future<Output = Result<Vec<u8>, Status>> {
-        (**self).unary(path, request)
+        (**self).unary(path, request, options)
     }
 }
 
 impl<T: BlockingUnaryTransport + ?Sized> BlockingUnaryTransport for &mut T {
-    fn unary(&mut self, path: &str, request: &[u8]) -> Result<Vec<u8>, Status> {
-        (**self).unary(path, request)
+    fn unary(
+        &mut self,
+        path: &str,
+        request: &[u8],
+        options: CallOptions,
+    ) -> Result<Vec<u8>, Status> {
+        (**self).unary(path, request, options)
     }
 }
 
@@ -185,7 +207,11 @@ pub trait StreamingTransport {
         Self: 'a;
 
     /// Start a call of `path` (`/package.Service/Method`).
-    fn start(&self, path: &str) -> impl Future<Output = Result<Self::Call<'_>, Status>>;
+    fn start(
+        &self,
+        path: &str,
+        options: CallOptions,
+    ) -> impl Future<Output = Result<Self::Call<'_>, Status>>;
 }
 
 /// An active streaming call started by a [`StreamingTransport`].
@@ -214,7 +240,7 @@ pub trait BlockingStreamingTransport {
         Self: 'a;
 
     /// Start a call of `path` (`/package.Service/Method`).
-    fn start(&self, path: &str) -> Result<Self::Call<'_>, Status>;
+    fn start(&self, path: &str, options: CallOptions) -> Result<Self::Call<'_>, Status>;
 }
 
 /// Blocking counterpart of [`StreamingCall`].
@@ -233,8 +259,12 @@ impl<T: StreamingTransport + ?Sized> StreamingTransport for &mut T {
     where
         Self: 'a;
 
-    fn start(&self, path: &str) -> impl Future<Output = Result<Self::Call<'_>, Status>> {
-        (**self).start(path)
+    fn start(
+        &self,
+        path: &str,
+        options: CallOptions,
+    ) -> impl Future<Output = Result<Self::Call<'_>, Status>> {
+        (**self).start(path, options)
     }
 }
 
@@ -244,8 +274,8 @@ impl<T: BlockingStreamingTransport + ?Sized> BlockingStreamingTransport for &mut
     where
         Self: 'a;
 
-    fn start(&self, path: &str) -> Result<Self::Call<'_>, Status> {
-        (**self).start(path)
+    fn start(&self, path: &str, options: CallOptions) -> Result<Self::Call<'_>, Status> {
+        (**self).start(path, options)
     }
 }
 
@@ -253,5 +283,7 @@ impl<T: BlockingStreamingTransport + ?Sized> BlockingStreamingTransport for &mut
 mod tests;
 #[cfg(test)]
 mod tests_compression;
+#[cfg(test)]
+mod tests_deadline;
 #[cfg(test)]
 mod tests_streaming;

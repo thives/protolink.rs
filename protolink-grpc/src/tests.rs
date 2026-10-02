@@ -61,7 +61,7 @@ fn unknown_method_is_unimplemented() {
 struct Knows(&'static str);
 
 impl Handler for Knows {
-    fn call(&mut self, _: &str, _: &[u8]) -> Option<Result<Vec<u8>, Status>> {
+    fn call(&mut self, _: &CallContext<'_>, _: &[u8]) -> Option<Result<Vec<u8>, Status>> {
         None
     }
 
@@ -135,8 +135,13 @@ fn tuple_handlers_route_in_order() {
         FnHandler(|p: &str, _: &[u8]| (p == "/a.A/X").then(|| Ok(b"a".to_vec()))),
         FnHandler(|p: &str, _: &[u8]| (p == "/b.B/X").then(|| Ok(b"b".to_vec()))),
     );
-    assert_eq!(handler.call("/b.B/X", b""), Some(Ok(b"b".to_vec())));
-    assert_eq!(handler.call("/c.C/X", b""), None);
+    let ctx = |path| CallContext {
+        path,
+        id: 1,
+        deadline: None,
+    };
+    assert_eq!(handler.call(&ctx("/b.B/X"), b""), Some(Ok(b"b".to_vec())));
+    assert_eq!(handler.call(&ctx("/c.C/X"), b""), None);
 }
 
 /// Drive the server with a raw HTTP/2 client to check non-gRPC requests.

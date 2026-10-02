@@ -6,14 +6,39 @@
 use alloc::vec::Vec;
 use core::cell::RefCell;
 use core::task::{Context, Waker};
+use core::time::Duration;
 
 use embedded_io::{Error as _, ErrorKind, Read, Write};
 
 use crate::grpc::{
     self, BlockingStreamingCall, BlockingStreamingTransport, BlockingUnaryTransport, CallId,
-    ClientConfig, Handler, Next, ServerConfig, Status,
+    CallOptions, ClientConfig, Handler, Next, ServerConfig, Status,
 };
+use crate::timer::{Clock, NoTimer};
 use crate::{Error, READ_CHUNK};
+
+/// A blocking transport whose reads can be given a timeout.
+///
+/// Needed to enforce deadlines with a blocking driver: the driver sets the
+/// timeout to the time left until the earliest deadline before each read, so
+/// the read returns in time. A read that times out must fail with
+/// [`ErrorKind::TimedOut`] (or [`ErrorKind::Interrupted`]). Note that `std`
+/// sockets report timeouts as `WouldBlock` on Unix, which `embedded_io` maps to
+/// [`ErrorKind::Other`]; map it to `TimedOut` in the transport adapter.
+pub trait ReadTimeout {
+    /// Make later reads fail after `timeout` without data, or block without
+    /// limit for `None`. The timeout applies to every following read until it
+    /// is changed.
+    fn set_read_timeout(&mut self, timeout: Option<Duration>);
+}
+
+fn timed_out(kind: ErrorKind) -> bool {
+    matches!(kind, ErrorKind::TimedOut | ErrorKind::Interrupted)
+}
+
+fn remaining(next: Option<Duration>, now: Duration) -> Option<Duration> {
+    next.map(|d| d.saturating_sub(now))
+}
 
 /// Serve gRPC on one connection until the peer disconnects or the connection fails.
 ///
@@ -31,6 +56,9 @@ use crate::{Error, READ_CHUNK};
 ///
 /// When the connection ends, every active streaming call is reported to
 /// [`Handler::on_cancel`].
+///
+/// `serve` has no clock, so it doesn't enforce `grpc-timeout` deadlines; use
+/// [`serve_with_clock`] for that.
 pub fn serve<IO, H>(
     mut io: IO,
     handler: &mut H,
@@ -42,9 +70,53 @@ where
 {
     let mut server = grpc::Server::new(config);
     let mut cx = Context::from_waker(Waker::noop());
-    let result = serve_connection(&mut io, &mut server, handler, &mut cx, |io, buf| {
-        io.read(buf).map(Some)
-    });
+    let result = serve_connection(
+        &mut io,
+        &mut server,
+        handler,
+        &mut cx,
+        &NoTimer,
+        |io, buf, _| io.read(buf).map(Some),
+    );
+    server.cancel_all(handler);
+    result
+}
+
+/// Like [`serve`], and enforces the `grpc-timeout` deadline of each call using
+/// `clock`.
+///
+/// A call's deadline starts when its request headers arrive. When it is
+/// reached the call is ended with `DEADLINE_EXCEEDED` (streaming handlers are
+/// told through [`Handler::on_cancel`]). A unary handler that is running when
+/// its deadline passes can't be preempted.
+///
+/// Before each read the transport's read timeout is set to the time left until
+/// the earliest deadline (see [`ReadTimeout`]); the resulting
+/// [`ErrorKind::TimedOut`] is an idle tick, as in [`serve`].
+pub fn serve_with_clock<IO, H, C>(
+    mut io: IO,
+    handler: &mut H,
+    config: ServerConfig,
+    clock: C,
+) -> Result<(), Error<IO::Error>>
+where
+    IO: Read + Write + ReadTimeout,
+    H: Handler + ?Sized,
+    C: Clock,
+{
+    let mut server = grpc::Server::new(config);
+    let mut cx = Context::from_waker(Waker::noop());
+    let result = serve_connection(
+        &mut io,
+        &mut server,
+        handler,
+        &mut cx,
+        &clock,
+        |io, buf, timeout| {
+            io.set_read_timeout(timeout);
+            io.read(buf).map(Some)
+        },
+    );
     server.cancel_all(handler);
     result
 }
@@ -125,6 +197,22 @@ pub trait WakeableRead: Read {
     /// Like [`Read::read`], but returns `Ok(None)` when woken through a
     /// [`WakeHandle`] before data arrived.
     fn read_or_wake(&mut self, buf: &mut [u8]) -> Result<Option<usize>, Self::Error>;
+
+    /// [`read_or_wake`](Self::read_or_wake) that also gives up after `timeout`
+    /// (`None`: no limit), either by returning `Ok(None)` or by failing with
+    /// [`ErrorKind::TimedOut`]. Used by [`serve_wakeable_with_clock`] so that
+    /// the wait ends when the earliest deadline is reached.
+    ///
+    /// The default ignores `timeout`; deadlines are then only enforced when a
+    /// read returns for another reason.
+    fn read_or_wake_timeout(
+        &mut self,
+        buf: &mut [u8],
+        timeout: Option<Duration>,
+    ) -> Result<Option<usize>, Self::Error> {
+        let _ = timeout;
+        self.read_or_wake(buf)
+    }
 }
 
 /// Like [`serve`], for a transport that can wait for input or a wake-up.
@@ -153,32 +241,75 @@ where
     let mut server = grpc::Server::new(config);
     let waker = io.wake_handle().into_waker();
     let mut cx = Context::from_waker(&waker);
-    let result = serve_connection(&mut io, &mut server, handler, &mut cx, |io, buf| {
-        io.read_or_wake(buf)
-    });
+    let result = serve_connection(
+        &mut io,
+        &mut server,
+        handler,
+        &mut cx,
+        &NoTimer,
+        |io, buf, _| io.read_or_wake(buf),
+    );
     server.cancel_all(handler);
     result
 }
 
-/// The serving loop shared by [`serve`] and [`serve_wakeable`].
+/// [`serve_wakeable`] that also enforces `grpc-timeout` deadlines using
+/// `clock`, like [`serve_with_clock`].
 ///
-/// `read` waits for input. `Ok(None)` means it was woken: the handlers are
-/// polled again. Wakes that arrive before `read` is entered must make it
-/// return `Ok(None)` right away; that is the transport's job.
-fn serve_connection<IO, H, R>(
+/// The time left until the earliest deadline is passed to
+/// [`WakeableRead::read_or_wake_timeout`].
+#[cfg(target_has_atomic = "ptr")]
+pub fn serve_wakeable_with_clock<IO, H, C>(
+    mut io: IO,
+    handler: &mut H,
+    config: ServerConfig,
+    clock: C,
+) -> Result<(), Error<IO::Error>>
+where
+    IO: WakeableRead + Write,
+    H: Handler + ?Sized,
+    C: Clock,
+{
+    let mut server = grpc::Server::new(config);
+    let waker = io.wake_handle().into_waker();
+    let mut cx = Context::from_waker(&waker);
+    let result = serve_connection(
+        &mut io,
+        &mut server,
+        handler,
+        &mut cx,
+        &clock,
+        |io, buf, timeout| io.read_or_wake_timeout(buf, timeout),
+    );
+    server.cancel_all(handler);
+    result
+}
+
+/// The serving loop shared by [`serve`] and [`serve_wakeable`] and their
+/// clock variants.
+///
+/// `read` waits for input, at most for the timeout it is given (the time left
+/// until the earliest deadline; it may ignore it). `Ok(None)` means it was
+/// woken: the handlers are polled again. Wakes that arrive before `read` is
+/// entered must make it return `Ok(None)` right away; that is the transport's
+/// job.
+fn serve_connection<IO, H, C, R>(
     io: &mut IO,
     server: &mut grpc::Server,
     handler: &mut H,
     cx: &mut Context<'_>,
+    clock: &C,
     mut read: R,
 ) -> Result<(), Error<IO::Error>>
 where
     IO: Read + Write,
     H: Handler + ?Sized,
-    R: FnMut(&mut IO, &mut [u8]) -> Result<Option<usize>, IO::Error>,
+    C: Clock,
+    R: FnMut(&mut IO, &mut [u8], Option<Duration>) -> Result<Option<usize>, IO::Error>,
 {
     let mut buf = [0u8; READ_CHUNK];
     loop {
+        server.tick(clock.now(), &mut *handler);
         // Producing output can make room for more, so poll until idle.
         loop {
             server.poll(&mut *handler, cx);
@@ -192,15 +323,16 @@ where
         if server.is_closed() {
             return Ok(());
         }
-        let n = match read(io, &mut buf) {
+        let timeout = remaining(server.next_deadline(), server.now());
+        let n = match read(io, &mut buf, timeout) {
             Ok(None) => continue,
             Ok(Some(0)) => return Ok(()),
             Ok(Some(n)) => n,
-            Err(e) if matches!(e.kind(), ErrorKind::TimedOut | ErrorKind::Interrupted) => {
-                continue;
-            }
+            Err(e) if timed_out(e.kind()) => continue,
             Err(e) => return Err(Error::Io(e)),
         };
+        // Calls that start with this input get their deadline from now.
+        server.tick(clock.now(), &mut *handler);
         if let Err(e) = server.recv(&buf[..n], handler) {
             let _ = io.write_all(server.pending_output());
             let _ = io.flush();
@@ -221,32 +353,97 @@ where
 /// the peer waits for before blocking on a response. Unary calls take
 /// `&mut self`, so they can't run while a [`Call`] exists. The client is not
 /// `Sync`.
+///
+/// # Deadlines
+///
+/// Calls can have a timeout ([`CallOptions`], [`ClientConfig::default_timeout`]),
+/// which is sent to the server as `grpc-timeout`. A client built with
+/// [`with_clock`](Self::with_clock) also enforces it: when the call's time is
+/// up it fails with `DEADLINE_EXCEEDED` and the stream is reset. Messages
+/// that were already received are still delivered first. The transport's read
+/// timeout is set to the time left, so a read that finds no data returns in
+/// time; see [`ReadTimeout`]. A client built with [`new`](Self::new) has no
+/// clock and leaves enforcement to the server.
 #[derive(Debug)]
-pub struct Client<IO> {
+pub struct Client<IO, C = NoTimer> {
     state: RefCell<State<IO>>,
+    clock: C,
+    /// Sets the transport's read timeout; a no-op without a clock.
+    set_timeout: fn(&mut IO, Option<Duration>),
+    /// Read timeouts are idle ticks, not failures.
+    idle_timeouts: bool,
 }
 
 #[derive(Debug)]
 struct State<IO> {
     io: IO,
     inner: grpc::Client,
+    /// The read timeout last set on the transport.
+    timeout: Option<Duration>,
 }
 
 impl<IO: Read + Write> Client<IO> {
-    /// Create a client; the HTTP/2 preface is sent with the first call.
+    /// Create a client without a clock; the HTTP/2 preface is sent with the
+    /// first call. Timeouts are sent to the server but not enforced locally;
+    /// see [`with_clock`](Self::with_clock).
     pub fn new(io: IO, config: ClientConfig) -> Self {
+        Self::build(io, config, NoTimer, |_, _| {}, false)
+    }
+}
+
+impl<IO: Read + Write + ReadTimeout, C: Clock> Client<IO, C> {
+    /// Create a client that enforces call timeouts using `clock`; the HTTP/2
+    /// preface is sent with the first call.
+    ///
+    /// Read errors of kind [`ErrorKind::TimedOut`] or [`ErrorKind::Interrupted`]
+    /// are treated as idle ticks, not as transport failures.
+    pub fn with_clock(io: IO, config: ClientConfig, clock: C) -> Self {
+        Self::build(io, config, clock, IO::set_read_timeout, true)
+    }
+}
+
+impl<IO: Read + Write, C: Clock> Client<IO, C> {
+    fn build(
+        io: IO,
+        config: ClientConfig,
+        clock: C,
+        set_timeout: fn(&mut IO, Option<Duration>),
+        idle_timeouts: bool,
+    ) -> Self {
         Self {
             state: RefCell::new(State {
                 io,
                 inner: grpc::Client::new(config),
+                timeout: None,
             }),
+            clock,
+            set_timeout,
+            idle_timeouts,
         }
+    }
+
+    /// Report the current time to the call state, expiring calls.
+    fn tick(&self) {
+        let now = self.clock.now();
+        self.with(|s| s.inner.tick(now));
     }
 
     /// Perform one unary call.
     pub fn unary(&mut self, path: &str, request: &[u8]) -> Result<Vec<u8>, Status> {
-        let id = self.with(|s| s.inner.start_unary(path, request))?;
+        self.unary_with(path, request, CallOptions::default())
+    }
+
+    /// Perform one unary call with per-call `options`.
+    pub fn unary_with(
+        &mut self,
+        path: &str,
+        request: &[u8],
+        options: CallOptions,
+    ) -> Result<Vec<u8>, Status> {
+        self.tick();
+        let id = self.with(|s| s.inner.start_unary_with(path, request, &options))?;
         loop {
+            self.tick();
             if let Some(result) = self.with(|s| s.inner.take_response(id)) {
                 return result;
             }
@@ -260,8 +457,19 @@ impl<IO: Read + Write> Client<IO> {
     ///
     /// The request headers are sent with the first operation on the
     /// returned [`Call`]. Dropping the call before it completes cancels it.
-    pub fn streaming(&self, path: &str) -> Result<Call<'_, IO>, Status> {
-        let id = self.with(|s| s.inner.start_streaming(path))?;
+    pub fn streaming(&self, path: &str) -> Result<Call<'_, IO, C>, Status> {
+        self.streaming_with(path, CallOptions::default())
+    }
+
+    /// [`streaming`](Self::streaming) with per-call `options`. The timeout
+    /// covers the whole call, not each message.
+    pub fn streaming_with(
+        &self,
+        path: &str,
+        options: CallOptions,
+    ) -> Result<Call<'_, IO, C>, Status> {
+        self.tick();
+        let id = self.with(|s| s.inner.start_streaming_with(path, &options))?;
         Ok(Call {
             client: self,
             id,
@@ -302,32 +510,46 @@ impl<IO: Read + Write> Client<IO> {
 
     fn read_input(&self) {
         let mut buf = [0u8; READ_CHUNK];
-        self.with(|s| match s.io.read(&mut buf) {
-            Ok(0) => s.inner.fail_all(Status::unavailable("connection closed")),
-            Ok(n) => {
-                let _ = s.inner.recv(&buf[..n]);
+        let idle_timeouts = self.idle_timeouts;
+        self.with(|s| {
+            let timeout = remaining(s.inner.next_deadline(), s.inner.now());
+            if timeout != s.timeout {
+                (self.set_timeout)(&mut s.io, timeout);
+                s.timeout = timeout;
             }
-            Err(_) => s
-                .inner
-                .fail_all(Status::unavailable("transport read failed")),
+            match s.io.read(&mut buf) {
+                Ok(0) => s.inner.fail_all(Status::unavailable("connection closed")),
+                Ok(n) => {
+                    let _ = s.inner.recv(&buf[..n]);
+                }
+                Err(e) if idle_timeouts && timed_out(e.kind()) => {}
+                Err(_) => s
+                    .inner
+                    .fail_all(Status::unavailable("transport read failed")),
+            }
         });
     }
 }
 
-impl<IO: Read + Write> BlockingUnaryTransport for Client<IO> {
-    fn unary(&mut self, path: &str, request: &[u8]) -> Result<Vec<u8>, Status> {
-        Client::unary(self, path, request)
+impl<IO: Read + Write, C: Clock> BlockingUnaryTransport for Client<IO, C> {
+    fn unary(
+        &mut self,
+        path: &str,
+        request: &[u8],
+        options: CallOptions,
+    ) -> Result<Vec<u8>, Status> {
+        Client::unary_with(self, path, request, options)
     }
 }
 
-impl<IO: Read + Write> BlockingStreamingTransport for Client<IO> {
+impl<IO: Read + Write, C: Clock> BlockingStreamingTransport for Client<IO, C> {
     type Call<'a>
-        = Call<'a, IO>
+        = Call<'a, IO, C>
     where
         Self: 'a;
 
-    fn start(&self, path: &str) -> Result<Self::Call<'_>, Status> {
-        self.streaming(path)
+    fn start(&self, path: &str, options: CallOptions) -> Result<Self::Call<'_>, Status> {
+        self.streaming_with(path, options)
     }
 }
 
@@ -336,13 +558,13 @@ impl<IO: Read + Write> BlockingStreamingTransport for Client<IO> {
 /// See the async [`Call`](crate::Call) for the semantics. Dropping the call
 /// before [`message`](Self::message) reported the end cancels it.
 #[derive(Debug)]
-pub struct Call<'a, IO> {
-    client: &'a Client<IO>,
+pub struct Call<'a, IO, C = NoTimer> {
+    client: &'a Client<IO, C>,
     id: CallId,
     finished: Option<Result<(), Status>>,
 }
 
-impl<IO: Read + Write> Call<'_, IO> {
+impl<IO: Read + Write, C: Clock> Call<'_, IO, C> {
     /// The call's id on the connection.
     pub fn id(&self) -> CallId {
         self.id
@@ -356,7 +578,11 @@ impl<IO: Read + Write> Call<'_, IO> {
         }
         let client = self.client;
         let id = self.id;
-        while !client.with(|s| s.inner.can_send(id)) {
+        loop {
+            client.tick();
+            if client.with(|s| s.inner.can_send(id)) {
+                break;
+            }
             if client.write_output() && !client.with(|s| s.inner.can_send(id)) {
                 client.read_input();
             }
@@ -401,6 +627,7 @@ impl<IO: Read + Write> Call<'_, IO> {
         let client = self.client;
         let id = self.id;
         loop {
+            client.tick();
             match client.with(|s| s.inner.try_next(id)) {
                 Some(Next::Message(m)) => return Ok(Some(m)),
                 Some(Next::Done(result)) => {
@@ -421,7 +648,7 @@ impl<IO: Read + Write> Call<'_, IO> {
     }
 }
 
-impl<IO> Drop for Call<'_, IO> {
+impl<IO, C> Drop for Call<'_, IO, C> {
     fn drop(&mut self) {
         if self.finished.is_some() {
             return;
@@ -435,7 +662,7 @@ impl<IO> Drop for Call<'_, IO> {
     }
 }
 
-impl<IO: Read + Write> BlockingStreamingCall for Call<'_, IO> {
+impl<IO: Read + Write, C: Clock> BlockingStreamingCall for Call<'_, IO, C> {
     fn send(&mut self, message: &[u8]) -> Result<(), Status> {
         Call::send(self, message)
     }

@@ -89,6 +89,17 @@ jobs:
             -d '{}' "$addr" "$service/EventSubscribe" >/tmp/events.json
           test ! -s /tmp/events.json
 
+          # Deadlines: grpcurl sends `-max-time` as `grpc-timeout`. A stream
+          # that stays open (stdin is held for 3 s) ends with DeadlineExceeded
+          # after 1 s, and the server keeps serving afterwards.
+          deadline_out=$( (printf '%s\n' '{"correlationId":21,"getStatus":{}}'; sleep 3) |
+            grpcurl -plaintext -max-time 1 -import-path "$proto" -proto device.proto -d @ \
+              "$addr" "$service/CommandStream" 2>&1 || true)
+          grep -q 'DeadlineExceeded' <<<"$deadline_out" || { echo "$deadline_out"; exit 1; }
+          grpcurl -plaintext -import-path "$proto" -proto device.proto \
+            -d '{"correlationId":8,"getStatus":{}}' "$addr" "$service/Command" |
+            jq -e '.correlationId == 8' >/dev/null
+
   stress:
     name: Stress concurrent calls
     runs-on: ubuntu-latest
@@ -99,7 +110,7 @@ jobs:
         uses: taiki-e/install-action@nextest
       # A lost wakeup is a rare hang, so repeat the concurrency tests. The
       # nextest slow-timeout turns a hang into a failure.
-      - run: cargo nextest run --workspace --all-features -E 'test(/concurrent_/)' --stress-count 200
+      - run: cargo nextest run --workspace --all-features -E 'test(/concurrent_/) | binary(deadline) | binary(blocking_deadline)' --stress-count 200
 
   miri:
     name: Miri (ring buffer, client drivers)

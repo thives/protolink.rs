@@ -11,7 +11,7 @@ use embedded_device_example::{
 };
 use embedded_io_adapters::tokio_1::FromTokio;
 use protolink::grpc::Code;
-use protolink::{ClientConfig, ServerConfig};
+use protolink::{CallOptions, ClientConfig, ServerConfig};
 
 fn get_status(correlation_id: Option<u32>) -> Command {
     let mut command = Command {
@@ -465,6 +465,88 @@ async fn streaming_over_cobs_framing() {
         let event = events.message().await.unwrap().unwrap();
         assert_eq!(event.code, EVENT_RESTART);
         assert!(events.message().await.unwrap().is_none());
+    })
+    .await;
+}
+
+/// Deadlines through the generated `*_with_options` methods. The clock is
+/// paused, so the 300 ms below take no real time.
+#[tokio::test(start_paused = true)]
+async fn deadlines_through_generated_clients() {
+    let (a, b) = tokio::io::duplex(1024);
+    tokio::spawn(async move {
+        let mut handler = ServiceServer(Device::default());
+        let _ = protolink::tokio::serve(a, &mut handler, ServerConfig::default()).await;
+    });
+    with_timeout(async {
+        let mut client = ServiceClient::new(protolink::tokio::client(b, ClientConfig::default()));
+        let timeout = |ms| CallOptions::timeout(Duration::from_millis(ms));
+
+        // A call that finishes in time is unaffected.
+        let reply = client
+            .command_with_options(&get_status(Some(1)), timeout(1000))
+            .await
+            .unwrap();
+        assert_eq!(correlation_id(&reply), Some(1));
+
+        // A zero timeout fails at once.
+        let err = client
+            .command_with_options(&get_status(None), timeout(0))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, Code::DeadlineExceeded);
+
+        // An idle bidirectional stream runs out of time; replies that were
+        // delivered before are not lost.
+        let start = tokio::time::Instant::now();
+        let mut stream = client
+            .command_stream_with_options(timeout(300))
+            .await
+            .unwrap();
+        stream.send(&get_status(Some(2))).await.unwrap();
+        let reply = stream.message().await.unwrap().unwrap();
+        assert_eq!(correlation_id(&reply), Some(2));
+        let err = stream.message().await.unwrap_err();
+        assert_eq!(err.code, Code::DeadlineExceeded);
+        assert!(start.elapsed() >= Duration::from_millis(300));
+        drop(stream);
+
+        // The connection is still usable, and the plain methods have no
+        // deadline.
+        let reply = client.command(&get_status(Some(3))).await.unwrap();
+        assert_eq!(correlation_id(&reply), Some(3));
+        let mut events = client
+            .event_subscribe_with_options(&EventSubscribe {}, timeout(1000))
+            .await
+            .unwrap();
+        assert!(events.message().await.unwrap().is_none());
+    })
+    .await;
+}
+
+/// A client without a clock still sends `grpc-timeout`, so the server ends
+/// the call.
+#[tokio::test(start_paused = true)]
+async fn server_enforces_the_deadline_for_a_client_without_a_clock() {
+    let (a, b) = tokio::io::duplex(1024);
+    tokio::spawn(async move {
+        let mut handler = ServiceServer(Device::default());
+        let _ = protolink::tokio::serve(a, &mut handler, ServerConfig::default()).await;
+    });
+    with_timeout(async {
+        let client = ServiceClient::new(protolink::Client::new(
+            FromTokio::new(b),
+            ClientConfig::default(),
+        ));
+        let mut stream = client
+            .command_stream_with_options(CallOptions::timeout(Duration::from_millis(200)))
+            .await
+            .unwrap();
+        stream.send(&get_status(Some(1))).await.unwrap();
+        let reply = stream.message().await.unwrap().unwrap();
+        assert_eq!(correlation_id(&reply), Some(1));
+        let err = stream.message().await.unwrap_err();
+        assert_eq!(err.code, Code::DeadlineExceeded);
     })
     .await;
 }

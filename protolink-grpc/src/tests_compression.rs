@@ -561,7 +561,8 @@ struct TestHandler {
 }
 
 impl Handler for TestHandler {
-    fn call(&mut self, path: &str, request: &[u8]) -> Option<Result<Vec<u8>, Status>> {
+    fn call(&mut self, ctx: &CallContext<'_>, request: &[u8]) -> Option<Result<Vec<u8>, Status>> {
+        let path = ctx.path;
         (path == "/t.T/Echo").then(|| Ok(request.to_vec()))
     }
 
@@ -573,7 +574,8 @@ impl Handler for TestHandler {
         }
     }
 
-    fn on_message(&mut self, _: &str, call: CallId, message: &[u8]) -> Result<(), Status> {
+    fn on_message(&mut self, ctx: &CallContext<'_>, message: &[u8]) -> Result<(), Status> {
+        let call = ctx.id;
         self.calls
             .entry(call)
             .or_default()
@@ -582,12 +584,14 @@ impl Handler for TestHandler {
         Ok(())
     }
 
-    fn on_half_close(&mut self, _: &str, call: CallId) -> Result<(), Status> {
+    fn on_half_close(&mut self, ctx: &CallContext<'_>) -> Result<(), Status> {
+        let call = ctx.id;
         self.calls.entry(call).or_default().ended = true;
         Ok(())
     }
 
-    fn poll_response(&mut self, _: &str, call: CallId, _: &mut Context<'_>) -> Poll<Next<Vec<u8>>> {
+    fn poll_response(&mut self, ctx: &CallContext<'_>, _: &mut Context<'_>) -> Poll<Next<Vec<u8>>> {
+        let call = ctx.id;
         let state = self.calls.entry(call).or_default();
         match state.queue.pop_front() {
             Some(message) => Poll::Ready(Next::Message(message)),
@@ -599,7 +603,8 @@ impl Handler for TestHandler {
         }
     }
 
-    fn on_cancel(&mut self, _: &str, call: CallId) {
+    fn on_cancel(&mut self, ctx: &CallContext<'_>) {
+        let call = ctx.id;
         self.cancelled.push(call);
         self.calls.remove(&call);
     }
