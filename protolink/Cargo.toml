@@ -12,7 +12,7 @@ edition = "2024"
 rust-version = "1.88"
 
 [dependencies]
-protolink-grpc = { version = "0.0.1", path = "../protolink-grpc" }
+protolink-grpc = { version = "0", path = "../protolink-grpc" }
 embedded-io-async = { version = "0.7", optional = true }
 embedded-io = { version = "0.7", optional = true }
 cobs-io-async = { version = "0.0.3", default-features = false, features = ["embedded-io"], optional = true }

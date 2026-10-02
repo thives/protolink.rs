@@ -12,7 +12,7 @@ edition = "2024"
 rust-version = "1.88"
 
 [dependencies]
-protolink-http2 = { version = "0.0.1", path = "../protolink-http2" }
+protolink-http2 = { version = "0", path = "../protolink-http2" }
 micropb = { version = "0.6", default-features = false, features = ["alloc", "encode", "decode"], optional = true }
 
 [features]
