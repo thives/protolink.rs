@@ -89,8 +89,11 @@ where
 /// Implements [`BlockingUnaryTransport`] and [`BlockingStreamingTransport`]
 /// for generated `<Service>BlockingClient`s.
 ///
-/// One streaming [`Call`] can be active at a time: starting another one while
-/// a call still exists fails with `FAILED_PRECONDITION`. Unary calls take
+/// Several streaming [`Call`]s can be active on one connection; drive them
+/// from one thread by interleaving their operations. A blocking read can't be
+/// interrupted, so a `message()` waits until its own call has something to
+/// return, even if another call needs to send first. Send on every call that
+/// the peer waits for before blocking on a response. Unary calls take
 /// `&mut self`, so they can't run while a [`Call`] exists. The client is not
 /// `Sync`.
 #[derive(Debug)]
@@ -102,8 +105,6 @@ pub struct Client<IO> {
 struct State<IO> {
     io: IO,
     inner: grpc::Client,
-    /// Number of existing [`Call`]s.
-    active_calls: usize,
 }
 
 impl<IO: Read + Write> Client<IO> {
@@ -113,7 +114,6 @@ impl<IO: Read + Write> Client<IO> {
             state: RefCell::new(State {
                 io,
                 inner: grpc::Client::new(config),
-                active_calls: 0,
             }),
         }
     }
@@ -135,18 +135,8 @@ impl<IO: Read + Write> Client<IO> {
     ///
     /// The request headers are sent with the first operation on the
     /// returned [`Call`]. Dropping the call before it completes cancels it.
-    /// Fails with `FAILED_PRECONDITION` while another [`Call`] exists.
     pub fn streaming(&self, path: &str) -> Result<Call<'_, IO>, Status> {
-        let id = self.with(|s| {
-            if s.active_calls > 0 {
-                return Err(Status::failed_precondition(
-                    "another streaming call is active on this client",
-                ));
-            }
-            let id = s.inner.start_streaming(path)?;
-            s.active_calls += 1;
-            Ok(id)
-        })?;
+        let id = self.with(|s| s.inner.start_streaming(path))?;
         Ok(Call {
             client: self,
             id,
@@ -308,16 +298,14 @@ impl<IO: Read + Write> Call<'_, IO> {
 
 impl<IO> Drop for Call<'_, IO> {
     fn drop(&mut self) {
-        let id = self.id;
-        let unfinished = self.finished.is_none();
+        if self.finished.is_some() {
+            return;
+        }
         // Never panic in `drop`: the state is only borrowed here if a
         // `with_inner` closure drops a call, which is documented as not
         // allowed.
         if let Ok(mut s) = self.client.state.try_borrow_mut() {
-            if unfinished {
-                s.inner.cancel(id);
-            }
-            s.active_calls = s.active_calls.saturating_sub(1);
+            s.inner.cancel(self.id);
         }
     }
 }

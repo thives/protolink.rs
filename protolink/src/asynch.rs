@@ -97,14 +97,26 @@ where
 /// Implements [`UnaryTransport`] and [`StreamingTransport`], so it plugs
 /// straight into generated `<Service>Client`s.
 ///
-/// One streaming [`Call`] can be active at a time: starting another one while
-/// a call still exists fails with `FAILED_PRECONDITION`. Unary calls take
-/// `&mut self`, so they can't run while a [`Call`] exists. Use the sans-IO
-/// [`grpc::Client`] directly to run calls concurrently on one connection.
+/// Several streaming [`Call`]s can be active on one connection, and their
+/// operations can run concurrently (for example `join!`ed, or on separate
+/// tasks with `std`). Unary calls take `&mut self`, so they can't run while a
+/// [`Call`] exists.
 ///
-/// The transport is only checked out of the client while an operation uses
-/// it, and is returned when that operation completes or its future is
-/// dropped.
+/// The transport is used by one operation at a time. It is checked out of the
+/// client for each I/O step and returned when the step completes or its
+/// future is dropped. A pending read doesn't hold up the other calls: when
+/// another call has something to write (a request, a half-close, or the
+/// cancellation of a dropped call), the read is **dropped** so the transport
+/// can be used, and started again afterwards. This requires a cancel-safe
+/// `read`, which tokio streams, [`CobsFramed`](crate::link::CobsFramed) and
+/// the [`link`](crate::link) stack are (the same requirement as
+/// [`serve`] with streaming handlers). It only matters when more than one call
+/// is active; a client with one call never drops a read. For transports
+/// without a cancel-safe `read` (for example a one-shot DMA UART), put them
+/// behind [`link::pump`](crate::link::pump) or keep to one call at a time.
+///
+/// A blocked transport `write` still stops everything until it completes; see
+/// [`Call`].
 #[derive(Debug)]
 pub struct Client<IO> {
     shared: Shared<State<IO>>,
@@ -119,8 +131,12 @@ struct State<IO> {
     waiters: Vec<Waker>,
     /// A unary call whose future was dropped before it completed.
     stale_unary: Option<CallId>,
-    /// Number of existing [`Call`]s.
-    active_calls: usize,
+    /// Some call has output to write while the transport is busy: a pending
+    /// read should be dropped.
+    want_io: bool,
+    /// Waker of the operation that is reading, so that it can be asked to
+    /// give up the transport.
+    holder: Option<Waker>,
 }
 
 /// The transport, checked out of a [`Client`]. Dropping the guard checks it
@@ -143,6 +159,7 @@ impl<IO> Drop for IoGuard<'_, IO> {
         let io = self.io.take();
         let waiters = self.client.shared.with(|s| {
             s.io = io;
+            s.holder = None;
             core::mem::take(&mut s.waiters)
         });
         for waiter in waiters {
@@ -160,7 +177,8 @@ impl<IO: Read + Write> Client<IO> {
                 io: Some(io),
                 waiters: Vec::new(),
                 stale_unary: None,
-                active_calls: 0,
+                want_io: false,
+                holder: None,
             }),
         }
     }
@@ -188,18 +206,10 @@ impl<IO: Read + Write> Client<IO> {
     ///
     /// The request headers are sent with the first operation on the
     /// returned [`Call`]. Dropping the call before it completes cancels it.
-    /// Fails with `FAILED_PRECONDITION` while another [`Call`] exists.
     pub fn streaming(&self, path: &str) -> Result<Call<'_, IO>, Status> {
         let id = self.shared.with(|s| {
-            if s.active_calls > 0 {
-                return Err(Status::failed_precondition(
-                    "another streaming call is active on this client",
-                ));
-            }
             cancel_stale_unary(s);
-            let id = s.inner.start_streaming(path)?;
-            s.active_calls += 1;
-            Ok(id)
+            s.inner.start_streaming(path)
         })?;
         Ok(Call {
             client: self,
@@ -232,20 +242,35 @@ impl<IO: Read + Write> Client<IO> {
         done: &mut impl FnMut(&mut grpc::Client) -> Option<T>,
     ) -> Result<IoGuard<'_, IO>, T> {
         let acquired = poll_fn(|cx| {
-            self.shared.with(|s| {
+            let (poll, wake) = self.shared.with(|s| {
                 if let Some(value) = done(&mut s.inner) {
-                    return Poll::Ready(Err(value));
+                    return (Poll::Ready(Err(value)), None);
                 }
                 match s.io.take() {
-                    Some(io) => Poll::Ready(Ok(io)),
+                    Some(io) => {
+                        s.want_io = false;
+                        (Poll::Ready(Ok(io)), None)
+                    }
                     None => {
                         if !s.waiters.iter().any(|w| w.will_wake(cx.waker())) {
                             s.waiters.push(cx.waker().clone());
                         }
-                        Poll::Pending
+                        // Output is waiting but the transport is busy,
+                        // probably in a read: ask it to give way.
+                        let wake = if s.inner.has_output() {
+                            s.want_io = true;
+                            s.holder.take()
+                        } else {
+                            None
+                        };
+                        (Poll::Pending, wake)
                     }
                 }
-            })
+            });
+            if let Some(waker) = wake {
+                waker.wake();
+            }
+            poll
         })
         .await;
         acquired.map(|io| IoGuard {
@@ -313,9 +338,34 @@ impl<IO: Read + Write> Client<IO> {
     }
 
     /// Read once from the transport. Transport failures fail every call.
+    ///
+    /// If another call wants to write while the read is pending, the read is
+    /// dropped (it must be cancel-safe) and nothing is read.
     async fn read_once(&self, io: &mut IO) {
         let mut buf = [0u8; READ_CHUNK];
-        let result = io.read(&mut buf).await;
+        let result = {
+            let mut read = pin!(io.read(&mut buf));
+            poll_fn(|cx| {
+                if let Poll::Ready(result) = read.as_mut().poll(cx) {
+                    return Poll::Ready(Some(result));
+                }
+                let yield_now = self.shared.with(|s| {
+                    if !s.want_io && !s.holder.as_ref().is_some_and(|w| w.will_wake(cx.waker())) {
+                        s.holder = Some(cx.waker().clone());
+                    }
+                    s.want_io
+                });
+                if yield_now {
+                    Poll::Ready(None)
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await
+        };
+        let Some(result) = result else {
+            return;
+        };
         self.shared.with(|s| match result {
             Ok(0) => s.inner.fail_all(Status::unavailable("connection closed")),
             Ok(n) => {
@@ -463,14 +513,24 @@ impl<IO: Read + Write> Call<'_, IO> {
 
 impl<IO> Drop for Call<'_, IO> {
     fn drop(&mut self) {
+        if self.finished.is_some() {
+            return;
+        }
         let id = self.id;
-        let unfinished = self.finished.is_none();
-        self.client.shared.with(|s| {
-            if unfinished {
-                s.inner.cancel(id);
+        let wake = self.client.shared.with(|s| {
+            s.inner.cancel(id);
+            // The cancellation is written by whichever operation uses the
+            // transport next. If one is reading right now, ask it to flush.
+            if s.io.is_none() && s.inner.has_output() {
+                s.want_io = true;
+                s.holder.take()
+            } else {
+                None
             }
-            s.active_calls = s.active_calls.saturating_sub(1);
         });
+        if let Some(waker) = wake {
+            waker.wake();
+        }
     }
 }
 
@@ -485,5 +545,348 @@ impl<IO: Read + Write> StreamingCall for Call<'_, IO> {
 
     fn message(&mut self) -> impl Future<Output = Result<Option<Vec<u8>>, Status>> {
         Call::message(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use alloc::collections::{BTreeSet, VecDeque};
+    use alloc::rc::Rc;
+    use alloc::sync::Arc;
+    use alloc::task::Wake;
+    use core::cell::RefCell;
+    use core::convert::Infallible;
+    use core::pin::{Pin, pin};
+    use core::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use core::task::Context;
+
+    use embedded_io_async::ErrorType;
+
+    use super::*;
+    use crate::grpc::MethodKind;
+
+    const GATE: &str = "/t.T/Gate";
+    const OPEN: &str = "/t.T/Open";
+    const QUIET: &str = "/t.T/Quiet";
+
+    /// `Open` calls open the gate; `Gate` calls answer once it is open;
+    /// `Quiet` calls never answer. Every call ends when the client half-closes.
+    #[derive(Default)]
+    struct Script {
+        open: bool,
+        sent: BTreeSet<CallId>,
+        half_closed: BTreeSet<CallId>,
+        cancelled: usize,
+    }
+
+    impl Handler for Script {
+        fn call(&mut self, _: &str, _: &[u8]) -> Option<Result<Vec<u8>, Status>> {
+            None
+        }
+
+        fn method_kind(&self, path: &str) -> Option<MethodKind> {
+            matches!(path, GATE | OPEN | QUIET).then_some(MethodKind::BidiStreaming)
+        }
+
+        fn on_message(&mut self, path: &str, _: CallId, _: &[u8]) -> Result<(), Status> {
+            if path == OPEN {
+                self.open = true;
+            }
+            Ok(())
+        }
+
+        fn on_half_close(&mut self, _: &str, call: CallId) -> Result<(), Status> {
+            self.half_closed.insert(call);
+            Ok(())
+        }
+
+        fn poll_response(
+            &mut self,
+            path: &str,
+            call: CallId,
+            _: &mut Context<'_>,
+        ) -> Poll<Next<Vec<u8>>> {
+            if self.half_closed.remove(&call) {
+                return Poll::Ready(Next::Done(Ok(())));
+            }
+            if path == GATE && self.open && self.sent.insert(call) {
+                return Poll::Ready(Next::Message(b"open".to_vec()));
+            }
+            Poll::Pending
+        }
+
+        fn on_cancel(&mut self, _: &str, _: CallId) {
+            self.cancelled += 1;
+        }
+    }
+
+    /// An in-memory peer: whatever is written is processed by a sans-IO
+    /// server at once, and its output becomes readable.
+    struct Peer {
+        server: grpc::Server,
+        script: Script,
+        rx: VecDeque<u8>,
+        rx_waker: Option<Waker>,
+        reads_dropped: usize,
+    }
+
+    impl Peer {
+        fn new() -> Rc<RefCell<Self>> {
+            Rc::new(RefCell::new(Self {
+                server: grpc::Server::new(ServerConfig::default()),
+                script: Script::default(),
+                rx: VecDeque::new(),
+                rx_waker: None,
+                reads_dropped: 0,
+            }))
+        }
+
+        /// Run the server until it is idle (as `serve` does: delivering a
+        /// request can enable a response of a call polled earlier) and make
+        /// its output readable.
+        fn pump(&mut self) {
+            let mut cx = Context::from_waker(Waker::noop());
+            let mut idle_rounds = 0;
+            while idle_rounds < 2 {
+                self.server.poll(&mut self.script, &mut cx);
+                let n = self.server.pending_output().len();
+                idle_rounds = if n == 0 { idle_rounds + 1 } else { 0 };
+                self.rx.extend(self.server.pending_output());
+                self.server.consume_output(n);
+            }
+            if !self.rx.is_empty()
+                && let Some(waker) = self.rx_waker.take()
+            {
+                waker.wake();
+            }
+        }
+    }
+
+    /// The client's transport. Its `read` is cancel-safe: bytes are only taken
+    /// when the read completes.
+    struct Loopback(Rc<RefCell<Peer>>);
+
+    impl ErrorType for Loopback {
+        type Error = Infallible;
+    }
+
+    impl Read for Loopback {
+        async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Infallible> {
+            struct CountDrop<'a>(&'a RefCell<Peer>, bool);
+            impl Drop for CountDrop<'_> {
+                fn drop(&mut self) {
+                    if !self.1 {
+                        self.0.borrow_mut().reads_dropped += 1;
+                    }
+                }
+            }
+            let peer = &*self.0;
+            let mut tracker = CountDrop(peer, false);
+            let n = poll_fn(|cx| {
+                let mut p = peer.borrow_mut();
+                if p.rx.is_empty() {
+                    p.rx_waker = Some(cx.waker().clone());
+                    return Poll::Pending;
+                }
+                let n = buf.len().min(p.rx.len());
+                for byte in &mut buf[..n] {
+                    *byte = p.rx.pop_front().expect("checked length");
+                }
+                Poll::Ready(n)
+            })
+            .await;
+            tracker.1 = true;
+            Ok(n)
+        }
+    }
+
+    impl Write for Loopback {
+        async fn write(&mut self, buf: &[u8]) -> Result<usize, Infallible> {
+            let mut p = self.0.borrow_mut();
+            let Peer { server, script, .. } = &mut *p;
+            server
+                .recv(buf, script)
+                .expect("valid HTTP/2 from the client");
+            p.pump();
+            Ok(buf.len())
+        }
+
+        async fn flush(&mut self) -> Result<(), Infallible> {
+            Ok(())
+        }
+    }
+
+    /// A waker that counts how often it was woken.
+    #[derive(Default)]
+    struct Wakes(AtomicUsize);
+
+    impl Wake for Wakes {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, SeqCst);
+        }
+    }
+
+    impl Wakes {
+        fn waker() -> (Waker, Arc<Self>) {
+            let wakes = Arc::new(Self::default());
+            (Waker::from(wakes.clone()), wakes)
+        }
+
+        fn count(&self) -> usize {
+            self.0.load(SeqCst)
+        }
+    }
+
+    fn poll_once<F: Future>(f: Pin<&mut F>, waker: &Waker) -> Poll<F::Output> {
+        f.poll(&mut Context::from_waker(waker))
+    }
+
+    /// Drive a future that only waits on the in-memory peer.
+    fn run<F: Future>(f: F) -> F::Output {
+        let mut f = pin!(f);
+        for _ in 0..1000 {
+            if let Poll::Ready(v) = poll_once(f.as_mut(), Waker::noop()) {
+                return v;
+            }
+        }
+        panic!("future did not complete");
+    }
+
+    fn client(peer: &Rc<RefCell<Peer>>) -> Client<Loopback> {
+        Client::new(Loopback(peer.clone()), ClientConfig::default())
+    }
+
+    /// Call A waits for a reply that only arrives after call B sent a
+    /// request. A holds the transport in a pending read; B must get the
+    /// transport to write, so A has to yield.
+    #[test]
+    fn concurrent_reader_yields_to_a_writer_on_another_call() {
+        let peer = Peer::new();
+        let client = client(&peer);
+        let mut a = client.streaming(GATE).unwrap();
+        let mut b = client.streaming(OPEN).unwrap();
+        let (wake_a, a_wakes) = Wakes::waker();
+        let (wake_b, b_wakes) = Wakes::waker();
+
+        {
+            let mut a_message = pin!(a.message());
+            assert!(poll_once(a_message.as_mut(), &wake_a).is_pending());
+            assert_eq!(peer.borrow().reads_dropped, 0);
+            assert_eq!(a_wakes.count(), 0);
+
+            // B queues its request, but the transport is busy with A's read.
+            let mut b_send = pin!(b.send(b"go"));
+            assert!(poll_once(b_send.as_mut(), &wake_b).is_pending());
+            assert_eq!(a_wakes.count(), 1, "A is asked to give up the transport");
+
+            // A yields its read, which writes B's request. That opens the gate,
+            // so A's reply is already there and A completes.
+            let Poll::Ready(reply) = poll_once(a_message.as_mut(), &wake_a) else {
+                panic!("A should complete once B's request was written");
+            };
+            assert_eq!(reply.unwrap().unwrap(), b"open");
+            assert_eq!(peer.borrow().reads_dropped, 1);
+
+            // B's request went out with A's turn; B is woken and completes.
+            assert!(b_wakes.count() >= 1);
+            assert!(matches!(
+                poll_once(b_send.as_mut(), &wake_b),
+                Poll::Ready(Ok(()))
+            ));
+        }
+
+        // Both calls end cleanly.
+        run(a.close_send()).unwrap();
+        run(b.close_send()).unwrap();
+        assert!(run(a.message()).unwrap().is_none());
+        assert!(run(b.message()).unwrap().is_none());
+    }
+
+    /// A reader that receives data for another call wakes it.
+    #[test]
+    fn concurrent_waiting_call_is_woken_by_data_read_for_it() {
+        let peer = Peer::new();
+        let client = client(&peer);
+        let mut quiet = client.streaming(QUIET).unwrap();
+        let mut gate = client.streaming(GATE).unwrap();
+        let (wake_q, q_wakes) = Wakes::waker();
+        let (wake_g, g_wakes) = Wakes::waker();
+
+        let mut quiet_message = pin!(quiet.message());
+        assert!(poll_once(quiet_message.as_mut(), &wake_q).is_pending());
+
+        // The gate call has nothing to write and the transport is busy: it
+        // waits without asking the reader to yield.
+        let mut gate_message = pin!(gate.message());
+        assert!(poll_once(gate_message.as_mut(), &wake_g).is_pending());
+        assert_eq!(q_wakes.count(), 0);
+
+        // The reply for the gate call arrives. Only the reader is woken by
+        // the transport; it reads the data and passes the turn on.
+        {
+            let mut p = peer.borrow_mut();
+            p.script.open = true;
+            p.pump();
+        }
+        assert!(poll_once(quiet_message.as_mut(), &wake_q).is_pending());
+        assert!(g_wakes.count() >= 1, "the waiting call is woken");
+        let Poll::Ready(reply) = poll_once(gate_message.as_mut(), &wake_g) else {
+            panic!("the gate call's reply was read by the other call");
+        };
+        assert_eq!(reply.unwrap().unwrap(), b"open");
+        assert_eq!(peer.borrow().reads_dropped, 0, "nobody had to yield");
+    }
+
+    /// Dropping a call while another call is reading gets the cancellation
+    /// written promptly.
+    #[test]
+    fn concurrent_dropping_a_call_makes_the_reader_flush_the_cancel() {
+        let peer = Peer::new();
+        let client = client(&peer);
+        let mut quiet = client.streaming(QUIET).unwrap();
+        let mut other = client.streaming(QUIET).unwrap();
+        let (wake, wakes) = Wakes::waker();
+
+        run(other.send(b"hello")).unwrap();
+        let mut quiet_message = pin!(quiet.message());
+        assert!(poll_once(quiet_message.as_mut(), &wake).is_pending());
+        assert_eq!(peer.borrow().script.cancelled, 0);
+
+        drop(other);
+        assert_eq!(wakes.count(), 1, "the reader is asked to yield");
+        assert!(poll_once(quiet_message.as_mut(), &wake).is_pending());
+        assert_eq!(peer.borrow().script.cancelled, 1);
+        assert_eq!(peer.borrow().reads_dropped, 1);
+    }
+
+    /// A call that gave up waiting for the transport doesn't disturb the
+    /// others.
+    #[test]
+    fn concurrent_abandoned_waiter_does_not_block_the_others() {
+        let peer = Peer::new();
+        let client = client(&peer);
+        let mut gate = client.streaming(GATE).unwrap();
+        let mut open = client.streaming(OPEN).unwrap();
+        let (wake_g, _) = Wakes::waker();
+        let (wake_o, _) = Wakes::waker();
+
+        let mut gate_message = pin!(gate.message());
+        assert!(poll_once(gate_message.as_mut(), &wake_g).is_pending());
+        {
+            let mut parked = pin!(open.send(b"go"));
+            assert!(poll_once(parked.as_mut(), &wake_o).is_pending());
+        } // the parked send is dropped without ever finishing
+
+        // The request was queued before the send parked, so the reader still
+        // flushes it and completes.
+        let Poll::Ready(reply) = poll_once(gate_message.as_mut(), &wake_g) else {
+            panic!("the reader should complete");
+        };
+        assert_eq!(reply.unwrap().unwrap(), b"open");
+        // And the abandoned call can be used again.
+        run(open.close_send()).unwrap();
+        assert!(run(open.message()).unwrap().is_none());
     }
 }

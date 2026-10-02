@@ -89,15 +89,31 @@ jobs:
             -d '{}' "$addr" "$service/EventSubscribe" >/tmp/events.json
           test ! -s /tmp/events.json
 
+  stress:
+    name: Stress concurrent calls
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+      # A lost wakeup is a rare hang, so repeat the concurrency tests. The
+      # nextest slow-timeout turns a hang into a failure.
+      - run: cargo nextest run --workspace --all-features -E 'test(/concurrent_/)' --stress-count 200
+
   miri:
-    name: Miri (ring buffer)
+    name: Miri (ring buffer, client drivers)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri
-      - run: cargo miri test --features portable-atomic --lib link::ring
+      # The client's shared state differs with and without `std`.
+      - run: |
+            cargo miri test --features portable-atomic --lib link::ring
+            cargo miri test --features portable-atomic --lib asynch::tests
+            cargo miri test --features portable-atomic,std --lib asynch::tests
 
   cross-check:
     name: Check Cross-Compilation

@@ -102,8 +102,22 @@ let reply = stream.message().await?;
 stream.close_send().await?;
 ```
 
-Dropping a call before it ended cancels it. The drivers run one call at a time per client
-connection; the sans-IO `protolink::grpc::Client` supports concurrent calls.
+Dropping a call before it ended cancels it. Several streaming calls can be active on one client at
+the same time, for example `join!`ed or, with the `std` feature, on separate tasks:
+
+```rust
+let mut first = client.command_stream().await?;
+let mut second = client.command_stream().await?;
+first.send(&first_command).await?;
+second.send(&second_command).await?;
+let (a, b) = futures::join!(first.message(), second.message());
+```
+
+The transport is used by one operation at a time. A pending `message()` gives way when another call
+has something to write, which requires a cancel-safe transport `read` (tokio, the `link` stack and
+`CobsFramed` are). The blocking client can't interrupt a read, so there you send on every call the
+peer waits for before blocking on a response. Unary calls need `&mut` access to the client, so they
+can't run while a streaming call exists.
 
 See [`examples/embedded-device`](examples/embedded-device) for a complete, tested embedded-device
 example, including a TCP server (`just example-server`) that can be queried with `grpcurl`.

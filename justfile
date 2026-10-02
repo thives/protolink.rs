@@ -34,6 +34,12 @@ test:
 
 miri:
   cargo +nightly miri test --features portable-atomic --lib link::ring
+  cargo +nightly miri test --features portable-atomic --lib asynch::tests
+  cargo +nightly miri test --features portable-atomic,std --lib asynch::tests
+
+# Repeat the concurrency tests to catch rare hangs
+stress:
+  cargo nextest run --workspace --all-features -E 'test(/concurrent_/)' --stress-count 200
 
 build:
   cargo build --workspace --all-features

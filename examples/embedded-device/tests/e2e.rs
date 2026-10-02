@@ -265,6 +265,27 @@ async fn async_streaming_over_duplex() {
         assert!(events.message().await.unwrap().is_none(), "end is sticky");
         drop(events);
 
+        // Two bidirectional calls can be active and interleaved on one client.
+        let mut first = client.command_stream().await.unwrap();
+        let mut second = client.command_stream().await.unwrap();
+        first.send(&get_status(Some(71))).await.unwrap();
+        second.send(&get_status(Some(72))).await.unwrap();
+        first.close_send().await.unwrap();
+        second.close_send().await.unwrap();
+        // Read in the opposite order from the requests.
+        assert_eq!(
+            correlation_id(&second.message().await.unwrap().unwrap()),
+            Some(72)
+        );
+        assert_eq!(
+            correlation_id(&first.message().await.unwrap().unwrap()),
+            Some(71)
+        );
+        assert!(first.message().await.unwrap().is_none());
+        assert!(second.message().await.unwrap().is_none());
+        drop(first);
+        drop(second);
+
         // Bidi, ping-pong: each reply arrives before the next request.
         let mut stream = client.command_stream().await.unwrap();
         for i in 0..5 {
@@ -365,6 +386,22 @@ fn blocking_streaming_over_tcp() {
     }
     assert_eq!(codes, [EVENT_OUTPUT_CHANGED, EVENT_RESTART]);
     drop(events);
+
+    let mut first = client.command_stream().unwrap();
+    let mut second = client.command_stream().unwrap();
+    first.send(&get_status(Some(11))).unwrap();
+    second.send(&get_status(Some(12))).unwrap();
+    first.close_send().unwrap();
+    second.close_send().unwrap();
+    assert_eq!(correlation_id(&first.message().unwrap().unwrap()), Some(11));
+    assert_eq!(
+        correlation_id(&second.message().unwrap().unwrap()),
+        Some(12)
+    );
+    assert!(first.message().unwrap().is_none());
+    assert!(second.message().unwrap().is_none());
+    drop(first);
+    drop(second);
 
     let mut stream = client.command_stream().unwrap();
     stream.send(&get_status(Some(1))).unwrap();

@@ -42,9 +42,11 @@
 //! methods, which pull responses through a poll interface (see
 //! [`Handler`]). Streaming clients get a [`Call`] (or [`blocking::Call`])
 //! from [`Client::streaming`], or typed wrappers from generated clients. The
-//! high-level clients run one streaming call at a time per connection (starting
-//! another fails with `FAILED_PRECONDITION`); the sans-IO [`grpc::Client`]
-//! supports concurrent calls.
+//! high-level clients allow several active streaming calls on one connection.
+//! The async client drops a pending read when another call has something to
+//! write, which needs a cancel-safe `read` (see [`Client`]); the blocking
+//! client can't interrupt a read, so interleave sends before blocking on a
+//! response. The sans-IO [`grpc::Client`] is available for direct scheduling.
 #![cfg_attr(not(feature = "std"), no_std)]
 // `deny` rather than `forbid` so that `link::ring`, the only module that needs
 // `unsafe`, can opt in locally.
