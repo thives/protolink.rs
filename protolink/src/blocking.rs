@@ -26,6 +26,9 @@ use crate::{Error, READ_CHUNK};
 /// which `embedded_io` maps to [`ErrorKind::Other`]; map it to `TimedOut` in
 /// the transport adapter.
 ///
+/// A transport that can wait for input *or* a wake-up avoids the timeout: see
+/// [`WakeableRead`] and [`serve_wakeable`].
+///
 /// When the connection ends, every active streaming call is reported to
 /// [`Handler::on_cancel`].
 pub fn serve<IO, H>(
@@ -38,26 +41,147 @@ where
     H: Handler + ?Sized,
 {
     let mut server = grpc::Server::new(config);
-    let result = serve_connection(&mut io, &mut server, handler);
+    let mut cx = Context::from_waker(Waker::noop());
+    let result = serve_connection(&mut io, &mut server, handler, &mut cx, |io, buf| {
+        io.read(buf).map(Some)
+    });
     server.cancel_all(handler);
     result
 }
 
-fn serve_connection<IO, H>(
+/// A handle that wakes a [`WakeableRead`] transport.
+///
+/// [`serve_wakeable`] turns it into the [`Waker`] handlers receive in
+/// `poll_response`. Calling [`wake`](Self::wake) must make the transport's
+/// in-progress [`read_or_wake`](WakeableRead::read_or_wake) return `Ok(None)`,
+/// or the next one if none is in progress. It may be called from any thread
+/// or from an interrupt handler, so it must not block.
+#[cfg(target_has_atomic = "ptr")]
+#[derive(Clone)]
+pub struct WakeHandle(alloc::sync::Arc<dyn Fn() + Send + Sync>);
+
+#[cfg(target_has_atomic = "ptr")]
+impl WakeHandle {
+    /// Create a handle that calls `wake`.
+    pub fn new(wake: impl Fn() + Send + Sync + 'static) -> Self {
+        Self(alloc::sync::Arc::new(wake))
+    }
+
+    /// Wake the transport.
+    pub fn wake(&self) {
+        (self.0)();
+    }
+
+    /// Convert into a [`Waker`] that calls [`wake`](Self::wake).
+    pub fn into_waker(self) -> Waker {
+        Waker::from(alloc::sync::Arc::new(self))
+    }
+}
+
+#[cfg(target_has_atomic = "ptr")]
+impl alloc::task::Wake for WakeHandle {
+    fn wake(self: alloc::sync::Arc<Self>) {
+        (self.0)();
+    }
+
+    fn wake_by_ref(self: &alloc::sync::Arc<Self>) {
+        (self.0)();
+    }
+}
+
+#[cfg(target_has_atomic = "ptr")]
+impl core::fmt::Debug for WakeHandle {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("WakeHandle")
+    }
+}
+
+/// A blocking transport that can wait for input *or* a wake-up.
+///
+/// A plain [`Read`] can't be interrupted, so [`serve`] notices that a
+/// handler became ready only when a read returns or times out. Implementing
+/// this trait lets [`serve_wakeable`] react to a handler's wake immediately.
+/// How to wait for both is up to the transport (a condition variable, an
+/// event flag with `WFE`/`SEV`, an interrupt that also ends the UART read, a
+/// self-pipe, ...).
+///
+/// # Contract
+///
+/// - Every call of the [`WakeHandle`] returned by
+///   [`wake_handle`](Self::wake_handle) is *latched*: the next
+///   [`read_or_wake`](Self::read_or_wake) that has not consumed it returns
+///   `Ok(None)` without blocking. A wake that arrives while the server is
+///   polling handlers or writing, i.e. while no read is in progress, must not
+///   be lost.
+/// - Wakes may be coalesced, and spurious `Ok(None)` results are fine.
+/// - A wake is never reported as end of stream: `Ok(Some(0))` means the peer
+///   closed the connection, as for [`Read::read`].
+#[cfg(target_has_atomic = "ptr")]
+pub trait WakeableRead: Read {
+    /// A handle that wakes [`read_or_wake`](Self::read_or_wake). It is
+    /// requested once per [`serve_wakeable`] call.
+    fn wake_handle(&self) -> WakeHandle;
+
+    /// Like [`Read::read`], but returns `Ok(None)` when woken through a
+    /// [`WakeHandle`] before data arrived.
+    fn read_or_wake(&mut self, buf: &mut [u8]) -> Result<Option<usize>, Self::Error>;
+}
+
+/// Like [`serve`], for a transport that can wait for input or a wake-up.
+///
+/// Handlers receive a waker backed by [`WakeableRead::wake_handle`]. Waking it
+/// ends the wait for input, so a streaming handler that returned
+/// `Poll::Pending` and is woken later (from a timer, an interrupt or another
+/// thread) is polled again, and its output written, without any peer traffic
+/// and without a transport read timeout.
+///
+/// Read errors of kind [`ErrorKind::TimedOut`] or [`ErrorKind::Interrupted`]
+/// are still treated as idle ticks, as in [`serve`].
+///
+/// When the connection ends, every active streaming call is reported to
+/// [`Handler::on_cancel`].
+#[cfg(target_has_atomic = "ptr")]
+pub fn serve_wakeable<IO, H>(
+    mut io: IO,
+    handler: &mut H,
+    config: ServerConfig,
+) -> Result<(), Error<IO::Error>>
+where
+    IO: WakeableRead + Write,
+    H: Handler + ?Sized,
+{
+    let mut server = grpc::Server::new(config);
+    let waker = io.wake_handle().into_waker();
+    let mut cx = Context::from_waker(&waker);
+    let result = serve_connection(&mut io, &mut server, handler, &mut cx, |io, buf| {
+        io.read_or_wake(buf)
+    });
+    server.cancel_all(handler);
+    result
+}
+
+/// The serving loop shared by [`serve`] and [`serve_wakeable`].
+///
+/// `read` waits for input. `Ok(None)` means it was woken: the handlers are
+/// polled again. Wakes that arrive before `read` is entered must make it
+/// return `Ok(None)` right away; that is the transport's job.
+fn serve_connection<IO, H, R>(
     io: &mut IO,
     server: &mut grpc::Server,
     handler: &mut H,
+    cx: &mut Context<'_>,
+    mut read: R,
 ) -> Result<(), Error<IO::Error>>
 where
     IO: Read + Write,
     H: Handler + ?Sized,
+    R: FnMut(&mut IO, &mut [u8]) -> Result<Option<usize>, IO::Error>,
 {
     let mut buf = [0u8; READ_CHUNK];
-    let mut cx = Context::from_waker(Waker::noop());
     loop {
         // Producing output can make room for more, so poll until idle.
         loop {
-            server.poll(&mut *handler, &mut cx);
+            server.poll(&mut *handler, cx);
             if !server.has_output() {
                 break;
             }
@@ -68,9 +192,10 @@ where
         if server.is_closed() {
             return Ok(());
         }
-        let n = match io.read(&mut buf) {
-            Ok(0) => return Ok(()),
-            Ok(n) => n,
+        let n = match read(io, &mut buf) {
+            Ok(None) => continue,
+            Ok(Some(0)) => return Ok(()),
+            Ok(Some(n)) => n,
             Err(e) if matches!(e.kind(), ErrorKind::TimedOut | ErrorKind::Interrupted) => {
                 continue;
             }

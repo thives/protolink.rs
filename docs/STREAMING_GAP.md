@@ -195,6 +195,12 @@ The private `inbound.rs` wraps the decoder with manual flow control. Credit is w
 - **Blocking `serve`** polls with a no-op waker before every read.
   - `ErrorKind::TimedOut`/`Interrupted` read errors are treated as idle ticks, so a transport read timeout keeps `Pending` streams moving.
   - std's `WouldBlock` maps to `ErrorKind::Other` in `embedded-io` and must be remapped by the adapter. This is documented.
+- **`blocking::serve_wakeable`** serves a transport that can wait for input *or* a wake-up, so `Pending` handlers progress without peer traffic and without read timeouts.
+  - The transport implements `WakeableRead`: `wake_handle() -> WakeHandle` and `read_or_wake(buf) -> Result<Option<usize>, _>`. `Ok(None)` means woken. The driver turns the `WakeHandle` into the `Waker` handlers get in `poll_response`.
+  - The transport owns the latch. A wake that arrives while the server is polling or writing (no read in progress) makes the next `read_or_wake` return `Ok(None)` at once, so the driver needs no flag of its own and cannot lose a wake between its last poll and the wait. Wakes may coalesce and may be spurious. A wake is never end of stream.
+  - `serve` and `serve_wakeable` share one loop; `serve` passes a no-op waker and `|io, buf| io.read(buf).map(Some)`. Timed-out and interrupted reads are idle ticks in both.
+  - The new items need pointer-sized atomics (`Arc`), so they are gated with `#[cfg(target_has_atomic = "ptr")]`. Targets without them keep `serve` and the timeout fallback.
+  - Tests: `protolink/tests/blocking_wake.rs` (server on a thread over a channel transport; `wake_during_poll_is_not_lost` fails if the latch is missing).
 - **`Client::streaming(path) -> Call`**, also exposed through `StreamingTransport` and `BlockingStreamingTransport`:
   - Several calls can be active at once; each is routed by its HTTP/2 stream ID. `StreamingTransport::start`, `BlockingStreamingTransport::start` and the generated streaming methods take `&self`; unary calls take `&mut self`, so they can't run while a `Call` exists.
   - The async client keeps its state behind a short-lived lock (a `Mutex` with `std`, a `RefCell` without) that is never held across an await. The transport is checked out for each I/O step and returned by a guard, also when the future is dropped. With `std` the client is `Sync` for a `Send` transport, so calls can be driven from spawned tasks.
@@ -212,7 +218,7 @@ The private `inbound.rs` wraps the decoder with manual flow control. Credit is w
 - **Unary calls and streaming calls don't overlap.** Unary calls take `&mut self`, so they can't run while a `Call` exists.
 - **The drivers don't read while a transport write is blocked.** On a transport that buffers less than the data in flight, a bidi call that sends many requests without reading responses can block both peers in `write`. This affects tiny pipes or UART buffers without a reader task. HTTP/2 flow control bounds memory but not transport-level write blocking. The workaround is to interleave `message` with `send`, or give the transport enough buffering. This is documented on `Call`, and the e2e COBS test uses a 4 KiB pipe for this reason.
 - **Unknown paths are answered at `END_STREAM`.** A path no handler reports through `method_kind` is treated as unary, so `UNIMPLEMENTED` is sent once the client half-closes. A client streaming to an unknown method only learns that when it finishes sending.
-- **Blocking `serve` and `Pending` handlers.** Pending streams progress only when a read returns or times out (see §6).
+- **Blocking `serve` and `Pending` handlers.** With plain `serve`, Pending streams progress only when a read returns or times out. A transport that implements `WakeableRead` and is served with `serve_wakeable` doesn't have this limitation (see §6). The crate ships no wakeable adapter for std sockets: one needs an OS mechanism to wait on the socket and a wake source together (a self-pipe or `eventfd` with `poll`, `mio`, ...).
 
 ## Acceptance criteria
 

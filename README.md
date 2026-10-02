@@ -113,6 +113,10 @@ second.send(&second_command).await?;
 let (a, b) = futures::join!(first.message(), second.message());
 ```
 
+The blocking server polls `Pending` streaming handlers when a read returns or times out. A transport that can
+wait for input or a wake-up can implement `blocking::WakeableRead` and be served with
+`blocking::serve_wakeable`, which polls a handler as soon as it wakes its waker, with no read timeout.
+
 The transport is used by one operation at a time. A pending `message()` gives way when another call
 has something to write, which requires a cancel-safe transport `read` (tokio, the `link` stack and
 `CobsFramed` are). The blocking client can't interrupt a read, so there you send on every call the

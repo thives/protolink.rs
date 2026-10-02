@@ -21,7 +21,10 @@
 //!   `embedded_io_async::{Read, Write}`, and the [`link`] module (including the
 //!   optional [`link::pump`] lower layer for DMA UARTs).
 //! - `blocking`: [`blocking::serve`] and [`blocking::Client`] over
-//!   `embedded_io::{Read, Write}`.
+//!   `embedded_io::{Read, Write}`. [`blocking::serve_wakeable`] serves
+//!   transports that implement [`blocking::WakeableRead`], so streaming
+//!   handlers that were `Pending` progress as soon as they are woken, without
+//!   relying on read timeouts.
 //! - `tokio`: [`tokio`] helpers adapting tokio I/O to the async drivers.
 //! - `portable-atomic`: use [`portable-atomic`](https://docs.rs/portable-atomic) for link and
 //!   ARQ atomics on targets that need a portable implementation. On targets without native
