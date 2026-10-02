@@ -1,0 +1,13 @@
+# cargo-nextest configuration.
+#
+# A lost wakeup in the drivers shows up as a test that never finishes, not as a
+# failure. The tests wrap their async bodies in a 10 s `with_timeout`; this is
+# the backstop for everything else (blocking tests, hung threads), so a hang
+# fails the run instead of stalling CI.
+#
+# Convention: tests that exercise several active calls on one connection are
+# named `concurrent_*`, so they can be selected for repeated runs, e.g.
+#   cargo nextest run -E 'test(/concurrent_/)'
+
+[profile.default]
+slow-timeout = { period = "20s", terminate-after = 1 }

@@ -110,7 +110,7 @@ impl<IO: Read + Write> Client<IO> {
             if let Some(result) = self.inner.take_response(id) {
                 return result;
             }
-            if self.write_output() {
+            if self.write_output() && self.inner.is_pending(id) {
                 self.read_input();
             }
         }

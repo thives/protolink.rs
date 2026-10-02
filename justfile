@@ -1,4 +1,4 @@
-all: check build embedded test clippy fmt docs coverage miri
+all: check build embedded features test clippy fmt docs coverage miri
 
 # no_std crates that must build for embedded targets
 no_std := "-p protolink -p protolink-grpc -p protolink-http2"
@@ -15,6 +15,18 @@ check:
 embedded:
   cargo build --target thumbv7em-none-eabihf --no-default-features {{no_std}}
   cargo build --target thumbv7em-none-eabihf --no-default-features --features async,blocking {{no_std}}
+
+# Every feature on its own, and the combinations that interact (needs cargo-hack)
+features:
+  cargo hack check --each-feature --no-dev-deps -p protolink -p protolink-grpc -p protolink-http2 -p protolink-grpc-gen
+  cargo check --no-default-features --features async,std -p protolink
+  cargo check --no-default-features --features blocking,std -p protolink
+  cargo check --no-default-features --features async,blocking -p protolink
+  cargo check --no-default-features --features async,blocking,std -p protolink
+
+# Public API compared with the last release (report only; update the tag after releases)
+semver:
+  cargo semver-checks --workspace --exclude embedded-device-example --baseline-rev v0.0.2 --release-type patch --all-features
 
 test:
   cargo nextest r --workspace --all-features

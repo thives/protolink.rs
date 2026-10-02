@@ -116,6 +116,39 @@ jobs:
             cargo check --release --target=${{matrix.target}} --no-default-features -p protolink -p protolink-grpc -p protolink-http2
             cargo check --release --target=${{matrix.target}} --no-default-features --features async,blocking -p protolink -p protolink-grpc -p protolink-http2
 
+  features:
+    name: Check feature combinations
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-hack
+      # Dev-dependencies are excluded so that the `tokio` dev-dependency's
+      # features can't hide a broken combination.
+      - run: |
+            cargo hack check --each-feature --no-dev-deps -p protolink -p protolink-grpc -p protolink-http2 -p protolink-grpc-gen
+            cargo check --no-default-features --features async,std -p protolink
+            cargo check --no-default-features --features blocking,std -p protolink
+            cargo check --no-default-features --features async,blocking -p protolink
+            cargo check --no-default-features --features async,blocking,std -p protolink
+
+  semver:
+    name: Public API vs last release (informational)
+    runs-on: ubuntu-latest
+    # Report only: the crates are 0.0.x, where any change may be breaking. The
+    # output tells reviewers which public items changed. Move the baseline to
+    # the newest release tag after each release.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-semver-checks
+      # With an unchanged version the tool assumes a major bump and skips every
+      # check, so ask for a patch-level comparison explicitly.
+      - run: cargo semver-checks --workspace --exclude embedded-device-example --baseline-rev v0.0.2 --release-type patch --all-features
+
   fmt:
     name: Check formatting
     runs-on: ubuntu-latest

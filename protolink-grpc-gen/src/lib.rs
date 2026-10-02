@@ -995,7 +995,10 @@ service Service {
 }"#;
 
     fn generate(g: &Generator) -> String {
-        let dir = std::env::temp_dir().join(format!("protolink_grpc_gen_{}", std::process::id()));
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("protolink_grpc_gen_{}_{n}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let proto = dir.join("t.proto");
         fs::write(&proto, PROTO).unwrap();
