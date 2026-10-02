@@ -35,7 +35,15 @@
 //!
 //! ## Scope
 //!
-//! Unary RPCs only. See [`grpc`] for the full compatibility profile.
+//! Unary, server-streaming, client-streaming and bidirectional streaming
+//! RPCs. See [`grpc`] for the full compatibility profile.
+//!
+//! Streaming servers implement the generated `<Service>` trait's streaming
+//! methods, which pull responses through a poll interface (see
+//! [`Handler`]). Streaming clients get a [`Call`] (or [`blocking::Call`])
+//! from [`Client::streaming`], or typed wrappers from generated clients. The
+//! drivers run one call at a time per client connection; the sans-IO
+//! [`grpc::Client`] supports concurrent calls.
 #![cfg_attr(not(feature = "std"), no_std)]
 // `deny` rather than `forbid` so that `link::ring`, the only module that needs
 // `unsafe`, can opt in locally.
@@ -46,7 +54,9 @@ extern crate alloc;
 
 pub use protolink_grpc as grpc;
 pub use protolink_grpc::{
-    BlockingUnaryTransport, ClientConfig, Code, Handler, ServerConfig, Status, UnaryTransport,
+    BlockingStreamingCall, BlockingStreamingTransport, BlockingUnaryTransport, CallId,
+    ClientConfig, Code, Handler, MethodKind, Next, ServerConfig, Status, StreamingCall,
+    StreamingTransport, UnaryTransport,
 };
 
 mod error;
@@ -55,7 +65,7 @@ pub use error::Error;
 #[cfg(feature = "async")]
 mod asynch;
 #[cfg(feature = "async")]
-pub use asynch::{Client, serve};
+pub use asynch::{Call, Client, serve};
 
 #[cfg(feature = "async")]
 pub mod link;

@@ -2,9 +2,12 @@
 
 use std::time::Duration;
 
-use embedded_device_example::device::{Command, Command_, GetStatus, Reply_, Restart, SetOutput};
+use embedded_device_example::device::{
+    Command, Command_, EventSubscribe, GetStatus, Reply, Reply_, Restart, SetOutput,
+};
 use embedded_device_example::{
-    Device, METHOD_EVENT_SUBSCRIBE, ServiceBlockingClient, ServiceClient, ServiceServer,
+    Device, EVENT_OUTPUT_CHANGED, EVENT_RESTART, ServiceBlockingClient, ServiceClient,
+    ServiceServer,
 };
 use embedded_io_adapters::tokio_1::FromTokio;
 use protolink::grpc::Code;
@@ -19,6 +22,17 @@ fn get_status(correlation_id: Option<u32>) -> Command {
         command.set_correlation_id(id);
     }
     command
+}
+
+fn restart() -> Command {
+    Command {
+        command: Some(Command_::Command::Restart(Restart { delay_ms: 5 })),
+        ..Command::default()
+    }
+}
+
+fn correlation_id(reply: &Reply) -> Option<u32> {
+    reply.correlation_id().copied()
 }
 
 fn set_output(channel: u32, enabled: bool) -> Command {
@@ -86,12 +100,6 @@ async fn async_client_and_server_over_duplex() {
         assert_eq!(err.message, "output channel out of range");
 
         let transport = client.transport_mut();
-        // Streaming method -> UNIMPLEMENTED.
-        let err = transport
-            .unary(METHOD_EVENT_SUBSCRIBE, &[])
-            .await
-            .unwrap_err();
-        assert_eq!(err.code, Code::Unimplemented);
         // Unknown method -> UNIMPLEMENTED.
         let err = transport
             .unary("/protolink.examples.embedded.device.Service/Nope", &[])
@@ -203,6 +211,223 @@ async fn reliable_link_cobs_arq() {
             let reply = client.command(&get_status(Some(100 + i))).await.unwrap();
             assert_eq!(reply.correlation_id(), Some(&(100 + i)));
         }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn async_streaming_over_duplex() {
+    let (a, b) = tokio::io::duplex(1024);
+    let server = tokio::spawn(async move {
+        let mut handler = ServiceServer(Device::default());
+        protolink::tokio::serve(a, &mut handler, ServerConfig::default())
+            .await
+            .unwrap();
+        handler.0
+    });
+
+    with_timeout(async {
+        let mut client = ServiceClient::new(protolink::tokio::client(b, ClientConfig::default()));
+
+        // Server streaming, empty: no events yet.
+        let mut events = client.event_subscribe(&EventSubscribe {}).await.unwrap();
+        assert!(events.message().await.unwrap().is_none());
+        drop(events);
+
+        // Client streaming, empty.
+        let batch = client.command_batch().await.unwrap();
+        let summary = batch.finish().await.unwrap();
+        assert_eq!((summary.accepted, summary.rejected), (0, 0));
+
+        // Client streaming: several commands, one rejected.
+        let mut batch = client.command_batch().await.unwrap();
+        for command in [
+            set_output(0, true),
+            set_output(9, true),
+            restart(),
+            set_output(0, false),
+        ] {
+            batch.send(&command).await.unwrap();
+        }
+        let summary = batch.finish().await.unwrap();
+        assert_eq!((summary.accepted, summary.rejected), (3, 1));
+
+        // Server streaming replays the event log, then ends.
+        let mut events = client.event_subscribe(&EventSubscribe {}).await.unwrap();
+        let mut codes = Vec::new();
+        while let Some(event) = events.message().await.unwrap() {
+            codes.push(event.code);
+        }
+        assert_eq!(
+            codes,
+            [EVENT_OUTPUT_CHANGED, EVENT_RESTART, EVENT_OUTPUT_CHANGED]
+        );
+        assert!(events.message().await.unwrap().is_none(), "end is sticky");
+        drop(events);
+
+        // Bidi, ping-pong: each reply arrives before the next request.
+        let mut stream = client.command_stream().await.unwrap();
+        for i in 0..5 {
+            stream.send(&get_status(Some(i))).await.unwrap();
+            let reply = stream.message().await.unwrap().unwrap();
+            assert_eq!(correlation_id(&reply), Some(i));
+        }
+        stream.close_send().await.unwrap();
+        assert!(stream.message().await.unwrap().is_none());
+        drop(stream);
+
+        // Bidi, empty.
+        let mut stream = client.command_stream().await.unwrap();
+        stream.close_send().await.unwrap();
+        assert!(stream.message().await.unwrap().is_none());
+        drop(stream);
+
+        // Bidi: an error after replies keeps the replies sent before it.
+        let mut stream = client.command_stream().await.unwrap();
+        for i in 0..3 {
+            stream.send(&get_status(Some(i))).await.unwrap();
+        }
+        stream.send(&Command::default()).await.unwrap();
+        stream.send(&get_status(Some(99))).await.unwrap();
+        stream.close_send().await.unwrap();
+        for i in 0..3 {
+            let reply = stream.message().await.unwrap().unwrap();
+            assert_eq!(correlation_id(&reply), Some(i));
+        }
+        let err = stream.message().await.unwrap_err();
+        assert_eq!(err.code, Code::InvalidArgument);
+        assert_eq!(err.message, "missing command");
+        assert_eq!(stream.message().await.unwrap_err(), err, "error is sticky");
+        drop(stream);
+
+        // Cancel by drop, mid-stream, for both streaming directions.
+        let mut events = client.event_subscribe(&EventSubscribe {}).await.unwrap();
+        assert!(events.message().await.unwrap().is_some());
+        drop(events);
+        let mut stream = client.command_stream().await.unwrap();
+        stream.send(&get_status(Some(1))).await.unwrap();
+        assert!(stream.message().await.unwrap().is_some());
+        drop(stream);
+
+        // The connection is still usable.
+        let reply = client.command(&get_status(Some(2))).await.unwrap();
+        assert_eq!(correlation_id(&reply), Some(2));
+        let mut events = client.event_subscribe(&EventSubscribe {}).await.unwrap();
+        let mut count = 0;
+        while events.message().await.unwrap().is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 3);
+    })
+    .await;
+
+    let device = with_timeout(server).await.unwrap();
+    assert_eq!(device.calls.active(), 0, "streaming call state released");
+    assert_eq!(device.restarts, 1);
+    assert!(!device.output_states[0]);
+}
+
+#[test]
+fn blocking_streaming_over_tcp() {
+    use embedded_io_adapters::std::FromStd;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut handler = ServiceServer(Device::default());
+        protolink::blocking::serve(FromStd::new(stream), &mut handler, ServerConfig::default())
+            .unwrap();
+        handler.0
+    });
+    let stream = std::net::TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut client = ServiceBlockingClient::new(protolink::blocking::Client::new(
+        FromStd::new(stream),
+        ClientConfig::default(),
+    ));
+
+    let mut events = client.event_subscribe(&EventSubscribe {}).unwrap();
+    assert!(events.message().unwrap().is_none());
+    drop(events);
+
+    let mut batch = client.command_batch().unwrap();
+    batch.send(&set_output(2, true)).unwrap();
+    batch.send(&restart()).unwrap();
+    let summary = batch.finish().unwrap();
+    assert_eq!((summary.accepted, summary.rejected), (2, 0));
+
+    let mut events = client.event_subscribe(&EventSubscribe {}).unwrap();
+    let mut codes = Vec::new();
+    while let Some(event) = events.message().unwrap() {
+        codes.push(event.code);
+    }
+    assert_eq!(codes, [EVENT_OUTPUT_CHANGED, EVENT_RESTART]);
+    drop(events);
+
+    let mut stream = client.command_stream().unwrap();
+    stream.send(&get_status(Some(1))).unwrap();
+    stream.send(&get_status(Some(2))).unwrap();
+    stream.close_send().unwrap();
+    let replies: Vec<_> = std::iter::from_fn(|| stream.message().unwrap())
+        .map(|r| correlation_id(&r))
+        .collect();
+    assert_eq!(replies, [Some(1), Some(2)]);
+    drop(stream);
+
+    // Cancel by drop, then keep using the connection.
+    let mut stream = client.command_stream().unwrap();
+    stream.send(&get_status(Some(3))).unwrap();
+    assert!(stream.message().unwrap().is_some());
+    drop(stream);
+    let reply = client.command(&get_status(Some(4))).unwrap();
+    assert_eq!(correlation_id(&reply), Some(4));
+
+    drop(client);
+    let device = server.join().unwrap();
+    assert_eq!(device.calls.active(), 0);
+    assert_eq!(device.restarts, 1);
+}
+
+#[tokio::test]
+async fn streaming_over_cobs_framing() {
+    use protolink::link::CobsFramed;
+    // The drivers do not read while blocked in a write, so a bidi call that
+    // sends many requests before reading needs a transport that buffers the
+    // replies in flight (a 64-byte pipe would deadlock both writers).
+    let (a, b) = tokio::io::duplex(4096);
+    tokio::spawn(async move {
+        let mut handler = ServiceServer(Device::default());
+        let _ = protolink::serve(
+            CobsFramed::new(FromTokio::new(a)),
+            &mut handler,
+            ServerConfig::default(),
+        )
+        .await;
+    });
+    with_timeout(async {
+        let io = CobsFramed::new(FromTokio::new(b));
+        let mut client = ServiceClient::new(protolink::Client::new(io, ClientConfig::default()));
+        let mut stream = client.command_stream().await.unwrap();
+        for i in 0..10 {
+            stream.send(&get_status(Some(i))).await.unwrap();
+        }
+        stream.send(&restart()).await.unwrap();
+        stream.close_send().await.unwrap();
+        for i in 0..10 {
+            let reply = stream.message().await.unwrap().unwrap();
+            assert_eq!(correlation_id(&reply), Some(i));
+        }
+        let ack = stream.message().await.unwrap().unwrap();
+        assert!(matches!(ack.reply, Some(Reply_::Reply::RestartAck(_))));
+        assert!(stream.message().await.unwrap().is_none());
+        drop(stream);
+
+        let mut events = client.event_subscribe(&EventSubscribe {}).await.unwrap();
+        let event = events.message().await.unwrap().unwrap();
+        assert_eq!(event.code, EVENT_RESTART);
+        assert!(events.message().await.unwrap().is_none());
     })
     .await;
 }

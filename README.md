@@ -18,7 +18,7 @@ It is async first, `no_std + alloc`, with options for embedded-io, blocking I/O,
 | Crate | Path | Purpose |
 |---|---|---|
 | `protolink` | `.` | I/O drivers (async, blocking, tokio) and the COBS + ARQ link stack |
-| `protolink-grpc` | `grpc/` | Sans-IO unary gRPC server/client, status mapping, micropb codec |
+| `protolink-grpc` | `grpc/` | Sans-IO gRPC server/client (unary and streaming), status mapping, micropb codec |
 | `protolink-http2` | `http2/` | Sans-IO HTTP/2 connection, built on `zerodds-http2` + `zerodds-hpack` |
 | `protolink-grpc-gen` | `grpc-gen/` | Code generator: service traits, servers and clients for micropb messages |
 
@@ -70,20 +70,56 @@ let mut client = proto::service::ServiceClient::new(protolink::Client::new(io, D
 let reply = client.command(&request).await?;
 ```
 
+### Streaming
+
+For an RPC `Method`, the generated trait has:
+
+| Shape | Trait methods |
+|---|---|
+| unary | `method(request) -> Result<Resp, Status>` |
+| server streaming | `method(call, request)`, `poll_method(call, cx) -> Poll<Next<Resp>>`, `cancel_method(call)` |
+| client streaming | `method(call, request)` per message, `poll_method(call, cx) -> Poll<Result<Resp, Status>>`, `cancel_method(call)` |
+| bidirectional | `method(call, request)` per message, `end_method(call)`, `poll_method(call, cx) -> Poll<Next<Resp>>`, `cancel_method(call)` |
+
+Servers stay sans-IO and executor-agnostic: calls are identified by a `CallId`, request messages are
+delivered as they arrive, and responses are pulled with `poll_*` (wake `cx` when a pending response
+becomes ready). Streaming methods default to `UNIMPLEMENTED`, so adding one to a `.proto` does not
+break existing implementations.
+
+Clients return typed calls:
+
+```rust
+let mut events = client.event_subscribe(&EventSubscribe {}).await?;
+while let Some(event) = events.message().await? { /* ... */ }
+
+let mut batch = client.command_batch().await?;
+batch.send(&command).await?;
+let summary = batch.finish().await?;
+
+let mut stream = client.command_stream().await?;
+stream.send(&command).await?;
+let reply = stream.message().await?;
+stream.close_send().await?;
+```
+
+Dropping a call before it ended cancels it. The drivers run one call at a time per client
+connection; the sans-IO `protolink::grpc::Client` supports concurrent calls.
+
 See [`examples/embedded-device`](examples/embedded-device) for a complete, tested embedded-device
 example, including a TCP server (`just example-server`) that can be queried with `grpcurl`.
 
 ## Compatibility profile
 
 Supported:
-- unary RPCs, uncompressed protobuf payloads
+- unary, server-streaming, client-streaming and bidirectional streaming RPCs
+- uncompressed protobuf payloads
 - `application/grpc` (and `+proto`) content types
 - `grpc-status` / `grpc-message` (percent-encoded), trailers-only error responses
-- bounded message sizes (4 KiB default, configurable)
+- bounded message sizes (4 KiB default, configurable) and bounded buffering under HTTP/2 flow control
 - HTTP/2 h2c with preface, SETTINGS/PING acks, flow control, CONTINUATION, GOAWAY
 
 Not supported:
-- client, server and bidirectional streaming (generated servers answer `UNIMPLEMENTED`)
+
 - compression, deadlines (`grpc-timeout` is ignored), custom metadata
 - reflection, health checking, interceptors, TLS
 

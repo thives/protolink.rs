@@ -5,13 +5,35 @@
 //! produces the service glue that `tonic-build` would normally provide:
 //!
 //! - method path constants,
-//! - a service trait with one method per unary RPC,
+//! - a service trait with methods for every RPC (unary, server-streaming,
+//!   client-streaming and bidirectional streaming),
 //! - a `<Service>Server<S>` wrapper implementing `protolink_grpc::Handler`,
-//! - an async `<Service>Client<T: UnaryTransport>`,
-//! - a `<Service>BlockingClient<T: BlockingUnaryTransport>`.
+//! - an async `<Service>Client<T>`: unary methods for
+//!   `T: UnaryTransport`, streaming methods for `T: StreamingTransport`,
+//! - a `<Service>BlockingClient<T>`, the same over the blocking transports.
 //!
-//! Streaming RPCs are not supported: generated servers answer them with
-//! `UNIMPLEMENTED` and generated clients do not expose them.
+//! ## Streaming methods
+//!
+//! Servers are sans-IO and executor-agnostic: each streaming call is
+//! identified by a `CallId`, request messages are delivered to the service
+//! as they arrive, and responses are pulled with a `poll_<method>` function
+//! taking a [`Context`](core::task::Context). For an RPC `Method`:
+//!
+//! | Shape | Trait methods |
+//! |---|---|
+//! | unary | `method(request) -> Result<Resp, Status>` |
+//! | server streaming | `method(call, request)`, `poll_method(call, cx) -> Poll<Next<Resp>>`, `cancel_method(call)` |
+//! | client streaming | `method(call, request)` per message, `poll_method(call, cx) -> Poll<Result<Resp, Status>>` after the client half-closes, `cancel_method(call)` |
+//! | bidirectional | `method(call, request)` per message, `end_method(call)` on half-close, `poll_method(call, cx) -> Poll<Next<Resp>>`, `cancel_method(call)` |
+//!
+//! Streaming methods have default implementations that answer
+//! `UNIMPLEMENTED`, so adding a streaming RPC to a `.proto` does not break
+//! existing implementations. See `protolink_grpc::Handler` for the call
+//! lifecycle.
+//!
+//! Clients return typed call wrappers from `protolink_grpc::codec`:
+//! `ServerStreaming` (after sending the request), `ClientStreaming` and
+//! `BidiStreaming`, or their `Blocking*` counterparts.
 //!
 //! ## Usage from `build.rs`
 //!
@@ -322,31 +344,38 @@ impl Generator {
         let name = svc.name();
         let rt = &self.runtime_path;
 
-        struct M<'a> {
-            desc: &'a MethodDescriptorProto,
-            konst: String,
-            func: String,
-            req: String,
-            resp: String,
-        }
         let methods = svc
             .method
             .iter()
             .map(|m| {
+                let s = snake(m.name());
                 Ok(M {
-                    desc: m,
-                    konst: format!("METHOD_{}", snake(m.name()).to_uppercase()),
-                    func: rust_fn_ident(&snake(m.name())),
+                    name: m.name().to_owned(),
+                    kind: Kind::of(m),
+                    konst: format!("METHOD_{}", s.to_uppercase()),
+                    func: rust_fn_ident(&s),
+                    poll: format!("poll_{s}"),
+                    end: format!("end_{s}"),
+                    cancel: format!("cancel_{s}"),
                     req: self.type_path(m.input_type())?,
                     resp: self.type_path(m.output_type())?,
                 })
             })
             .collect::<Result<Vec<_>, Error>>()?;
-        let unary = || {
-            methods
-                .iter()
-                .filter(|m| !m.desc.client_streaming() && !m.desc.server_streaming())
-        };
+
+        let mut seen: BTreeMap<String, &str> = BTreeMap::new();
+        for m in &methods {
+            for f in m.trait_fns() {
+                if let Some(other) = seen.insert(f.clone(), &m.name) {
+                    return Err(Error::Parse(format!(
+                        "service `{full}`: RPCs `{other}` and `{}` both generate a method named `{f}`",
+                        m.name
+                    )));
+                }
+            }
+        }
+        let streaming = methods.iter().any(|m| m.kind != Kind::Unary);
+        let unary = methods.iter().any(|m| m.kind == Kind::Unary);
 
         let w = &mut *out;
         let _ = writeln!(w, "\n/// gRPC bindings for `{full}`.");
@@ -354,23 +383,19 @@ impl Generator {
         let _ = writeln!(w, "pub mod {module} {{");
         let _ = writeln!(w, "    use {rt} as __rt;");
         let _ = writeln!(w, "    use __rt::Status;");
-        let _ = writeln!(w, "    use __rt::__private::Vec;\n");
+        let _ = writeln!(w, "    use __rt::__private::{{Context, Poll, Vec}};\n");
         let _ = writeln!(w, "    /// Fully-qualified service name.");
         let _ = writeln!(w, "    pub const SERVICE_NAME: &str = \"{full}\";");
         for m in &methods {
-            let _ = writeln!(w, "    /// Path of `{}`.", m.desc.name());
+            let _ = writeln!(w, "    /// Path of `{}`.", m.name);
             let _ = writeln!(
                 w,
                 "    pub const {}: &str = \"/{full}/{}\";",
-                m.konst,
-                m.desc.name()
+                m.konst, m.name
             );
         }
         let list: Vec<&str> = methods.iter().map(|m| m.konst.as_str()).collect();
-        let _ = writeln!(
-            w,
-            "    /// All method paths, including unsupported streaming methods."
-        );
+        let _ = writeln!(w, "    /// All method paths.");
         let _ = writeln!(
             w,
             "    pub const METHODS: &[&str] = &[{}];",
@@ -378,119 +403,481 @@ impl Generator {
         );
 
         if self.server {
-            let _ = writeln!(
-                w,
-                "\n    /// Server-side implementation of `{full}` (unary methods only)."
-            );
-            let _ = writeln!(w, "    pub trait {name} {{");
-            for m in unary() {
-                let _ = writeln!(w, "        /// Handle `{}`.", m.desc.name());
-                let _ = writeln!(
-                    w,
-                    "        fn {}(&mut self, request: {}) -> Result<{}, Status>;",
-                    m.func, m.req, m.resp
-                );
-            }
-            let _ = writeln!(w, "    }}\n");
-            let _ = writeln!(
-                w,
-                "    /// Routes `{full}` requests to a [`{name}`] implementation.\n    \
-                 #[derive(Debug, Clone, Default)]\n    \
-                 pub struct {name}Server<S>(pub S);\n\n    \
-                 impl<S> {name}Server<S> {{\n        \
-                 /// Wrap a service implementation.\n        \
-                 pub fn new(service: S) -> Self {{\n            Self(service)\n        }}\n\n        \
-                 /// Unwrap the service implementation.\n        \
-                 pub fn into_inner(self) -> S {{\n            self.0\n        }}\n    }}\n"
-            );
-            let _ = writeln!(
-                w,
-                "    impl<S: {name}> __rt::Handler for {name}Server<S> {{"
-            );
-            let _ = writeln!(
-                w,
-                "        fn call(&mut self, path: &str, request: &[u8]) -> Option<Result<Vec<u8>, Status>> {{"
-            );
-            let _ = writeln!(w, "            match path {{");
-            for m in &methods {
-                let (cs, ss) = (m.desc.client_streaming(), m.desc.server_streaming());
-                if !cs && !ss {
-                    let _ = writeln!(
-                        w,
-                        "                {} => Some(__rt::codec::unary(request, |req| {name}::{}(&mut self.0, req))),",
-                        m.konst, m.func
-                    );
-                } else {
-                    let kind = match (cs, ss) {
-                        (true, true) => "bidirectional",
-                        (true, false) => "client",
-                        _ => "server",
-                    };
-                    let _ = writeln!(
-                        w,
-                        "                {} => Some(Err(Status::unimplemented(\"{kind} streaming is not supported\"))),",
-                        m.konst
-                    );
-                }
-            }
-            let _ = writeln!(
-                w,
-                "                _ => None,\n            }}\n        }}\n    }}"
-            );
+            self.gen_server(w, &full, name, &methods, streaming);
         }
-
-        let client = |w: &mut String,
-                      ty: &str,
-                      bound: &str,
-                      asyncness: &str,
-                      dot_await: &str,
-                      doc: &str| {
-            let _ = writeln!(
-                w,
-                "\n    /// {doc} client for `{full}` (unary methods only).\n    \
-                 #[derive(Debug, Clone)]\n    \
-                 pub struct {name}{ty}<T> {{\n        transport: T,\n    }}\n\n    \
-                 impl<T> {name}{ty}<T> {{\n        \
-                 /// Create a client on top of `transport`.\n        \
-                 pub fn new(transport: T) -> Self {{\n            Self {{ transport }}\n        }}\n\n        \
-                 /// Mutable access to the transport.\n        \
-                 pub fn transport_mut(&mut self) -> &mut T {{\n            &mut self.transport\n        }}\n\n        \
-                 /// Unwrap the transport.\n        \
-                 pub fn into_inner(self) -> T {{\n            self.transport\n        }}\n    }}\n"
-            );
-            let _ = writeln!(w, "    impl<T: __rt::{bound}> {name}{ty}<T> {{");
-            for m in unary() {
-                let _ = writeln!(
-                    w,
-                    "        /// Call `{}`.\n        \
-                     pub {asyncness}fn {}(&mut self, request: &{}) -> Result<{}, Status> {{\n            \
-                     let request = __rt::codec::encode(request)?;\n            \
-                     let reply = __rt::{bound}::unary(&mut self.transport, {}, &request){dot_await}?;\n            \
-                     __rt::codec::decode_response(&reply)\n        }}",
-                    m.desc.name(),
-                    m.func,
-                    m.req,
-                    m.resp,
-                    m.konst
-                );
-            }
-            let _ = writeln!(w, "    }}");
-        };
         if self.client {
-            client(w, "Client", "UnaryTransport", "async ", ".await", "Async");
+            gen_client(
+                w,
+                &full,
+                name,
+                &methods,
+                ClientFlavor::ASYNC,
+                unary,
+                streaming,
+            );
         }
         if self.blocking_client {
-            client(
+            gen_client(
                 w,
-                "BlockingClient",
-                "BlockingUnaryTransport",
-                "",
-                "",
-                "Blocking",
+                &full,
+                name,
+                &methods,
+                ClientFlavor::BLOCKING,
+                unary,
+                streaming,
             );
         }
         let _ = writeln!(w, "}}");
         Ok(())
+    }
+
+    fn gen_server(&self, w: &mut String, full: &str, name: &str, methods: &[M], streaming: bool) {
+        let _ = writeln!(w, "\n    /// Server-side implementation of `{full}`.");
+        if streaming {
+            let _ = writeln!(
+                w,
+                "    ///\n    \
+                 /// Streaming calls are identified by a `CallId`, unique per connection.\n    \
+                 /// Request messages are delivered as they arrive and responses are\n    \
+                 /// pulled with the `poll_*` methods; on `Poll::Pending`, wake `cx` once a\n    \
+                 /// response may be ready. Unless overridden, streaming methods answer\n    \
+                 /// `UNIMPLEMENTED`. See `Handler` in the protolink gRPC runtime for the\n    \
+                 /// full call lifecycle."
+            );
+        }
+        let _ = writeln!(w, "    pub trait {name} {{");
+        let mut first = true;
+        for m in methods {
+            if !first {
+                w.push('\n');
+            }
+            first = false;
+            let (n, func, req, resp) = (&m.name, &m.func, &m.req, &m.resp);
+            let (poll, end, cancel) = (&m.poll, &m.end, &m.cancel);
+            let unimpl = format!("Status::unimplemented(\"`{n}` is not implemented\")");
+            let start = |w: &mut String, doc: &str| {
+                let _ = writeln!(
+                    w,
+                    "        /// {doc}\n        \
+                     fn {func}(&mut self, call: __rt::CallId, request: {req}) -> Result<(), Status> {{\n            \
+                     let _ = (call, request);\n            \
+                     Err({unimpl})\n        }}\n"
+                );
+            };
+            let poll_stream = |w: &mut String, doc: &str| {
+                let _ = writeln!(
+                    w,
+                    "        /// {doc}\n        \
+                     /// Return `Next::Message` for each response, then `Next::Done` with\n        \
+                     /// the final status.\n        \
+                     fn {poll}(&mut self, call: __rt::CallId, cx: &mut Context<'_>) -> Poll<__rt::Next<{resp}>> {{\n            \
+                     let _ = (call, cx);\n            \
+                     Poll::Ready(__rt::Next::Done(Err({unimpl})))\n        }}\n"
+                );
+            };
+            let cancel_fn = |w: &mut String| {
+                let _ = writeln!(
+                    w,
+                    "        /// A `{n}` call ended without the service finishing it (cancelled,\n        \
+                     /// reset, malformed or the connection closed): release its state.\n        \
+                     fn {cancel}(&mut self, call: __rt::CallId) {{\n            \
+                     let _ = call;\n        }}"
+                );
+            };
+            match m.kind {
+                Kind::Unary => {
+                    let _ = writeln!(
+                        w,
+                        "        /// Handle `{n}`.\n        \
+                         fn {func}(&mut self, request: {req}) -> Result<{resp}, Status>;"
+                    );
+                }
+                Kind::Server => {
+                    start(
+                        w,
+                        &format!(
+                            "Start a `{n}` call (server streaming) with its request.\n        \
+                             /// Responses are then pulled with `{poll}`."
+                        ),
+                    );
+                    poll_stream(w, &format!("Next response of a `{n}` call."));
+                    cancel_fn(w);
+                }
+                Kind::Client => {
+                    start(
+                        w,
+                        &format!(
+                            "One request message of a `{n}` call (client streaming), in order."
+                        ),
+                    );
+                    let _ = writeln!(
+                        w,
+                        "        /// The response of a `{n}` call, polled once the client has sent\n        \
+                         /// all of its requests.\n        \
+                         fn {poll}(&mut self, call: __rt::CallId, cx: &mut Context<'_>) -> Poll<Result<{resp}, Status>> {{\n            \
+                         let _ = (call, cx);\n            \
+                         Poll::Ready(Err({unimpl}))\n        }}\n"
+                    );
+                    cancel_fn(w);
+                }
+                Kind::Bidi => {
+                    start(
+                        w,
+                        &format!(
+                            "One request message of a `{n}` call (bidirectional streaming),\n        \
+                             /// in order."
+                        ),
+                    );
+                    let _ = writeln!(
+                        w,
+                        "        /// The client finished sending requests on a `{n}` call.\n        \
+                         fn {end}(&mut self, call: __rt::CallId) -> Result<(), Status> {{\n            \
+                         let _ = call;\n            \
+                         Ok(())\n        }}\n"
+                    );
+                    poll_stream(
+                        w,
+                        &format!(
+                            "Next response of a `{n}` call, polled from the start of the call."
+                        ),
+                    );
+                    cancel_fn(w);
+                }
+            }
+        }
+        let _ = writeln!(w, "    }}\n");
+        let _ = writeln!(
+            w,
+            "    /// Routes `{full}` requests to a [`{name}`] implementation.\n    \
+             #[derive(Debug, Clone, Default)]\n    \
+             pub struct {name}Server<S>(pub S);\n\n    \
+             impl<S> {name}Server<S> {{\n        \
+             /// Wrap a service implementation.\n        \
+             pub fn new(service: S) -> Self {{\n            Self(service)\n        }}\n\n        \
+             /// Unwrap the service implementation.\n        \
+             pub fn into_inner(self) -> S {{\n            self.0\n        }}\n    }}\n"
+        );
+        let _ = writeln!(
+            w,
+            "    impl<S: {name}> __rt::Handler for {name}Server<S> {{"
+        );
+
+        // Unary dispatch.
+        let _ = writeln!(
+            w,
+            "        fn call(&mut self, path: &str, request: &[u8]) -> Option<Result<Vec<u8>, Status>> {{\n            \
+             match path {{"
+        );
+        for m in methods {
+            if m.kind == Kind::Unary {
+                let _ = writeln!(
+                    w,
+                    "                {} => Some(__rt::codec::unary(request, |req| {name}::{}(&mut self.0, req))),",
+                    m.konst, m.func
+                );
+            } else {
+                let _ = writeln!(
+                    w,
+                    "                {} => Some(Err(Status::unimplemented(\"`{}` is a streaming method\"))),",
+                    m.konst, m.name
+                );
+            }
+        }
+        let _ = writeln!(
+            w,
+            "                _ => None,\n            }}\n        }}\n"
+        );
+
+        // Method kinds.
+        let _ = writeln!(
+            w,
+            "        fn method_kind(&self, path: &str) -> Option<__rt::MethodKind> {{\n            \
+             match path {{"
+        );
+        for m in methods {
+            let _ = writeln!(
+                w,
+                "                {} => Some(__rt::MethodKind::{}),",
+                m.konst,
+                m.kind.runtime_name()
+            );
+        }
+        let _ = writeln!(w, "                _ => None,\n            }}\n        }}");
+
+        if streaming {
+            let streams = || methods.iter().filter(|m| m.kind != Kind::Unary);
+            let _ = writeln!(
+                w,
+                "\n        fn on_message(&mut self, path: &str, call: __rt::CallId, message: &[u8]) -> Result<(), Status> {{\n            \
+                 match path {{"
+            );
+            for m in streams() {
+                let _ = writeln!(
+                    w,
+                    "                {} => __rt::codec::message(message, |req| {name}::{}(&mut self.0, call, req)),",
+                    m.konst, m.func
+                );
+            }
+            let _ = writeln!(
+                w,
+                "                _ => Err(Status::unimplemented(\"unknown method\")),\n            }}\n        }}"
+            );
+
+            let _ = writeln!(
+                w,
+                "\n        fn on_half_close(&mut self, path: &str, call: __rt::CallId) -> Result<(), Status> {{\n            \
+                 match path {{"
+            );
+            for m in streams().filter(|m| m.kind == Kind::Bidi) {
+                let _ = writeln!(
+                    w,
+                    "                {} => {name}::{}(&mut self.0, call),",
+                    m.konst, m.end
+                );
+            }
+            let _ = writeln!(
+                w,
+                "                _ => Ok(()),\n            }}\n        }}"
+            );
+
+            let _ = writeln!(
+                w,
+                "\n        fn poll_response(&mut self, path: &str, call: __rt::CallId, cx: &mut Context<'_>) -> Poll<__rt::Next<Vec<u8>>> {{\n            \
+                 match path {{"
+            );
+            for m in streams() {
+                let helper = if m.kind == Kind::Client {
+                    "poll_single"
+                } else {
+                    "poll_stream"
+                };
+                let _ = writeln!(
+                    w,
+                    "                {} => __rt::codec::{helper}({name}::{}(&mut self.0, call, cx)),",
+                    m.konst, m.poll
+                );
+            }
+            let _ = writeln!(
+                w,
+                "                _ => Poll::Ready(__rt::Next::Done(Err(Status::unimplemented(\"unknown method\")))),\n            }}\n        }}"
+            );
+
+            let _ = writeln!(
+                w,
+                "\n        fn on_cancel(&mut self, path: &str, call: __rt::CallId) {{\n            \
+                 match path {{"
+            );
+            for m in streams() {
+                let _ = writeln!(
+                    w,
+                    "                {} => {name}::{}(&mut self.0, call),",
+                    m.konst, m.cancel
+                );
+            }
+            let _ = writeln!(w, "                _ => {{}}\n            }}\n        }}");
+        }
+        let _ = writeln!(w, "    }}");
+    }
+}
+
+/// One RPC of a service, with its generated names.
+struct M {
+    name: String,
+    kind: Kind,
+    konst: String,
+    func: String,
+    poll: String,
+    end: String,
+    cancel: String,
+    req: String,
+    resp: String,
+}
+
+impl M {
+    /// Names of the trait methods generated for this RPC.
+    fn trait_fns(&self) -> Vec<String> {
+        match self.kind {
+            Kind::Unary => vec![self.func.clone()],
+            Kind::Server | Kind::Client => {
+                vec![self.func.clone(), self.poll.clone(), self.cancel.clone()]
+            }
+            Kind::Bidi => vec![
+                self.func.clone(),
+                self.end.clone(),
+                self.poll.clone(),
+                self.cancel.clone(),
+            ],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Unary,
+    Server,
+    Client,
+    Bidi,
+}
+
+impl Kind {
+    fn of(m: &MethodDescriptorProto) -> Self {
+        match (m.client_streaming(), m.server_streaming()) {
+            (false, false) => Self::Unary,
+            (false, true) => Self::Server,
+            (true, false) => Self::Client,
+            (true, true) => Self::Bidi,
+        }
+    }
+
+    fn runtime_name(self) -> &'static str {
+        match self {
+            Self::Unary => "Unary",
+            Self::Server => "ServerStreaming",
+            Self::Client => "ClientStreaming",
+            Self::Bidi => "BidiStreaming",
+        }
+    }
+}
+
+/// Async or blocking client.
+struct ClientFlavor {
+    ty: &'static str,
+    doc: &'static str,
+    unary_bound: &'static str,
+    stream_bound: &'static str,
+    call_trait: &'static str,
+    wrapper_prefix: &'static str,
+    asyncness: &'static str,
+    dot_await: &'static str,
+}
+
+impl ClientFlavor {
+    const ASYNC: Self = Self {
+        ty: "Client",
+        doc: "Async",
+        unary_bound: "UnaryTransport",
+        stream_bound: "StreamingTransport",
+        call_trait: "StreamingCall",
+        wrapper_prefix: "",
+        asyncness: "async ",
+        dot_await: ".await",
+    };
+    const BLOCKING: Self = Self {
+        ty: "BlockingClient",
+        doc: "Blocking",
+        unary_bound: "BlockingUnaryTransport",
+        stream_bound: "BlockingStreamingTransport",
+        call_trait: "BlockingStreamingCall",
+        wrapper_prefix: "Blocking",
+        asyncness: "",
+        dot_await: "",
+    };
+}
+
+fn gen_client(
+    w: &mut String,
+    full: &str,
+    name: &str,
+    methods: &[M],
+    f: ClientFlavor,
+    unary: bool,
+    streaming: bool,
+) {
+    let ClientFlavor {
+        ty,
+        doc,
+        unary_bound,
+        stream_bound,
+        call_trait,
+        wrapper_prefix: p,
+        asyncness,
+        dot_await,
+    } = f;
+    let mut transports = Vec::new();
+    if unary {
+        transports.push(format!("`{unary_bound}` for unary methods"));
+    }
+    if streaming {
+        transports.push(format!("`{stream_bound}` for streaming methods"));
+    }
+    let _ = writeln!(
+        w,
+        "\n    /// {doc} client for `{full}`.\n    \
+         ///\n    \
+         /// Requires {}.\n    \
+         #[derive(Debug, Clone)]\n    \
+         pub struct {name}{ty}<T> {{\n        transport: T,\n    }}\n\n    \
+         impl<T> {name}{ty}<T> {{\n        \
+         /// Create a client on top of `transport`.\n        \
+         pub fn new(transport: T) -> Self {{\n            Self {{ transport }}\n        }}\n\n        \
+         /// Mutable access to the transport.\n        \
+         pub fn transport_mut(&mut self) -> &mut T {{\n            &mut self.transport\n        }}\n\n        \
+         /// Unwrap the transport.\n        \
+         pub fn into_inner(self) -> T {{\n            self.transport\n        }}\n    }}",
+        if transports.is_empty() {
+            "nothing".to_owned()
+        } else {
+            transports.join(" and ")
+        }
+    );
+    if unary {
+        let _ = writeln!(w, "\n    impl<T: __rt::{unary_bound}> {name}{ty}<T> {{");
+        for m in methods.iter().filter(|m| m.kind == Kind::Unary) {
+            let _ = writeln!(
+                w,
+                "        /// Call `{}`.\n        \
+                 pub {asyncness}fn {}(&mut self, request: &{}) -> Result<{}, Status> {{\n            \
+                 let request = __rt::codec::encode(request)?;\n            \
+                 let reply = __rt::{unary_bound}::unary(&mut self.transport, {}, &request){dot_await}?;\n            \
+                 __rt::codec::decode_response(&reply)\n        }}",
+                m.name, m.func, m.req, m.resp, m.konst
+            );
+        }
+        let _ = writeln!(w, "    }}");
+    }
+    if streaming {
+        let call = format!("<T as __rt::{stream_bound}>::Call<'_>");
+        let _ = writeln!(w, "\n    impl<T: __rt::{stream_bound}> {name}{ty}<T> {{");
+        for m in methods.iter().filter(|m| m.kind != Kind::Unary) {
+            let (n, func, req, resp, konst) = (&m.name, &m.func, &m.req, &m.resp, &m.konst);
+            let start =
+                format!("__rt::{stream_bound}::start(&mut self.transport, {konst}){dot_await}?");
+            match m.kind {
+                Kind::Server => {
+                    let _ = writeln!(
+                        w,
+                        "        /// Call `{n}` (server streaming): send `request`, then read the\n        \
+                         /// responses from the returned stream.\n        \
+                         pub {asyncness}fn {func}(&mut self, request: &{req}) -> Result<__rt::codec::{p}ServerStreaming<{call}, {resp}>, Status> {{\n            \
+                         let request = __rt::codec::encode(request)?;\n            \
+                         let mut call = {start};\n            \
+                         __rt::{call_trait}::send(&mut call, &request){dot_await}?;\n            \
+                         __rt::{call_trait}::close_send(&mut call){dot_await}?;\n            \
+                         Ok(__rt::codec::{p}ServerStreaming::new(call))\n        }}"
+                    );
+                }
+                Kind::Client => {
+                    let _ = writeln!(
+                        w,
+                        "        /// Call `{n}` (client streaming): send requests on the returned\n        \
+                         /// stream, then `finish` it to get the response.\n        \
+                         pub {asyncness}fn {func}(&mut self) -> Result<__rt::codec::{p}ClientStreaming<{call}, {req}, {resp}>, Status> {{\n            \
+                         Ok(__rt::codec::{p}ClientStreaming::new({start}))\n        }}"
+                    );
+                }
+                Kind::Bidi => {
+                    let _ = writeln!(
+                        w,
+                        "        /// Call `{n}` (bidirectional streaming): send requests and read\n        \
+                         /// responses on the returned stream.\n        \
+                         pub {asyncness}fn {func}(&mut self) -> Result<__rt::codec::{p}BidiStreaming<{call}, {req}, {resp}>, Status> {{\n            \
+                         Ok(__rt::codec::{p}BidiStreaming::new({start}))\n        }}"
+                    );
+                }
+                Kind::Unary => {}
+            }
+        }
+        let _ = writeln!(w, "    }}");
     }
 }
 
@@ -603,6 +990,8 @@ service Service {
   rpc Command(Command) returns (Reply);
   rpc Nested(Command.Inner) returns (Reply);
   rpc EventSubscribe(EventSubscribe) returns (stream Event);
+  rpc Upload(stream Command) returns (Reply);
+  rpc Chat(stream Command) returns (stream Reply);
 }"#;
 
     fn generate(g: &Generator) -> String {
@@ -613,6 +1002,23 @@ service Service {
         let out = dir.join("grpc.rs");
         g.compile_protos(&[&proto], &out).unwrap();
         fs::read_to_string(out).unwrap()
+    }
+
+    /// Parse a single proto3 file given as source.
+    fn parse(body: &str) -> FileDescriptorProto {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "protolink_grpc_gen_parse_{}_{n}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let proto = dir.join("p.proto");
+        fs::write(&proto, format!("syntax = \"proto3\";\n{body}\n")).unwrap();
+        let mut parser = protobuf_parse::Parser::new();
+        parser.pure().include(&dir).input(&proto);
+        let mut set = parser.file_descriptor_set().unwrap();
+        set.file.pop().unwrap()
     }
 
     #[test]
@@ -651,12 +1057,127 @@ service Service {
     fn generates_service() {
         let src = generate(&Generator::new());
         assert!(src.contains("pub const METHOD_COMMAND: &str = \"/a.b.Service/Command\";"));
+        assert!(src.contains("pub const METHODS: &[&str] = &[METHOD_COMMAND, METHOD_NESTED, METHOD_EVENT_SUBSCRIBE, METHOD_UPLOAD, METHOD_CHAT];"));
         assert!(src.contains("fn command(&mut self, request: super::a_::b_::Command) -> Result<super::a_::b_::Reply, Status>;"));
         assert!(src.contains("request: super::a_::b_::Command_::Inner"));
-        assert!(!src.contains("fn event_subscribe"));
-        assert!(src.contains("METHOD_EVENT_SUBSCRIBE => Some(Err(Status::unimplemented(\"server streaming is not supported\")))"));
         assert!(src.contains("pub async fn command(&mut self, request: &super::a_::b_::Command)"));
         assert!(src.contains("pub struct ServiceBlockingClient<T>"));
+    }
+
+    #[test]
+    fn generates_streaming_service_methods() {
+        let src = generate(&Generator::new());
+        let (req, cmd, reply, event) = (
+            "super::a_::b_::EventSubscribe",
+            "super::a_::b_::Command",
+            "super::a_::b_::Reply",
+            "super::a_::b_::Event",
+        );
+        // Server streaming.
+        assert!(src.contains(&format!(
+            "fn event_subscribe(&mut self, call: __rt::CallId, request: {req}) -> Result<(), Status> {{"
+        )));
+        assert!(src.contains(&format!(
+            "fn poll_event_subscribe(&mut self, call: __rt::CallId, cx: &mut Context<'_>) -> Poll<__rt::Next<{event}>> {{"
+        )));
+        assert!(src.contains("fn cancel_event_subscribe(&mut self, call: __rt::CallId) {"));
+        // Client streaming.
+        assert!(src.contains(&format!(
+            "fn upload(&mut self, call: __rt::CallId, request: {cmd}) -> Result<(), Status> {{"
+        )));
+        assert!(src.contains(&format!(
+            "fn poll_upload(&mut self, call: __rt::CallId, cx: &mut Context<'_>) -> Poll<Result<{reply}, Status>> {{"
+        )));
+        assert!(src.contains("fn cancel_upload(&mut self, call: __rt::CallId) {"));
+        // Bidirectional.
+        assert!(src.contains(&format!(
+            "fn chat(&mut self, call: __rt::CallId, request: {cmd}) -> Result<(), Status> {{"
+        )));
+        assert!(src.contains("fn end_chat(&mut self, call: __rt::CallId) -> Result<(), Status> {"));
+        assert!(src.contains(&format!(
+            "fn poll_chat(&mut self, call: __rt::CallId, cx: &mut Context<'_>) -> Poll<__rt::Next<{reply}>> {{"
+        )));
+        assert!(src.contains("fn cancel_chat(&mut self, call: __rt::CallId) {"));
+        // Streaming methods default to UNIMPLEMENTED; unary ones are required.
+        assert!(src.contains("Err(Status::unimplemented(\"`Upload` is not implemented\"))"));
+        assert!(!src.contains("fn command(&mut self, request: super::a_::b_::Command) -> Result<super::a_::b_::Reply, Status> {"));
+    }
+
+    #[test]
+    fn generates_streaming_routing() {
+        let src = generate(&Generator::new());
+        for line in [
+            "METHOD_COMMAND => Some(__rt::MethodKind::Unary),",
+            "METHOD_EVENT_SUBSCRIBE => Some(__rt::MethodKind::ServerStreaming),",
+            "METHOD_UPLOAD => Some(__rt::MethodKind::ClientStreaming),",
+            "METHOD_CHAT => Some(__rt::MethodKind::BidiStreaming),",
+            "METHOD_EVENT_SUBSCRIBE => Some(Err(Status::unimplemented(\"`EventSubscribe` is a streaming method\"))),",
+            "METHOD_UPLOAD => __rt::codec::message(message, |req| Service::upload(&mut self.0, call, req)),",
+            "METHOD_CHAT => Service::end_chat(&mut self.0, call),",
+            "METHOD_EVENT_SUBSCRIBE => __rt::codec::poll_stream(Service::poll_event_subscribe(&mut self.0, call, cx)),",
+            "METHOD_UPLOAD => __rt::codec::poll_single(Service::poll_upload(&mut self.0, call, cx)),",
+            "METHOD_CHAT => __rt::codec::poll_stream(Service::poll_chat(&mut self.0, call, cx)),",
+            "METHOD_UPLOAD => Service::cancel_upload(&mut self.0, call),",
+        ] {
+            assert!(src.contains(line), "missing `{line}`");
+        }
+        // Only bidi calls observe the half-close.
+        assert!(!src.contains("METHOD_UPLOAD => Service::end_upload"));
+        // Unary methods are not routed to the streaming entry points.
+        assert!(!src.contains("METHOD_COMMAND => __rt::codec::message"));
+    }
+
+    #[test]
+    fn generates_streaming_clients() {
+        let src = generate(&Generator::new());
+        for line in [
+            "impl<T: __rt::StreamingTransport> ServiceClient<T> {",
+            "pub async fn event_subscribe(&mut self, request: &super::a_::b_::EventSubscribe) -> Result<__rt::codec::ServerStreaming<<T as __rt::StreamingTransport>::Call<'_>, super::a_::b_::Event>, Status> {",
+            "pub async fn upload(&mut self) -> Result<__rt::codec::ClientStreaming<<T as __rt::StreamingTransport>::Call<'_>, super::a_::b_::Command, super::a_::b_::Reply>, Status> {",
+            "pub async fn chat(&mut self) -> Result<__rt::codec::BidiStreaming<<T as __rt::StreamingTransport>::Call<'_>, super::a_::b_::Command, super::a_::b_::Reply>, Status> {",
+            "impl<T: __rt::BlockingStreamingTransport> ServiceBlockingClient<T> {",
+            "pub fn event_subscribe(&mut self, request: &super::a_::b_::EventSubscribe) -> Result<__rt::codec::BlockingServerStreaming<",
+            "pub fn upload(&mut self) -> Result<__rt::codec::BlockingClientStreaming<",
+            "pub fn chat(&mut self) -> Result<__rt::codec::BlockingBidiStreaming<",
+            "__rt::BlockingStreamingCall::close_send(&mut call)?;",
+        ] {
+            assert!(src.contains(line), "missing `{line}`");
+        }
+    }
+
+    #[test]
+    fn unary_only_service_has_no_streaming_items() {
+        let mut g = Generator::new();
+        g.client(false).blocking_client(false);
+        let src = g
+            .generate(&[parse(
+                "package p; message M {} service S { rpc Get(M) returns (M); }",
+            )])
+            .unwrap();
+        assert!(
+            src.contains(
+                "fn get(&mut self, request: super::p_::M) -> Result<super::p_::M, Status>;"
+            )
+        );
+        assert!(src.contains("METHOD_GET => Some(__rt::MethodKind::Unary),"));
+        assert!(!src.contains("fn on_message"));
+        assert!(!src.contains("fn poll_response"));
+    }
+
+    #[test]
+    fn rejects_generated_name_collisions() {
+        let proto = "package p; message M {}\n\
+                     service S {\n\
+                       rpc Feed(stream M) returns (stream M);\n\
+                       rpc PollFeed(M) returns (M);\n\
+                     }";
+        let err = Generator::new().generate(&[parse(proto)]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("`Feed` and `PollFeed`") || msg.contains("`PollFeed` and `Feed`"),
+            "{msg}"
+        );
+        assert!(msg.contains("`poll_feed`"), "{msg}");
     }
 
     #[test]

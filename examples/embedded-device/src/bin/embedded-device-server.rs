@@ -5,6 +5,15 @@
 //! grpcurl -plaintext -import-path examples/embedded-device/proto -proto device.proto \
 //!   -d '{"correlation_id": 7, "get_status": {}}' \
 //!   127.0.0.1:50051 protolink.examples.embedded.device.Service/Command
+//!
+//! # Bidirectional streaming: one reply per command.
+//! grpcurl -plaintext -import-path examples/embedded-device/proto -proto device.proto \
+//!   -d '{"correlation_id": 1, "get_status": {}} {"restart": {}}' \
+//!   127.0.0.1:50051 protolink.examples.embedded.device.Service/CommandStream
+//!
+//! # Server streaming: replay the event log.
+//! grpcurl -plaintext -import-path examples/embedded-device/proto -proto device.proto \
+//!   -d '{}' 127.0.0.1:50051 protolink.examples.embedded.device.Service/EventSubscribe
 //! ```
 
 use embedded_device_example::{Device, ServiceServer};
