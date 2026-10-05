@@ -32,7 +32,10 @@ fn call(path: &str, req: &[u8]) -> Result<Vec<u8>, Status> {
     let mut handler = FnHandler(echo);
     let id = client.start_unary(path, req).unwrap();
     run(&mut client, &mut server, &mut handler);
-    client.take_response(id).expect("call finished")
+    client
+        .take_response(id)
+        .expect("call finished")
+        .map(Response::into_message)
 }
 
 #[test]
@@ -61,7 +64,7 @@ fn unknown_method_is_unimplemented() {
 struct Knows(&'static str);
 
 impl Handler for Knows {
-    fn call(&mut self, _: &CallContext<'_>, _: &[u8]) -> Option<Result<Vec<u8>, Status>> {
+    fn call(&mut self, _: &mut CallContext<'_>, _: &[u8]) -> Option<Result<Vec<u8>, Status>> {
         None
     }
 
@@ -122,11 +125,13 @@ fn multiple_calls_on_one_connection() {
     let a = client.start_unary("/test.Echo/Echo", b"a").unwrap();
     let b = client.start_unary("/test.Echo/Echo", b"b").unwrap();
     run(&mut client, &mut server, &mut handler);
-    assert_eq!(client.take_response(a), Some(Ok(b"a".to_vec())));
-    assert_eq!(client.take_response(b), Some(Ok(b"b".to_vec())));
+    let body =
+        |r: Option<Result<Response<Vec<u8>>, Status>>| r.map(|r| r.map(Response::into_message));
+    assert_eq!(body(client.take_response(a)), Some(Ok(b"a".to_vec())));
+    assert_eq!(body(client.take_response(b)), Some(Ok(b"b".to_vec())));
     let c = client.start_unary("/test.Echo/Echo", b"c").unwrap();
     run(&mut client, &mut server, &mut handler);
-    assert_eq!(client.take_response(c), Some(Ok(b"c".to_vec())));
+    assert_eq!(body(client.take_response(c)), Some(Ok(b"c".to_vec())));
 }
 
 #[test]
@@ -135,13 +140,12 @@ fn tuple_handlers_route_in_order() {
         FnHandler(|p: &str, _: &[u8]| (p == "/a.A/X").then(|| Ok(b"a".to_vec()))),
         FnHandler(|p: &str, _: &[u8]| (p == "/b.B/X").then(|| Ok(b"b".to_vec()))),
     );
-    let ctx = |path| CallContext {
-        path,
-        id: 1,
-        deadline: None,
-    };
-    assert_eq!(handler.call(&ctx("/b.B/X"), b""), Some(Ok(b"b".to_vec())));
-    assert_eq!(handler.call(&ctx("/c.C/X"), b""), None);
+    let md = Metadata::new();
+    let mut response = ResponseMetadata::default();
+    let mut ctx = CallContext::new("/b.B/X", 1, None, &md, &mut response);
+    assert_eq!(handler.call(&mut ctx, b""), Some(Ok(b"b".to_vec())));
+    ctx.path = "/c.C/X";
+    assert_eq!(handler.call(&mut ctx, b""), None);
 }
 
 /// Drive the server with a raw HTTP/2 client to check non-gRPC requests.

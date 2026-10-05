@@ -47,13 +47,24 @@
 //! wake up from `next_deadline`. A server's [`Handler`] methods get the call's
 //! deadline in [`CallContext`]. The I/O drivers in `protolink` do the ticking.
 //!
+//! ## Metadata
+//!
+//! Custom metadata ([`Metadata`]) travels as extra HTTP/2 headers and trailers.
+//! A client sets request metadata in [`CallOptions::metadata`] and gets the
+//! response's headers and trailers back in [`Response`] (unary) or from the
+//! streaming call; trailers of a failed call are in [`Status::metadata`]. A
+//! server reads request metadata and sets response metadata through
+//! [`CallContext`]. Binary values (keys ending in `-bin`) are base64 on the
+//! wire.
+//!
 //! ## Compatibility profile
 //!
 //! Supported: unary and streaming RPCs, protobuf payloads (optionally
 //! compressed), `application/grpc[+proto]`, `grpc-status`/`grpc-message`,
-//! trailers-only responses, bounded message sizes, deadlines (`grpc-timeout`).
+//! trailers-only responses, bounded message sizes, deadlines (`grpc-timeout`),
+//! custom metadata.
 //!
-//! Not supported: custom metadata, reflection, health checking.
+//! Not supported: reflection, health checking.
 #![no_std]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -70,6 +81,7 @@ pub mod compression;
 mod handler;
 mod inbound;
 pub mod lpm;
+mod metadata;
 mod server;
 pub mod status;
 mod timeout;
@@ -78,7 +90,8 @@ pub use protolink_http2 as http2;
 
 pub use client::{CallOptions, Client, ClientConfig};
 pub use compression::Compression;
-pub use handler::{CallContext, FnHandler, Handler};
+pub use handler::{CallContext, FnHandler, Handler, ResponseMetadata};
+pub use metadata::{InvalidMetadata, Metadata, MetadataValue};
 pub use server::{Server, ServerConfig};
 pub use status::{Code, Status};
 
@@ -91,6 +104,43 @@ pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 4096;
 /// Identifies an in-flight call on a [`Client`] or [`Server`] (its HTTP/2
 /// stream id).
 pub type CallId = protolink_http2::StreamId;
+
+/// The successful outcome of a unary call: the response message and the
+/// metadata that came with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Response<T> {
+    /// The response message.
+    pub message: T,
+    /// Metadata of the response headers. Empty for a trailers-only response.
+    pub headers: Metadata,
+    /// Metadata of the response trailers.
+    pub trailers: Metadata,
+}
+
+impl<T> Response<T> {
+    /// A response without metadata.
+    pub fn new(message: T) -> Self {
+        Self {
+            message,
+            headers: Metadata::new(),
+            trailers: Metadata::new(),
+        }
+    }
+
+    /// Map the message, keeping the metadata.
+    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Response<U> {
+        Response {
+            message: f(self.message),
+            headers: self.headers,
+            trailers: self.trailers,
+        }
+    }
+
+    /// Drop the metadata.
+    pub fn into_message(self) -> T {
+        self.message
+    }
+}
 
 /// The shape of an RPC method.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -148,25 +198,25 @@ pub mod __private {
 /// Generated async clients are generic over this trait.
 pub trait UnaryTransport {
     /// Call `path` (`/package.Service/Method`) with `request` and return the
-    /// encoded response message.
+    /// encoded response message and its metadata.
     fn unary(
         &mut self,
         path: &str,
         request: &[u8],
         options: CallOptions,
-    ) -> impl Future<Output = Result<Vec<u8>, Status>>;
+    ) -> impl Future<Output = Result<Response<Vec<u8>>, Status>>;
 }
 
 /// Blocking counterpart of [`UnaryTransport`].
 pub trait BlockingUnaryTransport {
     /// Call `path` (`/package.Service/Method`) with `request` and return the
-    /// encoded response message.
+    /// encoded response message and its metadata.
     fn unary(
         &mut self,
         path: &str,
         request: &[u8],
         options: CallOptions,
-    ) -> Result<Vec<u8>, Status>;
+    ) -> Result<Response<Vec<u8>>, Status>;
 }
 
 impl<T: UnaryTransport + ?Sized> UnaryTransport for &mut T {
@@ -175,7 +225,7 @@ impl<T: UnaryTransport + ?Sized> UnaryTransport for &mut T {
         path: &str,
         request: &[u8],
         options: CallOptions,
-    ) -> impl Future<Output = Result<Vec<u8>, Status>> {
+    ) -> impl Future<Output = Result<Response<Vec<u8>>, Status>> {
         (**self).unary(path, request, options)
     }
 }
@@ -186,7 +236,7 @@ impl<T: BlockingUnaryTransport + ?Sized> BlockingUnaryTransport for &mut T {
         path: &str,
         request: &[u8],
         options: CallOptions,
-    ) -> Result<Vec<u8>, Status> {
+    ) -> Result<Response<Vec<u8>>, Status> {
         (**self).unary(path, request, options)
     }
 }
@@ -230,6 +280,14 @@ pub trait StreamingCall {
     /// `grpc-status: 0`, `Err` if it failed. Messages received before a
     /// failure are returned first.
     fn message(&mut self) -> impl Future<Output = Result<Option<Vec<u8>>, Status>>;
+
+    /// Metadata of the response headers, once the server has sent them. `None`
+    /// before that, and for a trailers-only response.
+    fn headers(&self) -> Option<Metadata>;
+
+    /// Metadata of the response trailers. `None` until the call has completed
+    /// (that is, [`message`](Self::message) returned `Ok(None)` or an error).
+    fn trailers(&self) -> Option<Metadata>;
 }
 
 /// Blocking counterpart of [`StreamingTransport`].
@@ -251,6 +309,10 @@ pub trait BlockingStreamingCall {
     fn close_send(&mut self) -> Result<(), Status>;
     /// See [`StreamingCall::message`].
     fn message(&mut self) -> Result<Option<Vec<u8>>, Status>;
+    /// See [`StreamingCall::headers`].
+    fn headers(&self) -> Option<Metadata>;
+    /// See [`StreamingCall::trailers`].
+    fn trailers(&self) -> Option<Metadata>;
 }
 
 impl<T: StreamingTransport + ?Sized> StreamingTransport for &mut T {
@@ -285,5 +347,7 @@ mod tests;
 mod tests_compression;
 #[cfg(test)]
 mod tests_deadline;
+#[cfg(test)]
+mod tests_metadata;
 #[cfg(test)]
 mod tests_streaming;

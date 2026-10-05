@@ -246,7 +246,12 @@ fn a_call_that_completes_in_time_is_unaffected() {
         .unwrap();
     pump(&mut client, &mut server, &mut handler);
     client.tick(ms(500));
-    assert_eq!(client.take_response(id), Some(Ok(b"ping".to_vec())));
+    assert_eq!(
+        client
+            .take_response(id)
+            .map(|r| r.map(Response::into_message)),
+        Some(Ok(b"ping".to_vec()))
+    );
     assert_eq!(client.next_deadline(), None);
     client.tick(Duration::from_secs(3600));
     assert!(client.take_output().is_empty());
@@ -260,7 +265,7 @@ struct OneThenWait {
 }
 
 impl Handler for OneThenWait {
-    fn call(&mut self, _: &CallContext<'_>, _: &[u8]) -> Option<Result<Vec<u8>, Status>> {
+    fn call(&mut self, _: &mut CallContext<'_>, _: &[u8]) -> Option<Result<Vec<u8>, Status>> {
         None
     }
 
@@ -268,11 +273,15 @@ impl Handler for OneThenWait {
         Some(MethodKind::ServerStreaming)
     }
 
-    fn on_message(&mut self, _: &CallContext<'_>, _: &[u8]) -> Result<(), Status> {
+    fn on_message(&mut self, _: &mut CallContext<'_>, _: &[u8]) -> Result<(), Status> {
         Ok(())
     }
 
-    fn poll_response(&mut self, ctx: &CallContext<'_>, _: &mut Context<'_>) -> Poll<Next<Vec<u8>>> {
+    fn poll_response(
+        &mut self,
+        ctx: &mut CallContext<'_>,
+        _: &mut Context<'_>,
+    ) -> Poll<Next<Vec<u8>>> {
         let call = ctx.id;
         if self.sent.contains(&call) {
             Poll::Pending
@@ -413,7 +422,7 @@ impl Raw {
 struct Counting(usize);
 
 impl Handler for Counting {
-    fn call(&mut self, _: &CallContext<'_>, request: &[u8]) -> Option<Result<Vec<u8>, Status>> {
+    fn call(&mut self, _: &mut CallContext<'_>, request: &[u8]) -> Option<Result<Vec<u8>, Status>> {
         self.0 += 1;
         Some(Ok(request.to_vec()))
     }
@@ -543,7 +552,7 @@ struct Stuck {
 }
 
 impl Handler for Stuck {
-    fn call(&mut self, _: &CallContext<'_>, _: &[u8]) -> Option<Result<Vec<u8>, Status>> {
+    fn call(&mut self, _: &mut CallContext<'_>, _: &[u8]) -> Option<Result<Vec<u8>, Status>> {
         None
     }
 
@@ -551,15 +560,19 @@ impl Handler for Stuck {
         Some(MethodKind::ServerStreaming)
     }
 
-    fn on_message(&mut self, _: &CallContext<'_>, _: &[u8]) -> Result<(), Status> {
+    fn on_message(&mut self, _: &mut CallContext<'_>, _: &[u8]) -> Result<(), Status> {
         Ok(())
     }
 
-    fn poll_response(&mut self, _: &CallContext<'_>, _: &mut Context<'_>) -> Poll<Next<Vec<u8>>> {
+    fn poll_response(
+        &mut self,
+        _: &mut CallContext<'_>,
+        _: &mut Context<'_>,
+    ) -> Poll<Next<Vec<u8>>> {
         Poll::Pending
     }
 
-    fn on_cancel(&mut self, ctx: &CallContext<'_>) {
+    fn on_cancel(&mut self, ctx: &mut CallContext<'_>) {
         let call = ctx.id;
         self.cancelled.push(call);
     }
@@ -620,7 +633,11 @@ struct Recorder {
 }
 
 impl Handler for Recorder {
-    fn call(&mut self, ctx: &CallContext<'_>, request: &[u8]) -> Option<Result<Vec<u8>, Status>> {
+    fn call(
+        &mut self,
+        ctx: &mut CallContext<'_>,
+        request: &[u8],
+    ) -> Option<Result<Vec<u8>, Status>> {
         self.seen.push(("call", ctx.id, ctx.deadline));
         Some(Ok(request.to_vec()))
     }
@@ -629,23 +646,27 @@ impl Handler for Recorder {
         (path == "/t.T/Watch").then_some(MethodKind::ServerStreaming)
     }
 
-    fn on_message(&mut self, ctx: &CallContext<'_>, _: &[u8]) -> Result<(), Status> {
+    fn on_message(&mut self, ctx: &mut CallContext<'_>, _: &[u8]) -> Result<(), Status> {
         assert_eq!(ctx.path, "/t.T/Watch");
         self.seen.push(("on_message", ctx.id, ctx.deadline));
         Ok(())
     }
 
-    fn on_half_close(&mut self, ctx: &CallContext<'_>) -> Result<(), Status> {
+    fn on_half_close(&mut self, ctx: &mut CallContext<'_>) -> Result<(), Status> {
         self.seen.push(("on_half_close", ctx.id, ctx.deadline));
         Ok(())
     }
 
-    fn poll_response(&mut self, ctx: &CallContext<'_>, _: &mut Context<'_>) -> Poll<Next<Vec<u8>>> {
+    fn poll_response(
+        &mut self,
+        ctx: &mut CallContext<'_>,
+        _: &mut Context<'_>,
+    ) -> Poll<Next<Vec<u8>>> {
         self.seen.push(("poll_response", ctx.id, ctx.deadline));
         Poll::Pending
     }
 
-    fn on_cancel(&mut self, ctx: &CallContext<'_>) {
+    fn on_cancel(&mut self, ctx: &mut CallContext<'_>) {
         self.seen.push(("on_cancel", ctx.id, ctx.deadline));
     }
 }
@@ -706,20 +727,21 @@ fn a_tuple_of_handlers_passes_the_context_on() {
 
 #[test]
 fn remaining_counts_down_and_saturates() {
-    let ctx = CallContext {
-        path: "/t.T/M",
-        id: 1,
-        deadline: Some(Duration::from_secs(10)),
-    };
+    let md = Metadata::new();
+    let mut response = ResponseMetadata::default();
+    let mut ctx = CallContext::new(
+        "/t.T/M",
+        1,
+        Some(Duration::from_secs(10)),
+        &md,
+        &mut response,
+    );
     assert_eq!(
         ctx.remaining(Duration::from_secs(4)),
         Some(Duration::from_secs(6))
     );
     assert_eq!(ctx.remaining(Duration::from_secs(10)), Some(Duration::ZERO));
     assert_eq!(ctx.remaining(Duration::from_secs(99)), Some(Duration::ZERO));
-    let open = CallContext {
-        deadline: None,
-        ..ctx
-    };
-    assert_eq!(open.remaining(Duration::from_secs(4)), None);
+    ctx.deadline = None;
+    assert_eq!(ctx.remaining(Duration::from_secs(4)), None);
 }

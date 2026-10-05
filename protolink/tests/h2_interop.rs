@@ -231,7 +231,7 @@ mod streaming {
     }
 
     impl Handler for Streams {
-        fn call(&mut self, _: &CallContext<'_>, _: &[u8]) -> Option<Result<Vec<u8>, Status>> {
+        fn call(&mut self, _: &mut CallContext<'_>, _: &[u8]) -> Option<Result<Vec<u8>, Status>> {
             None
         }
 
@@ -244,7 +244,7 @@ mod streaming {
             }
         }
 
-        fn on_message(&mut self, ctx: &CallContext<'_>, msg: &[u8]) -> Result<(), Status> {
+        fn on_message(&mut self, ctx: &mut CallContext<'_>, msg: &[u8]) -> Result<(), Status> {
             let path = ctx.path;
             let call = ctx.id;
             let mut calls = self.calls.lock().unwrap();
@@ -265,7 +265,7 @@ mod streaming {
             Ok(())
         }
 
-        fn on_half_close(&mut self, ctx: &CallContext<'_>) -> Result<(), Status> {
+        fn on_half_close(&mut self, ctx: &mut CallContext<'_>) -> Result<(), Status> {
             let path = ctx.path;
             let call = ctx.id;
             let mut calls = self.calls.lock().unwrap();
@@ -283,7 +283,7 @@ mod streaming {
 
         fn poll_response(
             &mut self,
-            ctx: &CallContext<'_>,
+            ctx: &mut CallContext<'_>,
             cx: &mut Context<'_>,
         ) -> Poll<Next<Vec<u8>>> {
             let path = ctx.path;
@@ -315,7 +315,7 @@ mod streaming {
             }
         }
 
-        fn on_cancel(&mut self, ctx: &CallContext<'_>) {
+        fn on_cancel(&mut self, ctx: &mut CallContext<'_>) {
             let path = ctx.path;
             let call = ctx.id;
             self.calls.lock().unwrap().remove(&call);
@@ -780,7 +780,11 @@ mod deadlines {
     struct QuietEcho;
 
     impl Handler for QuietEcho {
-        fn call(&mut self, ctx: &CallContext<'_>, req: &[u8]) -> Option<Result<Vec<u8>, Status>> {
+        fn call(
+            &mut self,
+            ctx: &mut CallContext<'_>,
+            req: &[u8],
+        ) -> Option<Result<Vec<u8>, Status>> {
             handler(ctx.path, req)
         }
 
@@ -788,13 +792,13 @@ mod deadlines {
             (path == QUIET).then_some(MethodKind::ServerStreaming)
         }
 
-        fn on_message(&mut self, _: &CallContext<'_>, _: &[u8]) -> Result<(), Status> {
+        fn on_message(&mut self, _: &mut CallContext<'_>, _: &[u8]) -> Result<(), Status> {
             Ok(())
         }
 
         fn poll_response(
             &mut self,
-            _: &CallContext<'_>,
+            _: &mut CallContext<'_>,
             _: &mut Context<'_>,
         ) -> Poll<Next<Vec<u8>>> {
             Poll::Pending

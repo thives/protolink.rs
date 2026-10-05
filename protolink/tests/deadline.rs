@@ -39,7 +39,11 @@ struct Peer {
 }
 
 impl Handler for Peer {
-    fn call(&mut self, ctx: &CallContext<'_>, request: &[u8]) -> Option<Result<Vec<u8>, Status>> {
+    fn call(
+        &mut self,
+        ctx: &mut CallContext<'_>,
+        request: &[u8],
+    ) -> Option<Result<Vec<u8>, Status>> {
         (ctx.path == ECHO).then(|| Ok(request.to_vec()))
     }
 
@@ -51,7 +55,7 @@ impl Handler for Peer {
         !matches!(path, ECHO | CHAT | QUIET | BURST)
     }
 
-    fn on_message(&mut self, ctx: &CallContext<'_>, message: &[u8]) -> Result<(), Status> {
+    fn on_message(&mut self, ctx: &mut CallContext<'_>, message: &[u8]) -> Result<(), Status> {
         if ctx.path == CHAT {
             self.queues
                 .entry(ctx.id)
@@ -61,7 +65,11 @@ impl Handler for Peer {
         Ok(())
     }
 
-    fn poll_response(&mut self, ctx: &CallContext<'_>, _: &mut Context<'_>) -> Poll<Next<Vec<u8>>> {
+    fn poll_response(
+        &mut self,
+        ctx: &mut CallContext<'_>,
+        _: &mut Context<'_>,
+    ) -> Poll<Next<Vec<u8>>> {
         if ctx.path == CHAT
             && let Some(message) = self.queues.get_mut(&ctx.id).and_then(VecDeque::pop_front)
         {
@@ -80,7 +88,7 @@ impl Handler for Peer {
         Poll::Pending
     }
 
-    fn on_cancel(&mut self, ctx: &CallContext<'_>) {
+    fn on_cancel(&mut self, ctx: &mut CallContext<'_>) {
         self.queues.remove(&ctx.id);
         self.cancelled.fetch_add(1, SeqCst);
     }
@@ -196,7 +204,7 @@ async fn a_call_that_finishes_in_time_is_not_expired_later() {
             .unary_with(ECHO, b"hi", CallOptions::timeout(ms(500)))
             .await
             .unwrap();
-        assert_eq!(reply, b"hi");
+        assert_eq!(reply.message, b"hi");
         tokio::time::sleep(Duration::from_secs(5)).await;
         assert_eq!(client.unary(ECHO, b"again").await.unwrap(), b"again");
         assert_eq!(client.with_inner(|c| c.next_deadline()), None);

@@ -14,7 +14,8 @@ use crate::handler::unimplemented;
 use crate::inbound::Inbound;
 use crate::status::encode_message;
 use crate::{
-    CallContext, CallId, DEFAULT_MAX_MESSAGE_SIZE, Handler, MethodKind, Next, Status, lpm, timeout,
+    CallContext, CallId, DEFAULT_MAX_MESSAGE_SIZE, Handler, Metadata, MethodKind, Next,
+    ResponseMetadata, Status, lpm, timeout,
 };
 
 /// Server configuration.
@@ -74,16 +75,22 @@ struct Call {
     headers_sent: bool,
     /// Encoding of the response messages, negotiated from the request.
     response_codec: Option<&'static dyn Codec>,
+    /// Custom metadata of the request.
+    request_metadata: Metadata,
+    /// Response metadata set by the handler.
+    response: ResponseMetadata,
 }
 
 impl Call {
     /// What handlers are told about this call.
-    fn ctx(&self, id: StreamId) -> CallContext<'_> {
-        CallContext {
-            path: &self.path,
+    fn ctx(&mut self, id: StreamId) -> CallContext<'_> {
+        CallContext::new(
+            &self.path,
             id,
-            deadline: self.deadline,
-        }
+            self.deadline,
+            &self.request_metadata,
+            &mut self.response,
+        )
     }
 }
 
@@ -233,12 +240,12 @@ impl Server {
     /// are reset with `CANCEL` and streaming calls are reported to
     /// [`Handler::on_cancel`].
     pub fn cancel_all<H: Handler + ?Sized>(&mut self, handler: &mut H) {
-        for (id, call) in core::mem::take(&mut self.calls) {
+        for (id, mut call) in core::mem::take(&mut self.calls) {
             if self.conn.has_stream(id) {
                 let _ = self.conn.reset_stream(id, ErrorCode::Cancel);
             }
             if call.kind != MethodKind::Unary {
-                handler.on_cancel(&call.ctx(id));
+                handler.on_cancel(&mut call.ctx(id));
             }
         }
     }
@@ -335,6 +342,22 @@ impl Server {
                                     }
                                 },
                             };
+                            // Metadata that breaks the rules can't be handed to
+                            // the handler as it was sent.
+                            let request_metadata = match Metadata::from_headers(&headers) {
+                                Ok(metadata) => metadata,
+                                Err(e) => {
+                                    self.send_status(
+                                        stream_id,
+                                        false,
+                                        end_stream,
+                                        Err(Status::invalid_argument(alloc::format!(
+                                            "malformed request metadata: {e}"
+                                        ))),
+                                    );
+                                    return;
+                                }
+                            };
                             // The request's encoding must be one we can
                             // decode; the client is told which ones we can.
                             let Ok(request_codec) = self
@@ -351,6 +374,7 @@ impl Server {
                                     end_stream,
                                     Err(Status::unimplemented("unsupported grpc-encoding")),
                                     extra,
+                                    ResponseMetadata::default(),
                                 );
                                 return;
                             };
@@ -372,6 +396,8 @@ impl Server {
                                     requests: 0,
                                     headers_sent: false,
                                     response_codec,
+                                    request_metadata,
+                                    response: ResponseMetadata::default(),
                                 },
                             );
                         }
@@ -409,10 +435,10 @@ impl Server {
                 self.drive(stream_id, handler, None);
             }
             Event::Reset { stream_id, .. } => {
-                if let Some(call) = self.calls.remove(&stream_id)
+                if let Some(mut call) = self.calls.remove(&stream_id)
                     && call.kind != MethodKind::Unary
                 {
-                    handler.on_cancel(&call.ctx(stream_id));
+                    handler.on_cancel(&mut call.ctx(stream_id));
                 }
             }
             Event::GoAway { .. } => {}
@@ -515,14 +541,10 @@ impl Server {
         let truncated = call.inbound.finish();
         let message = call.inbound.next(&mut self.conn, id);
         let path = call.path.clone();
-        let ctx = CallContext {
-            path: &path,
-            id,
-            deadline: call.deadline,
-        };
+        let mut ctx = call.ctx(id);
         let result = truncated.and_then(|()| match message {
             Some(Ok(msg)) => handler
-                .call(&ctx, &msg)
+                .call(&mut ctx, &msg)
                 .unwrap_or_else(|| Err(unimplemented(&path))),
             Some(Err(e)) => Err(e),
             None => Err(Status::internal("missing request message")),
@@ -537,6 +559,8 @@ impl Server {
             Ok(reply) => {
                 if self.send_message(id, &reply) {
                     self.finish(id, Ok(()));
+                } else {
+                    self.teardown(id, handler);
                 }
             }
             Err(status) => self.finish(id, Err(status)),
@@ -573,13 +597,7 @@ impl Server {
                         return true;
                     }
                     call.requests += 1;
-                    let path = call.path.clone();
-                    let ctx = CallContext {
-                        path: &path,
-                        id,
-                        deadline: call.deadline,
-                    };
-                    if let Err(status) = handler.on_message(&ctx, &msg) {
+                    if let Err(status) = handler.on_message(&mut call.ctx(id), &msg) {
                         self.finish(id, Err(status));
                         return true;
                     }
@@ -601,13 +619,7 @@ impl Server {
                         return true;
                     }
                     call.end_delivered = true;
-                    let path = call.path.clone();
-                    let ctx = CallContext {
-                        path: &path,
-                        id,
-                        deadline: call.deadline,
-                    };
-                    if let Err(status) = handler.on_half_close(&ctx) {
+                    if let Err(status) = handler.on_half_close(&mut call.ctx(id)) {
                         self.finish(id, Err(status));
                     }
                     return true;
@@ -636,20 +648,18 @@ impl Server {
             if self.backed_up(id) {
                 return progressed;
             }
-            let path = call.path.clone();
-            let ctx = CallContext {
-                path: &path,
-                id,
-                deadline: call.deadline,
-            };
-            let Poll::Ready(next) = handler.poll_response(&ctx, cx) else {
+            let polled = self
+                .calls
+                .get_mut(&id)
+                .map(|call| handler.poll_response(&mut call.ctx(id), cx));
+            let Some(Poll::Ready(next)) = polled else {
                 // The handler is working on the call: send the response
                 // headers now, so that peers which wait for them before
                 // streaming (or to see the call accepted) are not stalled.
                 // Calls that fail immediately still get a trailers-only
                 // response.
                 if !self.send_headers(id) {
-                    handler.on_cancel(&ctx);
+                    self.teardown(id, handler);
                     return true;
                 }
                 return progressed;
@@ -666,7 +676,7 @@ impl Server {
                         return true;
                     }
                     if !self.send_message(id, &msg) {
-                        handler.on_cancel(&ctx);
+                        self.teardown(id, handler);
                         return true;
                     }
                     if kind == MethodKind::ClientStreaming {
@@ -692,8 +702,8 @@ impl Server {
     }
 
     /// Queue one response message, preceded by the response headers if they
-    /// were not sent yet. On failure the stream is gone and the call is
-    /// removed.
+    /// were not sent yet. On failure the stream is reset; the caller removes
+    /// the call with [`teardown`](Self::teardown).
     fn send_message(&mut self, id: StreamId, msg: &[u8]) -> bool {
         if !self.send_headers(id) {
             return false;
@@ -701,7 +711,6 @@ impl Server {
         let codec = self.calls.get(&id).and_then(|call| call.response_codec);
         let framed = lpm::frame(msg, codec, self.compression.min_size);
         if self.conn.send_data(id, framed, false).is_err() {
-            self.calls.remove(&id);
             let _ = self.conn.reset_stream(id, ErrorCode::InternalError);
             return false;
         }
@@ -709,7 +718,8 @@ impl Server {
     }
 
     /// Queue the response headers unless they were sent already. On failure
-    /// the stream is gone and the call is removed.
+    /// the stream is reset; the caller removes the call with
+    /// [`teardown`](Self::teardown).
     fn send_headers(&mut self, id: StreamId) -> bool {
         let Some(call) = self.calls.get_mut(&id) else {
             return false;
@@ -728,22 +738,42 @@ impl Server {
         if let Some(accept) = self.compression.accept_header() {
             headers.push(field("grpc-accept-encoding", &accept));
         }
+        // From here on the handler can no longer add initial metadata.
+        if let Some(initial) = call.response.initial.take() {
+            initial.append_fields(&mut headers);
+        }
         if self.conn.send_headers(id, headers, false).is_err() {
-            self.calls.remove(&id);
             let _ = self.conn.reset_stream(id, ErrorCode::InternalError);
             return false;
         }
         true
     }
 
+    /// Forget a call whose stream failed. Streaming handlers are told.
+    fn teardown<H: Handler + ?Sized>(&mut self, id: StreamId, handler: &mut H) {
+        if let Some(mut call) = self.calls.remove(&id)
+            && call.kind != MethodKind::Unary
+        {
+            handler.on_cancel(&mut call.ctx(id));
+        }
+    }
+
     /// End the call with its final status: trailers after a response, or a
     /// trailers-only response. Queued messages are delivered first; if the
     /// client is still sending, the stream is then reset with `NO_ERROR`.
     fn finish(&mut self, id: StreamId, result: Result<(), Status>) {
-        let Some(call) = self.calls.remove(&id) else {
+        let Some(mut call) = self.calls.remove(&id) else {
             return;
         };
-        self.send_status(id, call.headers_sent, call.half_closed, result);
+        let response = core::mem::take(&mut call.response);
+        self.send_status_with(
+            id,
+            call.headers_sent,
+            call.half_closed,
+            result,
+            Vec::new(),
+            response,
+        );
     }
 
     /// Send the final status of a stream: trailers after a response, or a
@@ -756,11 +786,20 @@ impl Server {
         half_closed: bool,
         result: Result<(), Status>,
     ) {
-        self.send_status_with(id, headers_sent, half_closed, result, Vec::new());
+        self.send_status_with(
+            id,
+            headers_sent,
+            half_closed,
+            result,
+            Vec::new(),
+            ResponseMetadata::default(),
+        );
     }
 
     /// [`send_status`](Self::send_status) with `extra` header fields in a
-    /// trailers-only response (ignored if the headers were already sent).
+    /// trailers-only response (ignored if the headers were already sent), and
+    /// the metadata the handler set. Initial metadata is only sent in a
+    /// trailers-only response; otherwise it went out with the headers.
     fn send_status_with(
         &mut self,
         id: StreamId,
@@ -768,21 +807,33 @@ impl Server {
         half_closed: bool,
         result: Result<(), Status>,
         extra: Vec<HeaderField>,
+        response: ResponseMetadata,
     ) {
         let mut fields = Vec::new();
         if !headers_sent {
             fields.push(field(":status", "200"));
             fields.push(field("content-type", "application/grpc"));
             fields.extend(extra);
+            if let Some(initial) = &response.initial {
+                initial.append_fields(&mut fields);
+            }
         }
-        match result {
-            Ok(()) => fields.push(field("grpc-status", "0")),
+        let status_metadata = match result {
+            Ok(()) => {
+                fields.push(field("grpc-status", "0"));
+                None
+            }
             Err(status) => {
                 fields.push(field("grpc-status", &status.code.as_u8().to_string()));
                 if !status.message.is_empty() {
                     fields.push(field("grpc-message", &encode_message(&status.message)));
                 }
+                Some(status.metadata)
             }
+        };
+        response.trailing.append_fields(&mut fields);
+        if let Some(metadata) = status_metadata {
+            metadata.append_fields(&mut fields);
         }
         let _ = self.conn.send_headers(id, fields, true);
         if !half_closed {
@@ -792,16 +843,19 @@ impl Server {
 
     /// End a streaming call the handler did not finish itself.
     fn abort<H: Handler + ?Sized>(&mut self, id: StreamId, status: Status, handler: &mut H) {
-        let Some((path, deadline)) = self.calls.get(&id).map(|c| (c.path.clone(), c.deadline))
-        else {
+        let Some(mut call) = self.calls.remove(&id) else {
             return;
         };
-        self.finish(id, Err(status));
-        handler.on_cancel(&CallContext {
-            path: &path,
+        let response = core::mem::take(&mut call.response);
+        self.send_status_with(
             id,
-            deadline,
-        });
+            call.headers_sent,
+            call.half_closed,
+            Err(status),
+            Vec::new(),
+            response,
+        );
+        handler.on_cancel(&mut call.ctx(id));
     }
 }
 

@@ -132,7 +132,11 @@ struct Scripted {
 }
 
 impl Handler for Scripted {
-    fn call(&mut self, ctx: &CallContext<'_>, request: &[u8]) -> Option<Result<Vec<u8>, Status>> {
+    fn call(
+        &mut self,
+        ctx: &mut CallContext<'_>,
+        request: &[u8],
+    ) -> Option<Result<Vec<u8>, Status>> {
         let path = ctx.path;
         (path == "/s.S/Unary").then(|| Ok(request.to_vec()))
     }
@@ -152,7 +156,7 @@ impl Handler for Scripted {
         })
     }
 
-    fn on_message(&mut self, ctx: &CallContext<'_>, message: &[u8]) -> Result<(), Status> {
+    fn on_message(&mut self, ctx: &mut CallContext<'_>, message: &[u8]) -> Result<(), Status> {
         let path = ctx.path;
         let call = ctx.id;
         let st = self.calls.entry(call).or_default();
@@ -169,7 +173,7 @@ impl Handler for Scripted {
         Ok(())
     }
 
-    fn on_half_close(&mut self, ctx: &CallContext<'_>) -> Result<(), Status> {
+    fn on_half_close(&mut self, ctx: &mut CallContext<'_>) -> Result<(), Status> {
         let call = ctx.id;
         self.half_closed.push(call);
         self.calls.entry(call).or_default().ended = true;
@@ -178,7 +182,7 @@ impl Handler for Scripted {
 
     fn poll_response(
         &mut self,
-        ctx: &CallContext<'_>,
+        ctx: &mut CallContext<'_>,
         cx: &mut Context<'_>,
     ) -> Poll<Next<Vec<u8>>> {
         let path = ctx.path;
@@ -235,7 +239,7 @@ impl Handler for Scripted {
         Poll::Ready(next)
     }
 
-    fn on_cancel(&mut self, ctx: &CallContext<'_>) {
+    fn on_cancel(&mut self, ctx: &mut CallContext<'_>) {
         let call = ctx.id;
         self.cancelled.push(call);
         self.calls.remove(&call);
@@ -393,7 +397,12 @@ fn unary_and_streaming_share_a_connection() {
     s.client.send_message(count, &[2]).unwrap();
     s.client.close_send(count).unwrap();
     s.pump();
-    assert_eq!(s.client.take_response(unary), Some(Ok(b"u".to_vec())));
+    assert_eq!(
+        s.client
+            .take_response(unary)
+            .map(|r| r.map(Response::into_message)),
+        Some(Ok(b"u".to_vec()))
+    );
     assert_eq!(
         drain(&mut s.client, count),
         (msgs(&[&[1], &[2]]), Some(Ok(())))

@@ -8,8 +8,8 @@ use core::task::{Poll, Waker};
 use embedded_io_async::{Read, Write};
 
 use crate::grpc::{
-    self, CallId, CallOptions, ClientConfig, Handler, Next, ServerConfig, Status, StreamingCall,
-    StreamingTransport, UnaryTransport,
+    self, CallId, CallOptions, ClientConfig, Handler, Metadata, Next, Response, ServerConfig,
+    Status, StreamingCall, StreamingTransport, UnaryTransport,
 };
 use crate::shared::Shared;
 use crate::timer::{NoTimer, Timer};
@@ -254,16 +254,20 @@ impl<IO: Read + Write, T: Timer> Client<IO, T> {
 
     /// Perform one unary call.
     pub async fn unary(&mut self, path: &str, request: &[u8]) -> Result<Vec<u8>, Status> {
-        self.unary_with(path, request, CallOptions::default()).await
+        self.unary_with(path, request, CallOptions::default())
+            .await
+            .map(Response::into_message)
     }
 
-    /// Perform one unary call with per-call `options`.
+    /// Perform one unary call with per-call `options`, for example a timeout
+    /// or request metadata. The response carries the metadata that came with
+    /// it.
     pub async fn unary_with(
         &mut self,
         path: &str,
         request: &[u8],
         options: CallOptions,
-    ) -> Result<Vec<u8>, Status> {
+    ) -> Result<Response<Vec<u8>>, Status> {
         let now = self.timer.now();
         let id = self.shared.with(|s| {
             s.inner.tick(now);
@@ -308,6 +312,7 @@ impl<IO: Read + Write, T: Timer> Client<IO, T> {
             client: self,
             id,
             finished: None,
+            metadata: (None, Metadata::new()),
         })
     }
 
@@ -500,7 +505,7 @@ impl<IO: Read + Write, T: Timer> UnaryTransport for Client<IO, T> {
         path: &str,
         request: &[u8],
         options: CallOptions,
-    ) -> impl Future<Output = Result<Vec<u8>, Status>> {
+    ) -> impl Future<Output = Result<Response<Vec<u8>>, Status>> {
         Client::unary_with(self, path, request, options)
     }
 }
@@ -539,6 +544,9 @@ pub struct Call<'a, IO, T = NoTimer> {
     client: &'a Client<IO, T>,
     id: CallId,
     finished: Option<Result<(), Status>>,
+    /// Response headers and trailers, taken from the client when the call
+    /// finished.
+    metadata: (Option<Metadata>, Metadata),
 }
 
 impl<IO: Read + Write, T: Timer> Call<'_, IO, T> {
@@ -612,11 +620,33 @@ impl<IO: Read + Write, T: Timer> Call<'_, IO, T> {
         match next {
             Next::Message(m) => Ok(Some(m)),
             Next::Done(result) => {
+                self.metadata = client_take_metadata(self.client, id);
                 self.finished = Some(result.clone());
                 result.map(|()| None)
             }
         }
     }
+
+    /// Metadata of the response headers, once the server has sent them. `None`
+    /// before that, and for a trailers-only response.
+    pub fn headers(&self) -> Option<Metadata> {
+        if self.finished.is_some() {
+            return self.metadata.0.clone();
+        }
+        self.client
+            .shared
+            .with(|s| s.inner.response_headers(self.id).cloned())
+    }
+
+    /// Metadata of the response trailers. `None` until the call has completed
+    /// ([`message`](Self::message) returned `Ok(None)` or an error).
+    pub fn trailers(&self) -> Option<Metadata> {
+        self.finished.as_ref().map(|_| self.metadata.1.clone())
+    }
+}
+
+fn client_take_metadata<IO, T>(client: &Client<IO, T>, id: CallId) -> (Option<Metadata>, Metadata) {
+    client.shared.with(|s| s.inner.take_metadata(id))
 }
 
 impl<IO, T> Drop for Call<'_, IO, T> {
@@ -654,6 +684,14 @@ impl<IO: Read + Write, T: Timer> StreamingCall for Call<'_, IO, T> {
     fn message(&mut self) -> impl Future<Output = Result<Option<Vec<u8>>, Status>> {
         Call::message(self)
     }
+
+    fn headers(&self) -> Option<Metadata> {
+        Call::headers(self)
+    }
+
+    fn trailers(&self) -> Option<Metadata> {
+        Call::trailers(self)
+    }
 }
 
 #[cfg(test)]
@@ -690,7 +728,7 @@ mod tests {
     }
 
     impl Handler for Script {
-        fn call(&mut self, _: &CallContext<'_>, _: &[u8]) -> Option<Result<Vec<u8>, Status>> {
+        fn call(&mut self, _: &mut CallContext<'_>, _: &[u8]) -> Option<Result<Vec<u8>, Status>> {
             None
         }
 
@@ -698,7 +736,7 @@ mod tests {
             matches!(path, GATE | OPEN | QUIET).then_some(MethodKind::BidiStreaming)
         }
 
-        fn on_message(&mut self, ctx: &CallContext<'_>, _: &[u8]) -> Result<(), Status> {
+        fn on_message(&mut self, ctx: &mut CallContext<'_>, _: &[u8]) -> Result<(), Status> {
             let path = ctx.path;
             if path == OPEN {
                 self.open = true;
@@ -706,7 +744,7 @@ mod tests {
             Ok(())
         }
 
-        fn on_half_close(&mut self, ctx: &CallContext<'_>) -> Result<(), Status> {
+        fn on_half_close(&mut self, ctx: &mut CallContext<'_>) -> Result<(), Status> {
             let call = ctx.id;
             self.half_closed.insert(call);
             Ok(())
@@ -714,7 +752,7 @@ mod tests {
 
         fn poll_response(
             &mut self,
-            ctx: &CallContext<'_>,
+            ctx: &mut CallContext<'_>,
             _: &mut Context<'_>,
         ) -> Poll<Next<Vec<u8>>> {
             let path = ctx.path;
@@ -728,7 +766,7 @@ mod tests {
             Poll::Pending
         }
 
-        fn on_cancel(&mut self, _: &CallContext<'_>) {
+        fn on_cancel(&mut self, _: &mut CallContext<'_>) {
             self.cancelled += 1;
         }
     }

@@ -38,7 +38,11 @@ struct Echoes {
 }
 
 impl Handler for Echoes {
-    fn call(&mut self, ctx: &CallContext<'_>, request: &[u8]) -> Option<Result<Vec<u8>, Status>> {
+    fn call(
+        &mut self,
+        ctx: &mut CallContext<'_>,
+        request: &[u8],
+    ) -> Option<Result<Vec<u8>, Status>> {
         let path = ctx.path;
         (path == ECHO).then(|| Ok(request.to_vec()))
     }
@@ -51,7 +55,7 @@ impl Handler for Echoes {
         !matches!(path, ECHO | CHAT | GATE | OPEN)
     }
 
-    fn on_message(&mut self, ctx: &CallContext<'_>, message: &[u8]) -> Result<(), Status> {
+    fn on_message(&mut self, ctx: &mut CallContext<'_>, message: &[u8]) -> Result<(), Status> {
         let path = ctx.path;
         let call = ctx.id;
         if path == OPEN {
@@ -65,13 +69,17 @@ impl Handler for Echoes {
         Ok(())
     }
 
-    fn on_half_close(&mut self, ctx: &CallContext<'_>) -> Result<(), Status> {
+    fn on_half_close(&mut self, ctx: &mut CallContext<'_>) -> Result<(), Status> {
         let call = ctx.id;
         self.ended.insert(call);
         Ok(())
     }
 
-    fn poll_response(&mut self, ctx: &CallContext<'_>, _: &mut Context<'_>) -> Poll<Next<Vec<u8>>> {
+    fn poll_response(
+        &mut self,
+        ctx: &mut CallContext<'_>,
+        _: &mut Context<'_>,
+    ) -> Poll<Next<Vec<u8>>> {
         let path = ctx.path;
         let call = ctx.id;
         if let Some(message) = self.queues.get_mut(&call).and_then(VecDeque::pop_front) {
@@ -87,7 +95,7 @@ impl Handler for Echoes {
         Poll::Pending
     }
 
-    fn on_cancel(&mut self, ctx: &CallContext<'_>) {
+    fn on_cancel(&mut self, ctx: &mut CallContext<'_>) {
         let call = ctx.id;
         self.queues.remove(&call);
         self.ended.remove(&call);

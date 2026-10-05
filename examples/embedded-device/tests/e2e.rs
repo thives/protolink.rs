@@ -11,7 +11,7 @@ use embedded_device_example::{
 };
 use embedded_io_adapters::tokio_1::FromTokio;
 use protolink::grpc::Code;
-use protolink::{CallOptions, ClientConfig, ServerConfig};
+use protolink::{CallOptions, ClientConfig, Metadata, ServerConfig};
 
 fn get_status(correlation_id: Option<u32>) -> Command {
     let mut command = Command {
@@ -487,7 +487,7 @@ async fn deadlines_through_generated_clients() {
             .command_with_options(&get_status(Some(1)), timeout(1000))
             .await
             .unwrap();
-        assert_eq!(correlation_id(&reply), Some(1));
+        assert_eq!(correlation_id(&reply.message), Some(1));
 
         // A zero timeout fails at once.
         let err = client
@@ -549,4 +549,101 @@ async fn server_enforces_the_deadline_for_a_client_without_a_clock() {
         assert_eq!(err.code, Code::DeadlineExceeded);
     })
     .await;
+}
+
+/// Custom metadata through the generated clients: request metadata in
+/// `CallOptions`, response headers and trailers in `Response`, and the
+/// headers of a streaming call from the returned stream.
+#[tokio::test]
+async fn metadata_through_generated_clients() {
+    let (a, b) = tokio::io::duplex(1024);
+    tokio::spawn(async move {
+        let mut handler = ServiceServer(Device {
+            uptime_ms: 777,
+            ..Device::default()
+        });
+        let _ = protolink::tokio::serve(a, &mut handler, ServerConfig::default()).await;
+    });
+    with_timeout(async {
+        let mut client = ServiceClient::new(protolink::tokio::client(b, ClientConfig::default()));
+
+        let mut metadata = Metadata::new();
+        metadata.insert("x-request-id", "req-42").unwrap();
+        metadata.insert_bin("x-trace-bin", &[1, 2, 3]).unwrap();
+        let reply = client
+            .command_with_options(&get_status(Some(9)), CallOptions::metadata(metadata))
+            .await
+            .unwrap();
+        assert_eq!(correlation_id(&reply.message), Some(9));
+        assert_eq!(reply.headers.get("x-request-id"), Some("req-42"));
+        assert_eq!(reply.trailers.get("x-device-uptime-ms"), Some("777"));
+
+        // Without request metadata nothing is echoed.
+        let reply = client
+            .command_with_options(&get_status(None), CallOptions::new())
+            .await;
+        let reply = reply.unwrap();
+        assert!(reply.headers.get("x-request-id").is_none());
+
+        // A streaming call's headers arrive before its messages end.
+        client.command(&set_output(0, true)).await.unwrap();
+        let mut events = client.event_subscribe(&EventSubscribe {}).await.unwrap();
+        assert!(events.message().await.unwrap().is_some());
+        assert_eq!(
+            events.headers().unwrap().get("x-events-replayed"),
+            Some("1")
+        );
+        assert!(events.trailers().is_none(), "the call is still running");
+    })
+    .await;
+}
+
+#[test]
+fn blocking_metadata_over_tcp() {
+    use embedded_io_adapters::std::FromStd;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut handler = ServiceServer(Device::default());
+        protolink::blocking::serve(FromStd::new(stream), &mut handler, ServerConfig::default())
+            .unwrap();
+    });
+    let stream = std::net::TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut client = ServiceBlockingClient::new(protolink::blocking::Client::new(
+        FromStd::new(stream),
+        ClientConfig::default(),
+    ));
+
+    let mut metadata = Metadata::new();
+    metadata.insert("x-request-id", "req-7").unwrap();
+    let reply = client
+        .command_with_options(&get_status(Some(3)), CallOptions::metadata(metadata))
+        .unwrap();
+    assert_eq!(reply.headers.get("x-request-id"), Some("req-7"));
+    assert_eq!(reply.trailers.get("x-device-uptime-ms"), Some("0"));
+
+    // A call that fails: its trailers are in the status.
+    let err = client
+        .command_with_options(&Command::default(), CallOptions::new())
+        .unwrap_err();
+    assert_eq!(err.code, Code::InvalidArgument);
+    assert_eq!(err.metadata.get("x-device-uptime-ms"), Some("0"));
+
+    // An empty replay is a trailers-only response: all its metadata is
+    // trailing.
+    let mut events = client.event_subscribe(&EventSubscribe {}).unwrap();
+    assert!(events.message().unwrap().is_none());
+    assert!(events.headers().is_none());
+    assert_eq!(
+        events.trailers().unwrap().get("x-events-replayed"),
+        Some("0")
+    );
+
+    drop(events);
+    drop(client);
+    server.join().unwrap();
 }

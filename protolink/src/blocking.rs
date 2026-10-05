@@ -12,7 +12,7 @@ use embedded_io::{Error as _, ErrorKind, Read, Write};
 
 use crate::grpc::{
     self, BlockingStreamingCall, BlockingStreamingTransport, BlockingUnaryTransport, CallId,
-    CallOptions, ClientConfig, Handler, Next, ServerConfig, Status,
+    CallOptions, ClientConfig, Handler, Metadata, Next, Response, ServerConfig, Status,
 };
 use crate::timer::{Clock, NoTimer};
 use crate::{Error, READ_CHUNK};
@@ -431,15 +431,18 @@ impl<IO: Read + Write, C: Clock> Client<IO, C> {
     /// Perform one unary call.
     pub fn unary(&mut self, path: &str, request: &[u8]) -> Result<Vec<u8>, Status> {
         self.unary_with(path, request, CallOptions::default())
+            .map(Response::into_message)
     }
 
-    /// Perform one unary call with per-call `options`.
+    /// Perform one unary call with per-call `options`, for example a timeout
+    /// or request metadata. The response carries the metadata that came with
+    /// it.
     pub fn unary_with(
         &mut self,
         path: &str,
         request: &[u8],
         options: CallOptions,
-    ) -> Result<Vec<u8>, Status> {
+    ) -> Result<Response<Vec<u8>>, Status> {
         self.tick();
         let id = self.with(|s| s.inner.start_unary_with(path, request, &options))?;
         loop {
@@ -474,6 +477,7 @@ impl<IO: Read + Write, C: Clock> Client<IO, C> {
             client: self,
             id,
             finished: None,
+            metadata: (None, Metadata::new()),
         })
     }
 
@@ -537,7 +541,7 @@ impl<IO: Read + Write, C: Clock> BlockingUnaryTransport for Client<IO, C> {
         path: &str,
         request: &[u8],
         options: CallOptions,
-    ) -> Result<Vec<u8>, Status> {
+    ) -> Result<Response<Vec<u8>>, Status> {
         Client::unary_with(self, path, request, options)
     }
 }
@@ -562,6 +566,9 @@ pub struct Call<'a, IO, C = NoTimer> {
     client: &'a Client<IO, C>,
     id: CallId,
     finished: Option<Result<(), Status>>,
+    /// Response headers and trailers, taken from the client when the call
+    /// finished.
+    metadata: (Option<Metadata>, Metadata),
 }
 
 impl<IO: Read + Write, C: Clock> Call<'_, IO, C> {
@@ -631,6 +638,7 @@ impl<IO: Read + Write, C: Clock> Call<'_, IO, C> {
             match client.with(|s| s.inner.try_next(id)) {
                 Some(Next::Message(m)) => return Ok(Some(m)),
                 Some(Next::Done(result)) => {
+                    self.metadata = client.with(|s| s.inner.take_metadata(id));
                     self.finished = Some(result.clone());
                     return result.map(|()| None);
                 }
@@ -645,6 +653,22 @@ impl<IO: Read + Write, C: Clock> Call<'_, IO, C> {
                 client.read_input();
             }
         }
+    }
+
+    /// Metadata of the response headers, once the server has sent them. `None`
+    /// before that, and for a trailers-only response.
+    pub fn headers(&self) -> Option<Metadata> {
+        if self.finished.is_some() {
+            return self.metadata.0.clone();
+        }
+        self.client
+            .with(|s| s.inner.response_headers(self.id).cloned())
+    }
+
+    /// Metadata of the response trailers. `None` until the call has completed
+    /// ([`message`](Self::message) returned `Ok(None)` or an error).
+    pub fn trailers(&self) -> Option<Metadata> {
+        self.finished.as_ref().map(|_| self.metadata.1.clone())
     }
 }
 
@@ -673,5 +697,13 @@ impl<IO: Read + Write, C: Clock> BlockingStreamingCall for Call<'_, IO, C> {
 
     fn message(&mut self) -> Result<Option<Vec<u8>>, Status> {
         Call::message(self)
+    }
+
+    fn headers(&self) -> Option<Metadata> {
+        Call::headers(self)
+    }
+
+    fn trailers(&self) -> Option<Metadata> {
+        Call::trailers(self)
     }
 }

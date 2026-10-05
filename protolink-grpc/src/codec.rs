@@ -7,7 +7,7 @@ use core::task::Poll;
 
 use micropb::{MessageDecode, MessageEncode, PbDecoder, PbEncoder};
 
-use crate::{BlockingStreamingCall, Code, Next, Status, StreamingCall};
+use crate::{BlockingStreamingCall, Code, Metadata, Next, Response, Status, StreamingCall};
 
 /// Encode a micropb message to protobuf bytes.
 pub fn encode<M: MessageEncode>(msg: &M) -> Result<Vec<u8>, Status> {
@@ -125,6 +125,24 @@ macro_rules! wrapper_common {
     };
 }
 
+macro_rules! metadata_accessors {
+    ($name:ident <$($p:ident),+>, $bound:ident) => {
+        impl<C: $bound, $($p),+> $name<C, $($p),+> {
+            /// Metadata of the response headers, once the server has sent
+            /// them. `None` before that, and for a trailers-only response.
+            pub fn headers(&self) -> Option<Metadata> {
+                self.call.headers()
+            }
+
+            /// Metadata of the response trailers. `None` until the call has
+            /// completed.
+            pub fn trailers(&self) -> Option<Metadata> {
+                self.call.trailers()
+            }
+        }
+    };
+}
+
 /// Responses of a server-streaming call.
 #[derive(Debug)]
 pub struct ServerStreaming<C, Resp> {
@@ -132,6 +150,7 @@ pub struct ServerStreaming<C, Resp> {
     _types: PhantomData<fn() -> Resp>,
 }
 wrapper_common!(ServerStreaming<Resp>);
+metadata_accessors!(ServerStreaming<Resp>, StreamingCall);
 
 impl<C: StreamingCall, Resp: MessageDecode + Default> ServerStreaming<C, Resp> {
     /// Next response; `Ok(None)` once the stream ended successfully.
@@ -148,6 +167,7 @@ pub struct ClientStreaming<C, Req, Resp> {
     _types: PhantomData<fn(Req) -> Resp>,
 }
 wrapper_common!(ClientStreaming<Req, Resp>);
+metadata_accessors!(ClientStreaming<Req, Resp>, StreamingCall);
 
 impl<C, Req, Resp> ClientStreaming<C, Req, Resp>
 where
@@ -161,14 +181,26 @@ where
     }
 
     /// Half-close and wait for the single response and the final status.
-    pub async fn finish(mut self) -> Result<Resp, Status> {
+    pub async fn finish(self) -> Result<Resp, Status> {
+        self.finish_with_metadata()
+            .await
+            .map(Response::into_message)
+    }
+
+    /// [`finish`](Self::finish), keeping the response's metadata. The trailers
+    /// of a failed call are in [`Status::metadata`].
+    pub async fn finish_with_metadata(mut self) -> Result<Response<Resp>, Status> {
         self.call.close_send().await?;
         let first = self.call.message().await?;
         let rest = match first {
             Some(_) => self.call.message().await?,
             None => None,
         };
-        single(first, rest)
+        Ok(Response {
+            message: single(first, rest)?,
+            headers: self.call.headers().unwrap_or_default(),
+            trailers: self.call.trailers().unwrap_or_default(),
+        })
     }
 }
 
@@ -179,6 +211,7 @@ pub struct BidiStreaming<C, Req, Resp> {
     _types: PhantomData<fn(Req) -> Resp>,
 }
 wrapper_common!(BidiStreaming<Req, Resp>);
+metadata_accessors!(BidiStreaming<Req, Resp>, StreamingCall);
 
 impl<C, Req, Resp> BidiStreaming<C, Req, Resp>
 where
@@ -209,6 +242,7 @@ pub struct BlockingServerStreaming<C, Resp> {
     _types: PhantomData<fn() -> Resp>,
 }
 wrapper_common!(BlockingServerStreaming<Resp>);
+metadata_accessors!(BlockingServerStreaming<Resp>, BlockingStreamingCall);
 
 impl<C: BlockingStreamingCall, Resp: MessageDecode + Default> BlockingServerStreaming<C, Resp> {
     /// Next response; `Ok(None)` once the stream ended successfully.
@@ -224,6 +258,7 @@ pub struct BlockingClientStreaming<C, Req, Resp> {
     _types: PhantomData<fn(Req) -> Resp>,
 }
 wrapper_common!(BlockingClientStreaming<Req, Resp>);
+metadata_accessors!(BlockingClientStreaming<Req, Resp>, BlockingStreamingCall);
 
 impl<C, Req, Resp> BlockingClientStreaming<C, Req, Resp>
 where
@@ -237,14 +272,24 @@ where
     }
 
     /// Half-close and wait for the single response and the final status.
-    pub fn finish(mut self) -> Result<Resp, Status> {
+    pub fn finish(self) -> Result<Resp, Status> {
+        self.finish_with_metadata().map(Response::into_message)
+    }
+
+    /// [`finish`](Self::finish), keeping the response's metadata. The trailers
+    /// of a failed call are in [`Status::metadata`].
+    pub fn finish_with_metadata(mut self) -> Result<Response<Resp>, Status> {
         self.call.close_send()?;
         let first = self.call.message()?;
         let rest = match first {
             Some(_) => self.call.message()?,
             None => None,
         };
-        single(first, rest)
+        Ok(Response {
+            message: single(first, rest)?,
+            headers: self.call.headers().unwrap_or_default(),
+            trailers: self.call.trailers().unwrap_or_default(),
+        })
     }
 }
 
@@ -255,6 +300,7 @@ pub struct BlockingBidiStreaming<C, Req, Resp> {
     _types: PhantomData<fn(Req) -> Resp>,
 }
 wrapper_common!(BlockingBidiStreaming<Req, Resp>);
+metadata_accessors!(BlockingBidiStreaming<Req, Resp>, BlockingStreamingCall);
 
 impl<C, Req, Resp> BlockingBidiStreaming<C, Req, Resp>
 where

@@ -6,6 +6,8 @@ use core::fmt;
 
 use protolink_http2::ErrorCode;
 
+use crate::Metadata;
+
 /// gRPC status code (`grpc-status` trailer value).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -83,13 +85,16 @@ impl Code {
     }
 }
 
-/// A gRPC error status: code plus optional message.
+/// A gRPC error status: code, optional message and trailing metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Status {
     /// Status code.
     pub code: Code,
     /// Human-readable message (`grpc-message`).
     pub message: String,
+    /// Trailing metadata sent with the status by a server, or received with it
+    /// by a client.
+    pub metadata: Metadata,
 }
 
 macro_rules! ctor {
@@ -109,7 +114,14 @@ impl Status {
         Self {
             code,
             message: message.to_string(),
+            metadata: Metadata::new(),
         }
+    }
+
+    /// Replace the trailing metadata sent with this status.
+    pub fn with_metadata(mut self, metadata: Metadata) -> Self {
+        self.metadata = metadata;
+        self
     }
 
     ctor! {

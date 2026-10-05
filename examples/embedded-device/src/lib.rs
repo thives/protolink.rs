@@ -6,6 +6,11 @@
 //! - `EventSubscribe` (server streaming) replays the event log,
 //! - `CommandBatch` (client streaming) executes a batch of commands,
 //! - `CommandStream` (bidirectional) executes commands as they arrive.
+//!
+//! It also shows custom metadata: `Command` echoes the caller's `x-request-id`
+//! in its response headers and reports `x-device-uptime-ms` in its trailers,
+//! and `EventSubscribe` announces how many events it replays in
+//! `x-events-replayed`.
 
 pub mod proto {
     #![allow(
@@ -122,24 +127,37 @@ impl Device {
 }
 
 impl Service for Device {
-    fn command(&mut self, _: &CallContext<'_>, request: Command) -> Result<Reply, Status> {
+    fn command(&mut self, ctx: &mut CallContext<'_>, request: Command) -> Result<Reply, Status> {
+        // Let the caller correlate the answer with its own logs.
+        let request_id = ctx.metadata().get("x-request-id").map(str::to_owned);
+        if let (Some(id), Some(headers)) = (request_id, ctx.initial_metadata_mut()) {
+            // A value that arrived as metadata is valid metadata.
+            let _ = headers.insert("x-request-id", &id);
+        }
+        let uptime = self.uptime_ms.to_string();
+        let _ = ctx
+            .trailing_metadata_mut()
+            .insert("x-device-uptime-ms", &uptime);
         self.execute(request)
     }
 
     fn event_subscribe(
         &mut self,
-        ctx: &CallContext<'_>,
+        ctx: &mut CallContext<'_>,
         _request: EventSubscribe,
     ) -> Result<(), Status> {
         let call = ctx.id;
-        let snapshot = self.events.iter().copied().collect();
+        let snapshot: VecDeque<_> = self.events.iter().copied().collect();
+        if let Some(headers) = ctx.initial_metadata_mut() {
+            let _ = headers.insert("x-events-replayed", &snapshot.len().to_string());
+        }
         self.calls.subscriptions.insert(call, snapshot);
         Ok(())
     }
 
     fn poll_event_subscribe(
         &mut self,
-        ctx: &CallContext<'_>,
+        ctx: &mut CallContext<'_>,
         _cx: &mut Context<'_>,
     ) -> Poll<Next<Event>> {
         let call = ctx.id;
@@ -157,12 +175,12 @@ impl Service for Device {
         })
     }
 
-    fn cancel_event_subscribe(&mut self, ctx: &CallContext<'_>) {
+    fn cancel_event_subscribe(&mut self, ctx: &mut CallContext<'_>) {
         let call = ctx.id;
         self.calls.subscriptions.remove(&call);
     }
 
-    fn command_batch(&mut self, ctx: &CallContext<'_>, request: Command) -> Result<(), Status> {
+    fn command_batch(&mut self, ctx: &mut CallContext<'_>, request: Command) -> Result<(), Status> {
         let call = ctx.id;
         let accepted = self.execute(request).is_ok();
         let summary = self.calls.batches.entry(call).or_default();
@@ -176,7 +194,7 @@ impl Service for Device {
 
     fn poll_command_batch(
         &mut self,
-        ctx: &CallContext<'_>,
+        ctx: &mut CallContext<'_>,
         _cx: &mut Context<'_>,
     ) -> Poll<Result<BatchSummary, Status>> {
         let call = ctx.id;
@@ -184,12 +202,16 @@ impl Service for Device {
         Poll::Ready(Ok(self.calls.batches.remove(&call).unwrap_or_default()))
     }
 
-    fn cancel_command_batch(&mut self, ctx: &CallContext<'_>) {
+    fn cancel_command_batch(&mut self, ctx: &mut CallContext<'_>) {
         let call = ctx.id;
         self.calls.batches.remove(&call);
     }
 
-    fn command_stream(&mut self, ctx: &CallContext<'_>, request: Command) -> Result<(), Status> {
+    fn command_stream(
+        &mut self,
+        ctx: &mut CallContext<'_>,
+        request: Command,
+    ) -> Result<(), Status> {
         let call = ctx.id;
         if self
             .calls
@@ -210,7 +232,7 @@ impl Service for Device {
         Ok(())
     }
 
-    fn end_command_stream(&mut self, ctx: &CallContext<'_>) -> Result<(), Status> {
+    fn end_command_stream(&mut self, ctx: &mut CallContext<'_>) -> Result<(), Status> {
         let call = ctx.id;
         let stream = self.calls.streams.entry(call).or_default();
         stream.end.get_or_insert(Ok(()));
@@ -219,7 +241,7 @@ impl Service for Device {
 
     fn poll_command_stream(
         &mut self,
-        ctx: &CallContext<'_>,
+        ctx: &mut CallContext<'_>,
         _cx: &mut Context<'_>,
     ) -> Poll<Next<Reply>> {
         let call = ctx.id;
@@ -240,7 +262,7 @@ impl Service for Device {
         }
     }
 
-    fn cancel_command_stream(&mut self, ctx: &CallContext<'_>) {
+    fn cancel_command_stream(&mut self, ctx: &mut CallContext<'_>) {
         let call = ctx.id;
         self.calls.streams.remove(&call);
     }

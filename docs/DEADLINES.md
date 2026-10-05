@@ -50,7 +50,7 @@ retransmission timer). A target usually implements both on top of its platform t
   request completes never reaches the handler.
 - **Malformed header.** A malformed `grpc-timeout` is answered with `INVALID_ARGUMENT`. `0n` is accepted
   and means already expired.
-- **Handlers.** Every `Handler` method gets a `CallContext { path, id, deadline }`. `deadline` is on the
+- **Handlers.** Every `Handler` method gets a `CallContext` (with `path`, `id` and `deadline`). `deadline` is on the
   server's clock and `remaining(now)` turns it into a budget for downstream work.
 
 ## Drivers

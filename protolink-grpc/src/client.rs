@@ -9,12 +9,15 @@ use protolink_http2::{Config, Connection, Error, ErrorCode, Event, FlowControl, 
 use crate::compression::Compression;
 use crate::inbound::Inbound;
 use crate::status::decode_message;
-use crate::{CallId, Code, DEFAULT_MAX_MESSAGE_SIZE, Next, Status, lpm, timeout};
+use crate::{
+    CallId, Code, DEFAULT_MAX_MESSAGE_SIZE, Metadata, Next, Response, Status, lpm, timeout,
+};
 
 /// Per-call options.
 ///
-/// The default is no timeout (apart from [`ClientConfig::default_timeout`]).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// The default is no timeout (apart from [`ClientConfig::default_timeout`]) and
+/// no custom metadata.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct CallOptions {
     /// Time the whole call may take, from the moment it is started until its
@@ -22,19 +25,46 @@ pub struct CallOptions {
     /// fails locally with `DEADLINE_EXCEEDED` when it runs out (see
     /// [`Client::tick`]). Overrides [`ClientConfig::default_timeout`].
     pub timeout: Option<Duration>,
+    /// Custom metadata sent with the request headers. A `user-agent` entry
+    /// replaces the default `protolink` one.
+    pub metadata: Metadata,
 }
 
 impl CallOptions {
-    /// Options with no timeout of their own.
+    /// Options with no timeout of their own and no metadata.
     pub const fn new() -> Self {
-        Self { timeout: None }
+        Self {
+            timeout: None,
+            metadata: Metadata::new(),
+        }
     }
 
     /// Options with a call `timeout`.
     pub const fn timeout(timeout: Duration) -> Self {
         Self {
             timeout: Some(timeout),
+            metadata: Metadata::new(),
         }
+    }
+
+    /// Options with request `metadata`.
+    pub const fn metadata(metadata: Metadata) -> Self {
+        Self {
+            timeout: None,
+            metadata,
+        }
+    }
+
+    /// These options with a call `timeout`.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    /// These options with request `metadata`.
+    pub fn with_metadata(mut self, metadata: Metadata) -> Self {
+        self.metadata = metadata;
+        self
     }
 }
 
@@ -87,6 +117,10 @@ struct Call {
     /// [`Client::tick`]).
     deadline: Option<Duration>,
     headers_received: bool,
+    /// Metadata of the response headers, once received.
+    initial: Option<Metadata>,
+    /// Metadata of the response trailers, once received.
+    trailers: Metadata,
     inbound: Inbound,
     /// Final status, once known. Reported after every received message.
     status: Option<Result<(), Status>>,
@@ -127,7 +161,9 @@ struct Call {
 pub struct Client {
     conn: Connection,
     calls: BTreeMap<CallId, Call>,
-    done: BTreeMap<CallId, Result<Vec<u8>, Status>>,
+    done: BTreeMap<CallId, Result<Response<Vec<u8>>, Status>>,
+    /// Response metadata of finished streaming calls, until taken.
+    finished_metadata: BTreeMap<CallId, (Option<Metadata>, Metadata)>,
     max_message_size: usize,
     authority: String,
     compression: Compression,
@@ -144,6 +180,7 @@ impl Client {
             conn: Connection::client(config.http2),
             calls: BTreeMap::new(),
             done: BTreeMap::new(),
+            finished_metadata: BTreeMap::new(),
             max_message_size: config.max_message_size,
             authority: config.authority,
             compression: config.compression,
@@ -219,14 +256,18 @@ impl Client {
         headers.extend([
             field("content-type", "application/grpc"),
             field("te", "trailers"),
-            field("user-agent", "protolink"),
         ]);
+        if !options.metadata.contains_key("user-agent") {
+            headers.push(field("user-agent", "protolink"));
+        }
         if let Some(codec) = self.compression.send {
             headers.push(field("grpc-encoding", codec.name()));
         }
         if let Some(accept) = self.compression.accept_header() {
             headers.push(field("grpc-accept-encoding", &accept));
         }
+        // Custom metadata goes after the headers gRPC defines.
+        options.metadata.append_fields(&mut headers);
         let id = self.conn.open_stream(headers, false).map_err(|e| match e {
             Error::GoingAway => Status::unavailable("connection is going away"),
             _ => Status::unavailable("connection failed"),
@@ -237,6 +278,8 @@ impl Client {
                 unary,
                 deadline: timeout.map(|t| self.now.saturating_add(t)),
                 headers_received: false,
+                initial: None,
+                trailers: Metadata::new(),
                 inbound: Inbound::new(self.max_message_size),
                 status: None,
                 send_closed: unary,
@@ -305,7 +348,7 @@ impl Client {
         match call.inbound.next(&mut self.conn, id) {
             Some(Ok(msg)) => return Some(Next::Message(msg)),
             Some(Err(status)) => {
-                self.calls.remove(&id);
+                self.forget(id);
                 // A message that fails to decompress is only found here, with
                 // the stream possibly still open.
                 if self.conn.has_stream(id) {
@@ -316,8 +359,35 @@ impl Client {
             None => {}
         }
         let status = call.status.take()?;
-        self.calls.remove(&id);
+        self.forget(id);
         Some(Next::Done(status))
+    }
+
+    /// Remove a streaming call, keeping its response metadata for
+    /// [`take_metadata`](Self::take_metadata).
+    fn forget(&mut self, id: CallId) {
+        if let Some(call) = self.calls.remove(&id)
+            && (call.initial.is_some() || !call.trailers.is_empty())
+        {
+            self.finished_metadata
+                .insert(id, (call.initial, call.trailers));
+        }
+    }
+
+    /// Metadata of the response headers of an active call, once the server has
+    /// sent them. `None` before that, for a trailers-only response, and for
+    /// unknown calls.
+    pub fn response_headers(&self, id: CallId) -> Option<&Metadata> {
+        self.calls.get(&id)?.initial.as_ref()
+    }
+
+    /// Response metadata of a streaming call that [`try_next`](Self::try_next)
+    /// has reported as done: the headers' (`None` if the server sent none
+    /// before the trailers) and the trailers'. Taking it removes it, so call
+    /// this once after `Next::Done`; unknown or already taken gives no
+    /// metadata.
+    pub fn take_metadata(&mut self, id: CallId) -> (Option<Metadata>, Metadata) {
+        self.finished_metadata.remove(&id).unwrap_or_default()
     }
 
     /// Process received bytes.
@@ -375,8 +445,10 @@ impl Client {
             .min()
     }
 
-    /// Result of a finished unary call, removing it from the client.
-    pub fn take_response(&mut self, id: CallId) -> Option<Result<Vec<u8>, Status>> {
+    /// Result of a finished unary call, removing it from the client. A
+    /// successful call carries the response metadata; a failed one has its
+    /// trailers in [`Status::metadata`].
+    pub fn take_response(&mut self, id: CallId) -> Option<Result<Response<Vec<u8>>, Status>> {
         self.done.remove(&id)
     }
 
@@ -391,6 +463,7 @@ impl Client {
             let _ = self.conn.reset_stream(id, ErrorCode::Cancel);
         }
         self.done.remove(&id);
+        self.finished_metadata.remove(&id);
     }
 
     /// Mark every in-flight call as failed with `status`, e.g. when the
@@ -469,6 +542,13 @@ impl Client {
                 None => Err(Status::internal("missing response message")),
             }
         });
+        let headers = call.initial.take().unwrap_or_default();
+        let trailers = core::mem::take(&mut call.trailers);
+        let result = result.map(|message| Response {
+            message,
+            headers,
+            trailers,
+        });
         self.calls.remove(&id);
         self.done.insert(id, result);
     }
@@ -501,6 +581,7 @@ impl Client {
                         return;
                     }
                     if !end_stream {
+                        call.initial = Some(Metadata::from_headers_lossy(&headers));
                         // The message encoding is announced in the response
                         // headers, before any message.
                         match self
@@ -525,7 +606,12 @@ impl Client {
                     );
                     return;
                 }
-                let result = trailers_status(&headers).and_then(|()| call.inbound.finish());
+                // Trailers-only responses carry all their metadata here.
+                let trailers = Metadata::from_headers_lossy(&headers);
+                let result = trailers_status(&headers)
+                    .and_then(|()| call.inbound.finish())
+                    .map_err(|status| status.with_metadata(trailers.clone()));
+                call.trailers = trailers;
                 self.terminate(stream_id, result, Some(ErrorCode::NoError));
             }
             Event::Data {

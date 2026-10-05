@@ -140,7 +140,7 @@ impl WakeableRead for ChannelIo {
 struct Quiet(Arc<AtomicUsize>);
 
 impl Handler for Quiet {
-    fn call(&mut self, _: &CallContext<'_>, _: &[u8]) -> Option<Result<Vec<u8>, Status>> {
+    fn call(&mut self, _: &mut CallContext<'_>, _: &[u8]) -> Option<Result<Vec<u8>, Status>> {
         None
     }
 
@@ -148,15 +148,19 @@ impl Handler for Quiet {
         (path == QUIET).then_some(MethodKind::ServerStreaming)
     }
 
-    fn on_message(&mut self, _: &CallContext<'_>, _: &[u8]) -> Result<(), Status> {
+    fn on_message(&mut self, _: &mut CallContext<'_>, _: &[u8]) -> Result<(), Status> {
         Ok(())
     }
 
-    fn poll_response(&mut self, _: &CallContext<'_>, _: &mut Context<'_>) -> Poll<Next<Vec<u8>>> {
+    fn poll_response(
+        &mut self,
+        _: &mut CallContext<'_>,
+        _: &mut Context<'_>,
+    ) -> Poll<Next<Vec<u8>>> {
         Poll::Pending
     }
 
-    fn on_cancel(&mut self, _: &CallContext<'_>) {
+    fn on_cancel(&mut self, _: &mut CallContext<'_>) {
         self.0.fetch_add(1, SeqCst);
     }
 }

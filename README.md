@@ -58,7 +58,7 @@ pub mod proto {
 }
 
 impl proto::service::Service for MyDevice {
-    fn command(&mut self, ctx: &protolink::CallContext<'_>, request: Command) -> Result<Reply, protolink::Status> { /* ... */ }
+    fn command(&mut self, ctx: &mut protolink::CallContext<'_>, request: Command) -> Result<Reply, protolink::Status> { /* ... */ }
 }
 
 // Server, on any embedded_io_async::{Read, Write} transport:
@@ -82,7 +82,7 @@ For an RPC `Method`, the generated trait has:
 | bidirectional | `method(ctx, request)` per message, `end_method(ctx)`, `poll_method(ctx, cx) -> Poll<Next<Resp>>`, `cancel_method(ctx)` |
 
 Servers stay sans-IO and executor-agnostic: every method gets a `CallContext` with the method path, a
-`CallId` that identifies the call and its `deadline`; request messages are
+`CallId` that identifies the call, its `deadline` and its [metadata](#metadata); request messages are
 delivered as they arrive, and responses are pulled with `poll_*` (wake `cx` when a pending response
 becomes ready). Streaming methods default to `UNIMPLEMENTED`, so adding one to a `.proto` does not
 break existing implementations.
@@ -243,6 +243,46 @@ The `miniz-oxide` feature adds the stock pure-Rust backend (`MinizOxide`, the re
 - Compressed messages stay compressed while they wait to be taken, and flow-control credit is counted
   in bytes on the wire.
 
+## Metadata
+
+Custom metadata (the application headers and trailers of a call) is supported in both directions. See
+[`docs/METADATA.md`](docs/METADATA.md) for the rules and details.
+
+```rust
+use protolink::{CallOptions, Metadata};
+
+// Client: request metadata goes in the call options.
+let mut md = Metadata::new();
+md.insert("x-request-id", "req-42")?;
+md.insert_bin("x-trace-bin", &[1, 2, 3])?; // `-bin` keys carry bytes, base64 on the wire
+let reply = client.command_with_options(&request, CallOptions::metadata(md)).await?;
+reply.message;                       // the Reply
+reply.headers.get("x-request-id");   // metadata of the response headers
+reply.trailers.get("x-trail");       // metadata of the response trailers
+
+// Streaming calls: `headers()` once the server has sent them, `trailers()` once the call ended.
+let mut events = client.event_subscribe(&EventSubscribe {}).await?;
+while let Some(event) = events.message().await? { /* ... */ }
+events.trailers();
+```
+
+On the server, the `CallContext` handed to every method is also where metadata lives:
+
+```rust
+fn command(&mut self, ctx: &mut CallContext<'_>, request: Command) -> Result<Reply, Status> {
+    let id = ctx.metadata().get("x-request-id").map(str::to_owned); // request metadata
+    if let (Some(id), Some(headers)) = (id, ctx.initial_metadata_mut()) {
+        headers.insert("x-request-id", &id)?;                       // response headers
+    }
+    ctx.trailing_metadata_mut().insert("x-trail", "done")?;         // response trailers
+    /* ... */
+}
+```
+
+The plain generated methods (`client.command(&request)`) are unchanged and drop the response metadata;
+the `<method>_with_options` variants of unary methods return a `Response<T>` with `message`, `headers` and
+`trailers`. The trailers of a failed call are in `Status::metadata`.
+
 ## Compatibility profile
 
 Supported:
@@ -252,11 +292,11 @@ Supported:
 - `grpc-status` / `grpc-message` (percent-encoded), trailers-only error responses
 - bounded message sizes (4 KiB default, configurable) and bounded buffering under HTTP/2 flow control
 - deadlines: `grpc-timeout` is sent and enforced, with `DEADLINE_EXCEEDED` (see [Deadlines](#deadlines))
+- custom metadata: request and response headers, trailers and binary (`-bin`) values (see [Metadata](#metadata))
 - HTTP/2 h2c with preface, SETTINGS/PING acks, flow control, CONTINUATION, GOAWAY
 
 Not supported:
 
-- custom metadata
 - reflection, health checking, interceptors, TLS
 
 Interoperability is tested against the `h2` crate (the HTTP/2 stack under hyper and tonic).

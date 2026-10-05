@@ -2,12 +2,38 @@ use alloc::vec::Vec;
 use core::task::{Context, Poll};
 use core::time::Duration;
 
-use crate::{CallId, MethodKind, Next, Status};
+use crate::{CallId, Metadata, MethodKind, Next, Status};
 
-/// What a [`Handler`] is told about the call it is working on.
+/// The response metadata a [`Handler`] has set on a call so far.
 ///
-/// Passed to every call-specific [`Handler`] method. It is cheap to copy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The server keeps one per call; handlers reach it through
+/// [`CallContext`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResponseMetadata {
+    /// Metadata for the response headers. `None` once the headers have been
+    /// sent (with the first response message, or when `poll_response` returned
+    /// `Poll::Pending`): later changes could no longer reach the client.
+    pub initial: Option<Metadata>,
+    /// Metadata for the response trailers, sent with the final status. It is
+    /// sent whatever the status is, and also if the call ends some other way
+    /// (for example `DEADLINE_EXCEEDED`).
+    pub trailing: Metadata,
+}
+
+impl Default for ResponseMetadata {
+    fn default() -> Self {
+        Self {
+            initial: Some(Metadata::new()),
+            trailing: Metadata::new(),
+        }
+    }
+}
+
+/// What a [`Handler`] is told about the call it is working on, and where it
+/// sets the call's response metadata.
+///
+/// Passed to every call-specific [`Handler`] method.
+#[derive(Debug)]
 pub struct CallContext<'a> {
     /// The method path, `/package.Service/Method`.
     pub path: &'a str,
@@ -20,14 +46,50 @@ pub struct CallContext<'a> {
     /// Use [`remaining`](Self::remaining) to turn it into a budget for work
     /// the handler starts, so the deadline propagates downstream.
     pub deadline: Option<Duration>,
+    metadata: &'a Metadata,
+    response: &'a mut ResponseMetadata,
 }
 
-impl CallContext<'_> {
+impl<'a> CallContext<'a> {
+    /// A context for `path`, for the server and for testing handlers.
+    pub fn new(
+        path: &'a str,
+        id: CallId,
+        deadline: Option<Duration>,
+        metadata: &'a Metadata,
+        response: &'a mut ResponseMetadata,
+    ) -> Self {
+        Self {
+            path,
+            id,
+            deadline,
+            metadata,
+            response,
+        }
+    }
+
     /// Time left until the deadline at `now`, on the same clock as
     /// [`deadline`](Self::deadline). Zero once it has passed, `None` if the
     /// call has no deadline.
     pub fn remaining(&self, now: Duration) -> Option<Duration> {
         self.deadline.map(|d| d.saturating_sub(now))
+    }
+
+    /// The custom metadata the client sent with the request.
+    pub fn metadata(&self) -> &Metadata {
+        self.metadata
+    }
+
+    /// The metadata for the response headers, or `None` if the headers have
+    /// been sent already.
+    pub fn initial_metadata_mut(&mut self) -> Option<&mut Metadata> {
+        self.response.initial.as_mut()
+    }
+
+    /// The metadata for the response trailers. It can be changed until the call
+    /// ends.
+    pub fn trailing_metadata_mut(&mut self) -> &mut Metadata {
+        &mut self.response.trailing
     }
 }
 
@@ -85,6 +147,15 @@ impl CallContext<'_> {
 /// as `poll_response` returns `Poll::Pending`. A call that ends before either
 /// gets a trailers-only response.
 ///
+/// # Metadata
+///
+/// [`CallContext::metadata`] holds the request's custom metadata. A handler
+/// sets the response's headers with [`CallContext::initial_metadata_mut`], which
+/// works until the response headers are sent, and its trailers with
+/// [`CallContext::trailing_metadata_mut`]. A trailers-only response carries
+/// both in its single header block. A [`Status`] returned by the handler adds
+/// its own [`Status::metadata`] to the trailers.
+///
 /// # Waking
 ///
 /// `poll_response` follows the usual [`Future`](core::future::Future)
@@ -95,7 +166,11 @@ impl CallContext<'_> {
 /// Spurious polls are allowed.
 pub trait Handler {
     /// Handle the unary call `ctx.path` with the encoded `request` message.
-    fn call(&mut self, ctx: &CallContext<'_>, request: &[u8]) -> Option<Result<Vec<u8>, Status>>;
+    fn call(
+        &mut self,
+        ctx: &mut CallContext<'_>,
+        request: &[u8],
+    ) -> Option<Result<Vec<u8>, Status>>;
 
     /// Whether this handler knows that it serves nothing at `path`, neither
     /// unary nor streaming. The server then answers `UNIMPLEMENTED` as soon
@@ -122,13 +197,13 @@ pub trait Handler {
     }
 
     /// One request message of the streaming call `ctx.id` on `ctx.path`.
-    fn on_message(&mut self, ctx: &CallContext<'_>, message: &[u8]) -> Result<(), Status> {
+    fn on_message(&mut self, ctx: &mut CallContext<'_>, message: &[u8]) -> Result<(), Status> {
         let _ = message;
         Err(unimplemented(ctx.path))
     }
 
     /// The client half-closed the streaming call: no more request messages.
-    fn on_half_close(&mut self, ctx: &CallContext<'_>) -> Result<(), Status> {
+    fn on_half_close(&mut self, ctx: &mut CallContext<'_>) -> Result<(), Status> {
         let _ = ctx;
         Ok(())
     }
@@ -136,7 +211,7 @@ pub trait Handler {
     /// Next response of the streaming call `ctx.id` on `ctx.path`.
     fn poll_response(
         &mut self,
-        ctx: &CallContext<'_>,
+        ctx: &mut CallContext<'_>,
         cx: &mut Context<'_>,
     ) -> Poll<Next<Vec<u8>>> {
         let _ = cx;
@@ -144,7 +219,7 @@ pub trait Handler {
     }
 
     /// The streaming call ended without the handler finishing it.
-    fn on_cancel(&mut self, ctx: &CallContext<'_>) {
+    fn on_cancel(&mut self, ctx: &mut CallContext<'_>) {
         let _ = ctx;
     }
 }
@@ -154,7 +229,11 @@ pub(crate) fn unimplemented(path: &str) -> Status {
 }
 
 impl<H: Handler + ?Sized> Handler for &mut H {
-    fn call(&mut self, ctx: &CallContext<'_>, request: &[u8]) -> Option<Result<Vec<u8>, Status>> {
+    fn call(
+        &mut self,
+        ctx: &mut CallContext<'_>,
+        request: &[u8],
+    ) -> Option<Result<Vec<u8>, Status>> {
         (**self).call(ctx, request)
     }
 
@@ -166,23 +245,23 @@ impl<H: Handler + ?Sized> Handler for &mut H {
         (**self).method_kind(path)
     }
 
-    fn on_message(&mut self, ctx: &CallContext<'_>, message: &[u8]) -> Result<(), Status> {
+    fn on_message(&mut self, ctx: &mut CallContext<'_>, message: &[u8]) -> Result<(), Status> {
         (**self).on_message(ctx, message)
     }
 
-    fn on_half_close(&mut self, ctx: &CallContext<'_>) -> Result<(), Status> {
+    fn on_half_close(&mut self, ctx: &mut CallContext<'_>) -> Result<(), Status> {
         (**self).on_half_close(ctx)
     }
 
     fn poll_response(
         &mut self,
-        ctx: &CallContext<'_>,
+        ctx: &mut CallContext<'_>,
         cx: &mut Context<'_>,
     ) -> Poll<Next<Vec<u8>>> {
         (**self).poll_response(ctx, cx)
     }
 
-    fn on_cancel(&mut self, ctx: &CallContext<'_>) {
+    fn on_cancel(&mut self, ctx: &mut CallContext<'_>) {
         (**self).on_cancel(ctx)
     }
 }
@@ -195,7 +274,11 @@ impl<F> Handler for FnHandler<F>
 where
     F: FnMut(&str, &[u8]) -> Option<Result<Vec<u8>, Status>>,
 {
-    fn call(&mut self, ctx: &CallContext<'_>, request: &[u8]) -> Option<Result<Vec<u8>, Status>> {
+    fn call(
+        &mut self,
+        ctx: &mut CallContext<'_>,
+        request: &[u8],
+    ) -> Option<Result<Vec<u8>, Status>> {
         (self.0)(ctx.path, request)
     }
 }
@@ -207,7 +290,7 @@ macro_rules! tuple_handler {
         /// the path. A path is unknown up front only if every handler says so.
         impl<$($name: Handler),+> Handler for ($($name,)+) {
             #[allow(non_snake_case)]
-            fn call(&mut self, ctx: &CallContext<'_>, request: &[u8]) -> Option<Result<Vec<u8>, Status>> {
+            fn call(&mut self, ctx: &mut CallContext<'_>, request: &[u8]) -> Option<Result<Vec<u8>, Status>> {
                 let ($($name,)+) = self;
                 $(
                     if let Some(r) = $name.call(ctx, request) {
@@ -235,7 +318,7 @@ macro_rules! tuple_handler {
             }
 
             #[allow(non_snake_case)]
-            fn on_message(&mut self, ctx: &CallContext<'_>, message: &[u8]) -> Result<(), Status> {
+            fn on_message(&mut self, ctx: &mut CallContext<'_>, message: &[u8]) -> Result<(), Status> {
                 let ($($name,)+) = self;
                 $(
                     if $name.method_kind(ctx.path).is_some() {
@@ -246,7 +329,7 @@ macro_rules! tuple_handler {
             }
 
             #[allow(non_snake_case)]
-            fn on_half_close(&mut self, ctx: &CallContext<'_>) -> Result<(), Status> {
+            fn on_half_close(&mut self, ctx: &mut CallContext<'_>) -> Result<(), Status> {
                 let ($($name,)+) = self;
                 $(
                     if $name.method_kind(ctx.path).is_some() {
@@ -259,7 +342,7 @@ macro_rules! tuple_handler {
             #[allow(non_snake_case)]
             fn poll_response(
                 &mut self,
-                ctx: &CallContext<'_>,
+                ctx: &mut CallContext<'_>,
                 cx: &mut Context<'_>,
             ) -> Poll<Next<Vec<u8>>> {
                 let ($($name,)+) = self;
@@ -272,7 +355,7 @@ macro_rules! tuple_handler {
             }
 
             #[allow(non_snake_case)]
-            fn on_cancel(&mut self, ctx: &CallContext<'_>) {
+            fn on_cancel(&mut self, ctx: &mut CallContext<'_>) {
                 let ($($name,)+) = self;
                 $(
                     if $name.method_kind(ctx.path).is_some() {

@@ -561,7 +561,11 @@ struct TestHandler {
 }
 
 impl Handler for TestHandler {
-    fn call(&mut self, ctx: &CallContext<'_>, request: &[u8]) -> Option<Result<Vec<u8>, Status>> {
+    fn call(
+        &mut self,
+        ctx: &mut CallContext<'_>,
+        request: &[u8],
+    ) -> Option<Result<Vec<u8>, Status>> {
         let path = ctx.path;
         (path == "/t.T/Echo").then(|| Ok(request.to_vec()))
     }
@@ -574,7 +578,7 @@ impl Handler for TestHandler {
         }
     }
 
-    fn on_message(&mut self, ctx: &CallContext<'_>, message: &[u8]) -> Result<(), Status> {
+    fn on_message(&mut self, ctx: &mut CallContext<'_>, message: &[u8]) -> Result<(), Status> {
         let call = ctx.id;
         self.calls
             .entry(call)
@@ -584,13 +588,17 @@ impl Handler for TestHandler {
         Ok(())
     }
 
-    fn on_half_close(&mut self, ctx: &CallContext<'_>) -> Result<(), Status> {
+    fn on_half_close(&mut self, ctx: &mut CallContext<'_>) -> Result<(), Status> {
         let call = ctx.id;
         self.calls.entry(call).or_default().ended = true;
         Ok(())
     }
 
-    fn poll_response(&mut self, ctx: &CallContext<'_>, _: &mut Context<'_>) -> Poll<Next<Vec<u8>>> {
+    fn poll_response(
+        &mut self,
+        ctx: &mut CallContext<'_>,
+        _: &mut Context<'_>,
+    ) -> Poll<Next<Vec<u8>>> {
         let call = ctx.id;
         let state = self.calls.entry(call).or_default();
         match state.queue.pop_front() {
@@ -603,7 +611,7 @@ impl Handler for TestHandler {
         }
     }
 
-    fn on_cancel(&mut self, ctx: &CallContext<'_>) {
+    fn on_cancel(&mut self, ctx: &mut CallContext<'_>) {
         let call = ctx.id;
         self.cancelled.push(call);
         self.calls.remove(&call);
@@ -656,7 +664,14 @@ impl Pair {
     fn unary(&mut self, request: &[u8]) -> (Result<Vec<u8>, Status>, usize, usize) {
         let id = self.client.start_unary("/t.T/Echo", request).unwrap();
         let (up, down) = self.pump();
-        (self.client.take_response(id).unwrap(), up, down)
+        (
+            self.client
+                .take_response(id)
+                .unwrap()
+                .map(Response::into_message),
+            up,
+            down,
+        )
     }
 }
 
@@ -665,7 +680,12 @@ fn baseline(client: Compression, server: Compression) -> (usize, usize) {
     let mut p = pair(client, server);
     let id = p.client.start_unary("/t.T/Echo", b"").unwrap();
     let sizes = p.pump();
-    assert_eq!(p.client.take_response(id), Some(Ok(Vec::new())));
+    assert_eq!(
+        p.client
+            .take_response(id)
+            .map(|r| r.map(Response::into_message)),
+        Some(Ok(Vec::new()))
+    );
     sizes
 }
 

@@ -155,7 +155,7 @@ impl Shared {
 struct Watch(Arc<Shared>);
 
 impl Handler for Watch {
-    fn call(&mut self, _: &CallContext<'_>, _: &[u8]) -> Option<Result<Vec<u8>, Status>> {
+    fn call(&mut self, _: &mut CallContext<'_>, _: &[u8]) -> Option<Result<Vec<u8>, Status>> {
         None
     }
 
@@ -163,11 +163,15 @@ impl Handler for Watch {
         (path == WATCH).then_some(MethodKind::ServerStreaming)
     }
 
-    fn on_message(&mut self, _: &CallContext<'_>, _: &[u8]) -> Result<(), Status> {
+    fn on_message(&mut self, _: &mut CallContext<'_>, _: &[u8]) -> Result<(), Status> {
         Ok(())
     }
 
-    fn poll_response(&mut self, _: &CallContext<'_>, cx: &mut Context<'_>) -> Poll<Next<Vec<u8>>> {
+    fn poll_response(
+        &mut self,
+        _: &mut CallContext<'_>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Next<Vec<u8>>> {
         self.0.polls.fetch_add(1, SeqCst);
         // The waker is stored while the state is locked, so a push between
         // the check and the store can't be missed.
@@ -182,7 +186,7 @@ impl Handler for Watch {
         Poll::Pending
     }
 
-    fn on_cancel(&mut self, _: &CallContext<'_>) {
+    fn on_cancel(&mut self, _: &mut CallContext<'_>) {
         self.0.cancelled.fetch_add(1, SeqCst);
     }
 }
@@ -195,7 +199,7 @@ struct SelfWake {
 }
 
 impl Handler for SelfWake {
-    fn call(&mut self, _: &CallContext<'_>, _: &[u8]) -> Option<Result<Vec<u8>, Status>> {
+    fn call(&mut self, _: &mut CallContext<'_>, _: &[u8]) -> Option<Result<Vec<u8>, Status>> {
         None
     }
 
@@ -203,11 +207,15 @@ impl Handler for SelfWake {
         (path == WATCH).then_some(MethodKind::ServerStreaming)
     }
 
-    fn on_message(&mut self, _: &CallContext<'_>, _: &[u8]) -> Result<(), Status> {
+    fn on_message(&mut self, _: &mut CallContext<'_>, _: &[u8]) -> Result<(), Status> {
         Ok(())
     }
 
-    fn poll_response(&mut self, _: &CallContext<'_>, cx: &mut Context<'_>) -> Poll<Next<Vec<u8>>> {
+    fn poll_response(
+        &mut self,
+        _: &mut CallContext<'_>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Next<Vec<u8>>> {
         match self.polls.fetch_add(1, SeqCst) + 1 {
             1 | 2 => {
                 cx.waker().wake_by_ref();
