@@ -253,6 +253,8 @@ fn a_call_that_completes_in_time_is_unaffected() {
         Some(Ok(b"ping".to_vec()))
     );
     assert_eq!(client.next_deadline(), None);
+    // Consuming the retained response now returns connection receive credit.
+    pump(&mut client, &mut server, &mut handler);
     client.tick(Duration::from_secs(3600));
     assert!(client.take_output().is_empty());
 }
@@ -389,7 +391,9 @@ impl Raw {
         headers.push(hf("content-type", "application/grpc"));
         let id = self.conn.open_stream(headers, false).unwrap();
         if let Some(body) = body {
-            self.conn.send_data(id, lpm::encode(body), true).unwrap();
+            self.conn
+                .send_data(id, lpm::encode(body).unwrap(), true)
+                .unwrap();
         }
         self.exchange(h);
         id

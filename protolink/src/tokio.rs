@@ -18,7 +18,6 @@
 //! [`serve`] and [`client`] enforce deadlines (`grpc-timeout`) with a
 //! [`TokioTimer`], so they work with tokio's paused test clock too.
 
-use core::future::Future;
 use core::time::Duration;
 
 use ::tokio::io::{AsyncRead, AsyncWrite};
@@ -59,8 +58,20 @@ impl Clock for TokioTimer {
 }
 
 impl Timer for TokioTimer {
-    fn sleep_until(&self, deadline: Duration) -> impl Future<Output = ()> {
-        ::tokio::time::sleep_until(self.start + deadline)
+    async fn sleep_until(&self, deadline: Duration) {
+        // Keep both Instant arithmetic and Tokio's timer-wheel horizon bounded.
+        const CHUNK: Duration = Duration::from_secs(24 * 60 * 60);
+        loop {
+            let remaining = deadline.saturating_sub(self.now());
+            if remaining.is_zero() {
+                return;
+            }
+            let now = Instant::now();
+            let wake = now
+                .checked_add(remaining.min(CHUNK))
+                .expect("a one-day timer interval fits Instant");
+            ::tokio::time::sleep_until(wake).await;
+        }
     }
 }
 

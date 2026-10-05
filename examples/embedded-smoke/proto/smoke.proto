@@ -1,0 +1,15 @@
+syntax = "proto3";
+package embedded.smoke;
+
+message Payload {
+  uint32 value = 1;
+  string label = 2;
+  repeated uint32 samples = 3;
+}
+
+service Smoke {
+  rpc Unary(Payload) returns (Payload);
+  rpc ServerStream(Payload) returns (stream Payload);
+  rpc ClientStream(stream Payload) returns (Payload);
+  rpc Bidi(stream Payload) returns (stream Payload);
+}

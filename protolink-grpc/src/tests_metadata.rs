@@ -63,6 +63,23 @@ impl Handler for Meta {
                 md.insert("x-status", "s").unwrap();
                 Some(Err(Status::aborted("no").with_metadata(md)))
             }
+            "/m.M/BinaryEcho" => {
+                let values: Vec<Vec<u8>> = ctx
+                    .metadata()
+                    .get_all_bin("trace-bin")
+                    .map(<[u8]>::to_vec)
+                    .collect();
+                for value in values {
+                    ctx.initial_metadata_mut()
+                        .unwrap()
+                        .insert_bin("trace-bin", &value)
+                        .unwrap();
+                    ctx.trailing_metadata_mut()
+                        .insert_bin("trace-bin", &value)
+                        .unwrap();
+                }
+                Some(Ok(Vec::new()))
+            }
             "/m.M/UserAgent" => Some(Ok(ctx
                 .metadata()
                 .get_all("user-agent")
@@ -330,6 +347,10 @@ fn trailing_metadata_is_sent_when_the_deadline_ends_the_call() {
 
 /// A raw request on a fresh connection; returns what the server answered.
 fn raw_request(extra: &[(&str, &str)]) -> Vec<Event> {
+    raw_request_at("/m.M/UserAgent", extra)
+}
+
+fn raw_request_at(path: &str, extra: &[(&str, &str)]) -> Vec<Event> {
     let hf = |n: &str, v: &str| HeaderField {
         name: n.into(),
         value: v.into(),
@@ -337,7 +358,7 @@ fn raw_request(extra: &[(&str, &str)]) -> Vec<Event> {
     let mut headers = vec![
         hf(":method", "POST"),
         hf(":scheme", "http"),
-        hf(":path", "/m.M/UserAgent"),
+        hf(":path", path),
         hf("content-type", "application/grpc"),
     ];
     headers.extend(extra.iter().map(|(n, v)| hf(n, v)));
@@ -345,7 +366,7 @@ fn raw_request(extra: &[(&str, &str)]) -> Vec<Event> {
     let mut server = Server::new(ServerConfig::default());
     let mut handler = Meta::default();
     let id = conn.open_stream(headers, false).unwrap();
-    conn.send_data(id, lpm::encode(b""), true).unwrap();
+    conn.send_data(id, lpm::encode(b"").unwrap(), true).unwrap();
     for _ in 0..8 {
         server.recv(&conn.take_output(), &mut handler).unwrap();
         conn.recv(&server.take_output()).unwrap();
@@ -371,7 +392,9 @@ fn malformed_binary_request_metadata_is_invalid_argument() {
 
 #[test]
 fn request_metadata_with_control_characters_is_invalid_argument() {
-    let events = raw_request(&[("x-bad", "a\u{1}b")]);
+    // Internal HTAB is legal in HTTP fields, but not in gRPC ASCII metadata.
+    // Other controls are now rejected by HTTP/2 before reaching the gRPC parser.
+    let events = raw_request(&[("x-bad", "a\tb")]);
     assert_eq!(grpc_status(&events).as_deref(), Some("3"), "{events:?}");
 }
 
@@ -380,6 +403,92 @@ fn well_formed_raw_metadata_is_accepted() {
     // Padded base64 is accepted too.
     let events = raw_request(&[("x-ok-bin", "TWE="), ("x-ok", "v")]);
     assert_eq!(grpc_status(&events).as_deref(), Some("0"), "{events:?}");
+}
+
+#[test]
+fn combined_and_repeated_binary_request_headers_reach_the_handler_in_order() {
+    let events = raw_request_at(
+        "/m.M/BinaryEcho",
+        &[("trace-bin", "AQ== ,\tAg\t,"), ("trace-bin", "Aw==,, BA")],
+    );
+    assert_eq!(grpc_status(&events).as_deref(), Some("0"), "{events:?}");
+    let metadata: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Headers { headers, .. } => Some(Metadata::from_headers(headers).unwrap()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(metadata.len(), 2, "{events:?}");
+    for fields in metadata {
+        assert_eq!(
+            fields.get_all_bin("trace-bin").collect::<Vec<_>>(),
+            [&[1][..], &[2][..], &[], &[3][..], &[], &[4][..]]
+        );
+    }
+}
+
+#[test]
+fn malformed_combined_request_element_rejects_the_whole_call() {
+    for value in ["!,AQ==,Ag", "AQ==,!,Ag", "AQ==,Ag,!"] {
+        let events = raw_request_at("/m.M/BinaryEcho", &[("trace-bin", value)]);
+        assert_eq!(grpc_status(&events).as_deref(), Some("3"), "{events:?}");
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::Data { .. }))
+        );
+    }
+}
+
+fn raw_response(
+    initial: &[(&str, &str)],
+    trailing: &[(&str, &str)],
+    status: &str,
+) -> Result<Response<Vec<u8>>, Status> {
+    let hf = |name: &str, value: &str| HeaderField {
+        name: name.into(),
+        value: value.into(),
+    };
+    let mut client = Client::new(ClientConfig::default());
+    let mut peer = Connection::server(Default::default());
+    let id = client.start_unary("/m.M/Echo", b"").unwrap();
+    peer.recv(&client.take_output()).unwrap();
+    let mut headers = vec![hf(":status", "200"), hf("content-type", "application/grpc")];
+    headers.extend(initial.iter().map(|(name, value)| hf(name, value)));
+    peer.send_headers(id, headers, false).unwrap();
+    peer.send_data(id, lpm::encode(b"").unwrap(), false)
+        .unwrap();
+    let mut trailers = vec![hf("grpc-status", status)];
+    trailers.extend(trailing.iter().map(|(name, value)| hf(name, value)));
+    peer.send_headers(id, trailers, true).unwrap();
+    client.recv(&peer.take_output()).unwrap();
+    client.take_response(id).unwrap()
+}
+
+#[test]
+fn combined_binary_response_headers_and_trailers_preserve_valid_siblings() {
+    for first in ["AQ== ,\tAg\t,", "AQ==,!,Ag,"] {
+        let fields = [("trace-bin", first), ("trace-bin", "Aw==,, BA")];
+        let response = raw_response(&fields, &fields, "0").unwrap();
+        for metadata in [response.headers, response.trailers] {
+            assert_eq!(
+                metadata.get_all_bin("trace-bin").collect::<Vec<_>>(),
+                [&[1][..], &[2][..], &[], &[3][..], &[], &[4][..]]
+            );
+        }
+    }
+}
+
+#[test]
+fn combined_binary_error_trailers_preserve_valid_siblings() {
+    let fields = [("trace-bin", "AQ==,!,Ag"), ("trace-bin", "Aw==,, BA")];
+    let status = raw_response(&[], &fields, "7").unwrap_err();
+    assert_eq!(status.code, Code::PermissionDenied);
+    assert_eq!(
+        status.metadata.get_all_bin("trace-bin").collect::<Vec<_>>(),
+        [&[1][..], &[2][..], &[3][..], &[], &[4][..]]
+    );
 }
 
 #[test]

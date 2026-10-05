@@ -27,6 +27,12 @@ pub trait Deflate: Sync + fmt::Debug {
     /// Must not append more than `limit` bytes: return
     /// [`CodecError::TooLarge`] as soon as the result would be larger. On
     /// error the contents of `out` are unspecified.
+    ///
+    /// Success requires a complete, terminated DEFLATE stream consuming all
+    /// of `input` (apart from unused bits in its final byte). Truncated streams,
+    /// trailing bytes and concatenated streams must return
+    /// [`CodecError::Corrupt`], not a successfully decoded prefix. This is
+    /// necessary for [`Gzip`] to validate exactly one member.
     fn inflate(&self, input: &[u8], out: &mut Vec<u8>, limit: usize) -> Result<(), CodecError>;
 
     /// CRC-32 (IEEE 802.3, as used by gzip and zlib) of `data`, continuing
@@ -45,7 +51,7 @@ pub trait Deflate: Sync + fmt::Debug {
 /// One gzip member is written per message, which is what gRPC peers expect.
 /// Decoding verifies the CRC-32 and size trailer, and accepts the optional
 /// header fields other implementations may add. Concatenated members are not
-/// supported.
+/// supported and are rejected, as are bytes after the DEFLATE stream.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Gzip<D>(D);
 

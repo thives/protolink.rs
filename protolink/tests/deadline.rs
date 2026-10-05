@@ -395,3 +395,68 @@ async fn calls_without_a_timeout_run_unbounded() {
     assert!(waited.is_err(), "the call should still be running");
     assert_eq!(cancelled.load(SeqCst), 0);
 }
+
+#[tokio::test(start_paused = true)]
+async fn tokio_timer_duration_max_is_bounded_and_re_evaluated() {
+    use protolink::{Clock, Timer};
+    let timer = protolink::tokio::TokioTimer::new();
+    let mut sleep = std::pin::pin!(timer.sleep_until(Duration::MAX));
+    assert!(tokio::time::timeout(ms(1), &mut sleep).await.is_err());
+    // Poll past the first bounded sleep. The next interval remains pending,
+    // rather than treating a representability clamp as the actual deadline.
+    tokio::time::advance(Duration::from_secs(2 * 24 * 60 * 60)).await;
+    assert!(tokio::time::timeout(ms(1), &mut sleep).await.is_err());
+    timer.sleep_until(timer.now()).await;
+    let start = Instant::now();
+    timer.sleep_until(timer.now() + ms(10)).await;
+    assert_eq!(start.elapsed(), ms(10));
+}
+
+#[tokio::test(start_paused = true)]
+async fn aborting_server_task_cancels_each_active_call_once() {
+    struct AbortHandler {
+        started: Arc<AtomicUsize>,
+        cancelled: Arc<AtomicUsize>,
+    }
+    impl Handler for AbortHandler {
+        fn call(&mut self, _: &mut CallContext<'_>, _: &[u8]) -> Option<Result<Vec<u8>, Status>> {
+            None
+        }
+        fn method_kind(&self, _: &str) -> Option<MethodKind> {
+            Some(MethodKind::BidiStreaming)
+        }
+        fn on_message(&mut self, _: &mut CallContext<'_>, _: &[u8]) -> Result<(), Status> {
+            self.started.fetch_add(1, SeqCst);
+            Ok(())
+        }
+        fn poll_response(
+            &mut self,
+            _: &mut CallContext<'_>,
+            _: &mut Context<'_>,
+        ) -> Poll<Next<Vec<u8>>> {
+            Poll::Pending
+        }
+        fn on_cancel(&mut self, _: &mut CallContext<'_>) {
+            self.cancelled.fetch_add(1, SeqCst);
+        }
+    }
+    let (a, b) = tokio::io::duplex(16 * 1024);
+    let started = Arc::new(AtomicUsize::new(0));
+    let cancelled = Arc::new(AtomicUsize::new(0));
+    let mut handler = AbortHandler {
+        started: started.clone(),
+        cancelled: cancelled.clone(),
+    };
+    let server = tokio::spawn(async move {
+        protolink::tokio::serve(a, &mut handler, ServerConfig::default()).await
+    });
+    let client = protolink::tokio::client(b, ClientConfig::default());
+    let mut first = client.streaming(QUIET).unwrap();
+    let mut second = client.streaming(QUIET).unwrap();
+    first.send(b"one").await.unwrap();
+    second.send(b"two").await.unwrap();
+    wait_for(&started, 2).await;
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
+    assert_eq!(cancelled.load(SeqCst), 2);
+}

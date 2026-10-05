@@ -144,6 +144,70 @@ jobs:
             cargo check --release --target=${{matrix.target}} --no-default-features --features async,blocking -p protolink -p protolink-grpc -p protolink-http2
             cargo check --release --target=${{matrix.target}} --no-default-features --features miniz-oxide -p protolink-grpc
 
+  no-cas:
+    name: no_std Cortex-M0 (${{ matrix.features }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        features:
+          - portable-atomic-critical-section
+          - portable-atomic-critical-section,async
+          - portable-atomic-critical-section,blocking
+          - portable-atomic-critical-section,async,blocking
+          - portable-atomic-critical-section,miniz-oxide
+          - portable-atomic-critical-section,async,miniz-oxide
+          - portable-atomic-critical-section,blocking,miniz-oxide
+          - portable-atomic-critical-section,async,blocking,miniz-oxide
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv6m-none-eabi
+      # Only libraries: dev-dependencies must not unify in std/Tokio features.
+      # portable-atomic-critical-section currently also enables async itself.
+      - run: cargo check --release --target thumbv6m-none-eabi --lib --no-default-features --features "${{ matrix.features }}" -p protolink
+      # Separate invocations keep protolink's default micropb dependency from
+      # masking the sans-IO crates' codec-free feature combinations.
+      - name: Check isolated sans-IO codec combinations
+        if: matrix.features == 'portable-atomic-critical-section'
+        run: |
+          cargo check --release --target thumbv6m-none-eabi --lib --no-default-features -p protolink-grpc -p protolink-http2
+          cargo check --release --target thumbv6m-none-eabi --lib --no-default-features --features micropb -p protolink-grpc
+          cargo check --release --target thumbv6m-none-eabi --lib --no-default-features --features miniz-oxide -p protolink-grpc
+          cargo check --release --target thumbv6m-none-eabi --lib --no-default-features --features micropb,miniz-oxide -p protolink-grpc
+
+  embedded-smoke:
+    name: Generated no_std consumer (${{ matrix.features }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        features:
+          - async
+          - blocking
+          - async,blocking
+          - async,compression
+          - blocking,compression
+          - async,blocking,compression
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv6m-none-eabi
+      # Nested standalone workspace: host generators can use std, target code
+      # cannot inherit the root workspace's example/dev-dependency features.
+      - name: Check all generated RPC shapes
+        run: cargo check --manifest-path examples/embedded-smoke/Cargo.toml --release --target thumbv6m-none-eabi --lib --no-default-features --features "${{ matrix.features }}"
+      - name: Link Cortex-M0 allocator and interrupt critical section
+        if: contains(matrix.features, 'async,blocking')
+        run: cargo build --manifest-path examples/embedded-smoke/Cargo.toml --release --target thumbv6m-none-eabi --bin embedded-smoke --no-default-features --features "${{ matrix.features }}"
+      - name: Cross-compile generator identifier fixtures
+        if: matrix.features == 'async,blocking'
+        env:
+          PROTOLINK_GRPC_GEN_TEST_TARGET: thumbv6m-none-eabi
+        run: cargo test -p protolink-grpc-gen --test compilation
+      - name: Check fixture formatting
+        run: cargo fmt --manifest-path examples/embedded-smoke/Cargo.toml --all -- --check
+
   features:
     name: Check feature combinations
     runs-on: ubuntu-latest

@@ -1,4 +1,4 @@
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -7,7 +7,6 @@ use core::time::Duration;
 use protolink_http2::{Config, Connection, Error, ErrorCode, Event, FlowControl, HeaderField};
 
 use crate::compression::Compression;
-use crate::inbound::Inbound;
 use crate::status::decode_message;
 use crate::{
     CallId, Code, DEFAULT_MAX_MESSAGE_SIZE, Metadata, Next, Response, Status, lpm, timeout,
@@ -83,6 +82,17 @@ pub struct ClientConfig {
     /// Largest accepted response and sent request message, in bytes. Compressed
     /// messages count by their decompressed size.
     pub max_message_size: usize,
+    /// Connection-wide retained response budget, including decompressed messages
+    /// (with their five-byte prefixes) and partial messages, even after completion.
+    /// Exceeding it fails the receiving call with `RESOURCE_EXHAUSTED`.
+    /// Each message is charged at least its framed wire size. Decoder scratch
+    /// space is additionally bounded by [`lpm::wire_limit`] of `max_message_size`
+    /// plus one HTTP/2 DATA frame and one decompressed message. Defaults to 1 MiB.
+    pub max_buffered_response_bytes: usize,
+    /// Maximum calls retained by the client, including completed unread results
+    /// and finished streaming metadata. Consume or cancel them to admit more
+    /// calls. Defaults to 64.
+    pub max_retained_calls: usize,
     /// `:authority` sent with every request.
     pub authority: String,
     /// Message compression. Off by default.
@@ -103,9 +113,130 @@ impl Default for ClientConfig {
                 ..Config::default()
             },
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+            max_buffered_response_bytes: 1024 * 1024,
+            max_retained_calls: 64,
             authority: "localhost".into(),
             compression: Compression::NONE,
             default_timeout: None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RetainedMessage {
+    message: Vec<u8>,
+    credit: usize,
+    wire_len: usize,
+}
+
+impl RetainedMessage {
+    fn bytes(&self) -> usize {
+        self.message
+            .len()
+            .saturating_add(lpm::HEADER_LEN)
+            .max(self.wire_len)
+    }
+}
+
+#[derive(Debug)]
+struct Completed {
+    result: Result<Response<Vec<u8>>, Status>,
+    credit: usize,
+    bytes: usize,
+}
+
+/// Credit ownership outlives HTTP/2 stream state. Decode before retention so
+/// compressed responses cannot bypass the connection-wide memory budget.
+#[derive(Debug)]
+struct ResponseBuffer {
+    decoder: lpm::Decoder,
+    messages: VecDeque<RetainedMessage>,
+    message_bytes: usize,
+    credited: usize,
+    held: usize,
+}
+
+impl ResponseBuffer {
+    fn new(max_message_size: usize) -> Self {
+        Self {
+            decoder: lpm::Decoder::new(max_message_size),
+            messages: VecDeque::new(),
+            message_bytes: 0,
+            credited: 0,
+            held: 0,
+        }
+    }
+
+    fn buffered(&self) -> usize {
+        self.message_bytes.saturating_add(self.decoder.buffered())
+    }
+
+    fn push(
+        &mut self,
+        conn: &mut Connection,
+        id: CallId,
+        data: &[u8],
+        limit: usize,
+    ) -> Result<(), Status> {
+        if data.len() > limit.saturating_sub(self.buffered()) {
+            conn.release_capacity(id, data.len());
+            return Err(Status::resource_exhausted(
+                "response retention budget exceeded",
+            ));
+        }
+        self.held += data.len();
+        self.decoder.push(data);
+        while let Some(item) = self.decoder.next_framed() {
+            let (message, wire_len) = item?;
+            let already = wire_len.min(self.credited);
+            self.credited -= already;
+            let credit = (wire_len - already).min(self.held);
+            self.held -= credit;
+            let message = RetainedMessage {
+                message,
+                credit,
+                wire_len,
+            };
+            if message.bytes() > limit.saturating_sub(self.buffered()) {
+                conn.release_capacity(id, credit);
+                return Err(Status::resource_exhausted(
+                    "response retention budget exceeded",
+                ));
+            }
+            self.message_bytes += message.bytes();
+            self.messages.push_back(message);
+        }
+        self.release_partial(conn, id);
+        Ok(())
+    }
+
+    fn take_message(&mut self) -> Option<RetainedMessage> {
+        let message = self.messages.pop_front()?;
+        self.message_bytes -= message.bytes();
+        Some(message)
+    }
+
+    fn release_partial(&mut self, conn: &mut Connection, id: CallId) {
+        // A partial message may exceed the stream window. Its early credit is
+        // still charged to the retention budget, but never released twice.
+        if self.messages.is_empty() && self.held > 0 {
+            conn.release_capacity(id, self.held);
+            self.held = 0;
+            self.credited = self.decoder.buffered();
+        }
+    }
+
+    fn discard_partial(&mut self, conn: &mut Connection, id: CallId) {
+        conn.release_capacity(id, core::mem::take(&mut self.held));
+        self.credited = 0;
+        self.decoder = lpm::Decoder::new(0);
+    }
+
+    fn discard(&mut self, conn: &mut Connection, id: CallId) {
+        self.discard_partial(conn, id);
+        self.message_bytes = 0;
+        for message in self.messages.drain(..) {
+            conn.release_capacity(id, message.credit);
         }
     }
 }
@@ -121,7 +252,10 @@ struct Call {
     initial: Option<Metadata>,
     /// Metadata of the response trailers, once received.
     trailers: Metadata,
-    inbound: Inbound,
+    inbound: ResponseBuffer,
+    /// Used only if the terminal response does not carry a gRPC status.
+    fallback: Option<Status>,
+    valid_content_type: bool,
     /// Final status, once known. Reported after every received message.
     status: Option<Result<(), Status>>,
     /// The request side was half-closed.
@@ -161,7 +295,9 @@ struct Call {
 pub struct Client {
     conn: Connection,
     calls: BTreeMap<CallId, Call>,
-    done: BTreeMap<CallId, Result<Response<Vec<u8>>, Status>>,
+    done: BTreeMap<CallId, Completed>,
+    max_buffered_response_bytes: usize,
+    max_retained_calls: usize,
     /// Response metadata of finished streaming calls, until taken.
     finished_metadata: BTreeMap<CallId, (Option<Metadata>, Metadata)>,
     max_message_size: usize,
@@ -180,6 +316,8 @@ impl Client {
             conn: Connection::client(config.http2),
             calls: BTreeMap::new(),
             done: BTreeMap::new(),
+            max_buffered_response_bytes: config.max_buffered_response_bytes,
+            max_retained_calls: config.max_retained_calls,
             finished_metadata: BTreeMap::new(),
             max_message_size: config.max_message_size,
             authority: config.authority,
@@ -207,15 +345,16 @@ impl Client {
         if request.len() > self.max_message_size {
             return Err(Status::resource_exhausted("request message too large"));
         }
+        let frame = self.frame(request)?;
         let id = self.open(path, true, options)?;
         self.conn
-            .send_data(id, self.frame(request), true)
+            .send_data(id, frame, true)
             .map_err(|_| Status::internal("failed to queue request"))?;
         Ok(id)
     }
 
     /// Wrap a request message for sending, compressing it if configured.
-    fn frame(&self, message: &[u8]) -> Vec<u8> {
+    fn frame(&self, message: &[u8]) -> Result<Vec<u8>, Status> {
         lpm::frame(message, self.compression.send, self.compression.min_size)
     }
 
@@ -242,6 +381,14 @@ impl Client {
         let timeout = options.timeout.or(self.default_timeout);
         if timeout == Some(Duration::ZERO) {
             return Err(Status::deadline_exceeded("timeout is zero"));
+        }
+        if self.calls.len() + self.done.len() + self.finished_metadata.len()
+            >= self.max_retained_calls
+            || self.retained_response_bytes() >= self.max_buffered_response_bytes
+        {
+            return Err(Status::resource_exhausted(
+                "unread response retention limit",
+            ));
         }
         let mut headers = vec![
             field(":method", "POST"),
@@ -272,6 +419,9 @@ impl Client {
             Error::GoingAway => Status::unavailable("connection is going away"),
             _ => Status::unavailable("connection failed"),
         })?;
+        self.conn
+            .retain_receive_capacity(id)
+            .map_err(|_| Status::internal("failed to retain response capacity"))?;
         self.calls.insert(
             id,
             Call {
@@ -280,7 +430,9 @@ impl Client {
                 headers_received: false,
                 initial: None,
                 trailers: Metadata::new(),
-                inbound: Inbound::new(self.max_message_size),
+                inbound: ResponseBuffer::new(self.max_message_size),
+                fallback: None,
+                valid_content_type: false,
                 status: None,
                 send_closed: unary,
             },
@@ -307,7 +459,7 @@ impl Client {
             return Err(Status::failed_precondition("request stream already closed"));
         }
         self.conn
-            .send_data(id, self.frame(message), false)
+            .send_data(id, self.frame(message)?, false)
             .map_err(|_| Status::internal("failed to queue request"))
     }
 
@@ -345,18 +497,10 @@ impl Client {
         if call.unary {
             return None;
         }
-        match call.inbound.next(&mut self.conn, id) {
-            Some(Ok(msg)) => return Some(Next::Message(msg)),
-            Some(Err(status)) => {
-                self.forget(id);
-                // A message that fails to decompress is only found here, with
-                // the stream possibly still open.
-                if self.conn.has_stream(id) {
-                    let _ = self.conn.reset_stream(id, ErrorCode::Cancel);
-                }
-                return Some(Next::Done(Err(status)));
-            }
-            None => {}
+        if let Some(message) = call.inbound.take_message() {
+            self.conn.release_capacity(id, message.credit);
+            call.inbound.release_partial(&mut self.conn, id);
+            return Some(Next::Message(message.message));
         }
         let status = call.status.take()?;
         self.forget(id);
@@ -449,7 +593,9 @@ impl Client {
     /// successful call carries the response metadata; a failed one has its
     /// trailers in [`Status::metadata`].
     pub fn take_response(&mut self, id: CallId) -> Option<Result<Response<Vec<u8>>, Status>> {
-        self.done.remove(&id)
+        let completed = self.done.remove(&id)?;
+        self.conn.release_capacity(id, completed.credit);
+        Some(completed.result)
     }
 
     /// Whether the call is still waiting for its final status.
@@ -457,12 +603,15 @@ impl Client {
         self.calls.get(&id).is_some_and(|c| c.status.is_none())
     }
 
-    /// Abort an in-flight call (RST_STREAM CANCEL) and forget it.
+    /// Abort an in-flight call (RST_STREAM CANCEL), or discard an unread result.
     pub fn cancel(&mut self, id: CallId) {
-        if self.calls.remove(&id).is_some() && self.conn.has_stream(id) {
+        if let Some(mut call) = self.calls.remove(&id) {
+            call.inbound.discard(&mut self.conn, id);
             let _ = self.conn.reset_stream(id, ErrorCode::Cancel);
         }
-        self.done.remove(&id);
+        if let Some(completed) = self.done.remove(&id) {
+            self.conn.release_capacity(id, completed.credit);
+        }
         self.finished_metadata.remove(&id);
     }
 
@@ -476,10 +625,24 @@ impl Client {
         }
     }
 
-    /// Response bytes buffered for the call (messages not taken yet, plus a
-    /// partial message). `None` if the call is unknown.
+    /// Retention-budget bytes for the call: unread messages (the larger of
+    /// decompressed framed size and wire size), plus partial message bytes.
+    /// Includes completed unary results. `None` if the call is unknown.
     pub fn buffered_response_bytes(&self, id: CallId) -> Option<usize> {
-        self.calls.get(&id).map(|c| c.inbound.buffered())
+        self.calls
+            .get(&id)
+            .map(|c| c.inbound.buffered())
+            .or_else(|| self.done.get(&id).map(|c| c.bytes))
+    }
+
+    /// Total retention-budget bytes, including completed unread unary results.
+    /// See [`buffered_response_bytes`](Self::buffered_response_bytes).
+    pub fn retained_response_bytes(&self) -> usize {
+        self.calls
+            .values()
+            .map(|c| c.inbound.buffered())
+            .chain(self.done.values().map(|c| c.bytes))
+            .fold(0, usize::saturating_add)
     }
 
     /// Request bytes queued on the call that wait for the server's
@@ -522,35 +685,42 @@ impl Client {
         if call.status.is_some() {
             return;
         }
-        if let Some(code) = reset
-            && self.conn.has_stream(id)
-        {
+        if let Some(code) = reset {
             let _ = self.conn.reset_stream(id, code);
         }
         if !call.unary {
+            call.inbound.discard_partial(&mut self.conn, id);
             call.status = Some(result);
             return;
         }
         let result = result.and_then(|()| {
-            call.inbound.finish()?;
-            match call.inbound.next(&mut self.conn, id) {
-                Some(Ok(msg)) if !call.inbound.has_next() => Ok(msg),
-                Some(Ok(_)) => Err(Status::internal(
+            call.inbound.decoder.finish()?;
+            match call.inbound.messages.len() {
+                1 => Ok(call.inbound.take_message().unwrap()),
+                0 => Err(Status::internal("missing response message")),
+                _ => Err(Status::internal(
                     "more than one response message for unary call",
                 )),
-                Some(Err(e)) => Err(e),
-                None => Err(Status::internal("missing response message")),
             }
         });
+        call.inbound.discard(&mut self.conn, id);
         let headers = call.initial.take().unwrap_or_default();
         let trailers = core::mem::take(&mut call.trailers);
+        let (credit, bytes) = result.as_ref().map_or((0, 0), |m| (m.credit, m.bytes()));
         let result = result.map(|message| Response {
-            message,
+            message: message.message,
             headers,
             trailers,
         });
         self.calls.remove(&id);
-        self.done.insert(id, result);
+        self.done.insert(
+            id,
+            Completed {
+                result,
+                credit,
+                bytes,
+            },
+        );
     }
 
     fn on_event(&mut self, event: Event) {
@@ -560,6 +730,12 @@ impl Client {
                 headers,
                 end_stream,
             } => {
+                let http = header(&headers, ":status").and_then(|s| s.parse::<u16>().ok());
+                // HTTP/2 validates informational responses; they do not start
+                // the final gRPC response or contribute response metadata.
+                if http.is_some_and(|status| (100..200).contains(&status)) {
+                    return;
+                }
                 let Some(call) = self.calls.get_mut(&stream_id) else {
                     return;
                 };
@@ -569,26 +745,27 @@ impl Client {
                 let first = !call.headers_received;
                 call.headers_received = true;
                 if first {
-                    let http = header(&headers, ":status").and_then(|s| s.parse::<u16>().ok());
+                    call.valid_content_type =
+                        header(&headers, "content-type").is_some_and(grpc_content_type);
                     if http != Some(200) {
                         let code = http.map_or(Code::Internal, Code::from_http_status);
                         let msg = alloc::format!("unexpected HTTP status {}", http.unwrap_or(0));
-                        self.terminate(
-                            stream_id,
-                            Err(Status::new(code, msg)),
-                            Some(ErrorCode::Cancel),
-                        );
-                        return;
+                        call.fallback = Some(Status::new(code, msg));
+                    } else if !call.valid_content_type {
+                        call.fallback = Some(Status::internal("invalid response content-type"));
                     }
                     if !end_stream {
                         call.initial = Some(Metadata::from_headers_lossy(&headers));
+                        if !call.valid_content_type {
+                            return;
+                        }
                         // The message encoding is announced in the response
                         // headers, before any message.
                         match self
                             .compression
                             .decoder_for(header(&headers, "grpc-encoding"))
                         {
-                            Ok(codec) => call.inbound.set_codec(codec),
+                            Ok(codec) => call.inbound.decoder.set_codec(codec),
                             Err(_) => self.terminate(
                                 stream_id,
                                 Err(Status::internal("unsupported response grpc-encoding")),
@@ -608,8 +785,22 @@ impl Client {
                 }
                 // Trailers-only responses carry all their metadata here.
                 let trailers = Metadata::from_headers_lossy(&headers);
-                let result = trailers_status(&headers)
-                    .and_then(|()| call.inbound.finish())
+                let result = if header(&headers, "grpc-status").is_some() {
+                    trailers_status(&headers).and_then(|()| {
+                        if call.valid_content_type {
+                            Ok(())
+                        } else {
+                            Err(Status::internal("invalid response content-type"))
+                        }
+                    })
+                } else {
+                    Err(call
+                        .fallback
+                        .clone()
+                        .unwrap_or_else(|| Status::internal("missing grpc-status")))
+                };
+                let result = result
+                    .and_then(|()| call.inbound.decoder.finish())
                     .map_err(|status| status.with_metadata(trailers.clone()));
                 call.trailers = trailers;
                 self.terminate(stream_id, result, Some(ErrorCode::NoError));
@@ -619,6 +810,7 @@ impl Client {
                 data,
                 end_stream,
             } => {
+                let retained = self.retained_response_bytes();
                 let Some(call) = self.calls.get_mut(&stream_id) else {
                     self.conn.release_capacity(stream_id, data.len());
                     return;
@@ -627,11 +819,32 @@ impl Client {
                     self.conn.release_capacity(stream_id, data.len());
                     return;
                 }
-                call.inbound.push(&mut self.conn, stream_id, &data);
-                if let Some(e) = call.inbound.error() {
-                    let e = e.clone();
+                if !call.headers_received {
+                    self.conn.release_capacity(stream_id, data.len());
+                    self.terminate(
+                        stream_id,
+                        Err(Status::internal("DATA before response headers")),
+                        Some(ErrorCode::ProtocolError),
+                    );
+                    return;
+                }
+                if !call.valid_content_type {
+                    self.conn.release_capacity(stream_id, data.len());
+                    if end_stream {
+                        let status = call
+                            .fallback
+                            .clone()
+                            .unwrap_or_else(|| Status::internal("invalid response content-type"));
+                        self.terminate(stream_id, Err(status), Some(ErrorCode::ProtocolError));
+                    }
+                    return;
+                }
+                let limit = self
+                    .max_buffered_response_bytes
+                    .saturating_sub(retained.saturating_sub(call.inbound.buffered()));
+                if let Err(e) = call.inbound.push(&mut self.conn, stream_id, &data, limit) {
                     self.terminate(stream_id, Err(e), Some(ErrorCode::Cancel));
-                } else if call.unary && call.inbound.message_count() > 1 {
+                } else if call.unary && call.inbound.messages.len() > 1 {
                     self.terminate(
                         stream_id,
                         Err(Status::internal(
@@ -640,11 +853,11 @@ impl Client {
                         Some(ErrorCode::Cancel),
                     );
                 } else if end_stream {
-                    self.terminate(
-                        stream_id,
-                        Err(Status::internal("response ended without trailers")),
-                        None,
-                    );
+                    let status = call
+                        .fallback
+                        .clone()
+                        .unwrap_or_else(|| Status::internal("response ended without trailers"));
+                    self.terminate(stream_id, Err(status), Some(ErrorCode::ProtocolError));
                 }
             }
             Event::Reset {
@@ -660,6 +873,19 @@ impl Client {
             Event::GoAway { .. } => {}
         }
     }
+}
+
+fn grpc_content_type(value: &str) -> bool {
+    let media = value.split(';').next().unwrap_or("").trim();
+    media == "application/grpc"
+        || media
+            .strip_prefix("application/grpc+")
+            .is_some_and(|suffix| {
+                !suffix.is_empty()
+                    && suffix
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+            })
 }
 
 fn inactive() -> Status {

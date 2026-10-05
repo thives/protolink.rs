@@ -30,12 +30,16 @@ Rules, checked when an entry is inserted (`InvalidMetadata` says which one was b
 - Text values are printable ASCII (`0x20..=0x7e`).
 - A key ending in `-bin` carries bytes and must be inserted with `insert_bin`; any other key must be text.
   Binary values are base64 on the wire. They are sent unpadded, and padded or unpadded input is accepted.
+  Received combined fields such as `trace-bin: AQ==, Ag` split into ordered entries before decoding;
+  separator spaces/tabs are trimmed and empty elements are retained.
 - These names are reserved for HTTP/2 and gRPC and can't be used: pseudo-headers (`:…`), everything
   starting with `grpc-`, `content-type`, `te`, `host`, `content-length` and the hop-by-hop headers
   (`connection`, `keep-alive`, `proxy-connection`, `transfer-encoding`, `upgrade`, `trailer`).
   `user-agent` is **not** reserved: a client sends `protolink` unless the call's metadata sets its own.
 
-Because invalid metadata can't be constructed, nothing that is sent can break the protocol.
+HTTP/2 field validation also applies when sending. In particular, leading or trailing field-value
+whitespace is refused even though it is printable ASCII; rejected server response fields reset their
+stream rather than silently dropping its terminal response.
 
 ## Client
 
@@ -61,8 +65,8 @@ Only `<method>_with_options` of a unary method changed its return type, to `Resp
 A **trailers-only** response (a call that failed before any response headers were sent) has a single
 header block. All of its metadata is reported as trailers and `headers()` is `None`.
 
-Metadata that breaks the rules in a response (a malformed `-bin` value, a control character) is skipped
-rather than failing the call.
+Malformed gRPC metadata elements in a response (for example, a malformed `-bin` value) are skipped
+individually, retaining valid siblings. Invalid HTTP/2 field syntax is rejected at the HTTP/2 layer.
 
 The sans-IO client keeps the headers and trailers of a finished streaming call until
 `take_metadata(id)` takes them (the drivers do that when the call ends) or `cancel(id)` is called.
@@ -84,8 +88,9 @@ Trailing metadata is sent whatever way the call ends, including `DEADLINE_EXCEED
 set before that is not lost. A trailers-only response carries the initial metadata, the trailing metadata
 and the status's metadata in its single block, in that order.
 
-A request whose metadata breaks the rules (a malformed `-bin` value, a control character, an invalid
-key) is answered with `INVALID_ARGUMENT` and never reaches the handler.
+A request whose gRPC metadata breaks the rules (malformed `-bin` values, invalid keys, or expanded
+metadata limits) is answered with `INVALID_ARGUMENT` and never reaches the handler. Invalid HTTP/2
+field syntax is rejected before gRPC parsing.
 
 Handlers can be tested without a server: `CallContext::new(path, id, deadline, &request_metadata,
 &mut response_metadata)` builds a context, and the `ResponseMetadata` shows what the handler set.
@@ -99,10 +104,16 @@ Handlers can be tested without a server: `CallContext::new(path, id, deadline, &
 
 ## Limits
 
-- The peer's `SETTINGS_MAX_HEADER_LIST_SIZE` is not tracked when sending. Metadata is meant to be small;
-  a receiver resets a call whose headers exceed its limit (`Config::max_header_list_size`, 8 KiB by
-  default).
-- Metadata is buffered per call until the call is done, like other call state.
+- The peer's `SETTINGS_MAX_HEADER_LIST_SIZE` is not tracked when sending. Metadata is meant to be small.
+  Incremental HPACK decoding enforces the receiver's `Config::max_header_list_size` (8 KiB by default);
+  exceeding it terminates the connection without materializing the oversized list.
+- Received metadata has independent bounds per header/trailer block: **128 expanded entries** and
+  **8192 owned key/value bytes**, including every repeated key copy. Checks occur before cloning keys
+  or decoding values, so comma-separated empty values cannot amplify bounded headers into huge allocations.
+  Strict request parsing rejects an over-budget element; lossy response parsing skips it and continues
+  with later elements that fit. Application-created metadata is not subject to these receive limits.
+- Metadata is buffered per call until consumed or discarded. The client's retained-call admission budget
+  also covers completed streaming metadata (`ClientConfig::max_retained_calls`, default 64).
 
 ## Breaking changes
 

@@ -19,8 +19,8 @@ use crate::{Error, READ_CHUNK};
 /// fails.
 ///
 /// Requests are dispatched to `handler` (e.g. a generated `<Service>Server`, or
-/// a tuple of them). Writes are cancel-safe if the transport's `write` is, so
-/// the future may be dropped (e.g. on shutdown) without corrupting state.
+/// a tuple of them). Dropping this future closes its owned transport and
+/// cancels active streaming handlers, including while suspended in I/O.
 ///
 /// Streaming handlers are polled with this future's waker: when one returns
 /// `Poll::Pending` and later wakes the waker, the pending transport `read` is
@@ -30,7 +30,7 @@ use crate::{Error, READ_CHUNK};
 /// [`link`](crate::link) stack are); unary-only servers never drop a read.
 ///
 /// When the connection ends, every active streaming call is reported to
-/// [`Handler::on_cancel`].
+/// [`Handler::on_cancel`], including when this future is dropped.
 ///
 /// `serve` has no clock, so it doesn't enforce `grpc-timeout` deadlines; use
 /// [`serve_with_timer`] for that.
@@ -58,6 +58,8 @@ where
 /// Waiting for a deadline drops the pending transport `read` when the timer
 /// fires, exactly like waiting for a streaming handler does, so the transport's
 /// `read` must be cancel-safe (see [`serve`]), also for unary-only servers.
+/// Writes and flushes are raced too; expiry during output closes the connection
+/// with [`Error::OutputDeadline`] rather than reusing indeterminate wire state.
 pub async fn serve_with_timer<IO, H, T>(
     mut io: IO,
     handler: &mut H,
@@ -69,10 +71,50 @@ where
     H: Handler + ?Sized,
     T: Timer,
 {
-    let mut server = grpc::Server::new(config);
-    let result = serve_connection(&mut io, &mut server, handler, &timer).await;
-    server.cancel_all(handler);
-    result
+    let mut serving = Serving {
+        server: grpc::Server::new(config),
+        handler,
+    };
+    serve_connection(&mut io, &mut serving.server, &mut *serving.handler, &timer).await
+}
+
+struct Serving<'a, H: Handler + ?Sized> {
+    server: grpc::Server,
+    handler: &'a mut H,
+}
+
+impl<H: Handler + ?Sized> Drop for Serving<'_, H> {
+    fn drop(&mut self) {
+        self.server.cancel_all(self.handler);
+    }
+}
+
+/// Output cancellation can leave an indeterminate prefix on the wire. The
+/// caller must close/retire the connection if this returns `None`.
+async fn output_until<T: Timer, F: Future>(
+    timer: &T,
+    deadline: Option<core::time::Duration>,
+    output: F,
+) -> Option<F::Output> {
+    let mut output = pin!(output);
+    let mut sleep = pin!(deadline.map(|d| timer.sleep_until(d)));
+    poll_fn(|cx| {
+        if deadline.is_some_and(|d| timer.now() >= d)
+            || sleep
+                .as_mut()
+                .as_pin_mut()
+                .is_some_and(|s| s.poll(cx).is_ready())
+        {
+            return Poll::Ready(None);
+        }
+        let result = output.as_mut().poll(cx);
+        if deadline.is_some_and(|d| timer.now() >= d) {
+            Poll::Ready(None)
+        } else {
+            result.map(Some)
+        }
+    })
+    .await
 }
 
 async fn serve_connection<IO, H, T>(
@@ -90,10 +132,25 @@ where
     loop {
         server.tick(timer.now(), &mut *handler);
         while server.has_output() {
-            let n = io.write(server.pending_output()).await.map_err(Error::Io)?;
+            let n = output_until(
+                timer,
+                server.next_deadline(),
+                io.write(server.pending_output()),
+            )
+            .await
+            .ok_or(Error::OutputDeadline)?
+            .map_err(Error::Io)?;
+            if n == 0 {
+                return Err(Error::WriteZero);
+            }
             server.consume_output(n);
+            server.tick(timer.now(), &mut *handler);
         }
-        io.flush().await.map_err(Error::Io)?;
+        output_until(timer, server.next_deadline(), io.flush())
+            .await
+            .ok_or(Error::OutputDeadline)?
+            .map_err(Error::Io)?;
+        server.output_flushed();
         if server.is_closed() {
             return Ok(());
         }
@@ -103,6 +160,7 @@ where
             let mut read = pin!(io.read(&mut buf));
             let mut sleep = pin!(server.next_deadline().map(|d| timer.sleep_until(d)));
             poll_fn(|cx| {
+                server.tick(timer.now(), &mut *handler);
                 server.poll(&mut *handler, cx);
                 if server.has_output() {
                     return Poll::Ready(None);
@@ -127,8 +185,14 @@ where
         server.tick(timer.now(), &mut *handler);
         if let Err(e) = server.recv(&buf[..n], handler) {
             // Best effort: deliver the GOAWAY before giving up.
-            let _ = io.write_all(server.pending_output()).await;
-            let _ = io.flush().await;
+            let _ = output_until(timer, server.next_deadline(), async {
+                io.write_all(server.pending_output()).await?;
+                server.consume_output(server.pending_output().len());
+                io.flush().await?;
+                server.output_flushed();
+                Ok::<(), IO::Error>(())
+            })
+            .await;
             return Err(Error::Protocol(e));
         }
     }
@@ -157,8 +221,9 @@ where
 /// without a cancel-safe `read` (for example a one-shot DMA UART), put them
 /// behind [`link::pump`](crate::link::pump) or keep to one call at a time.
 ///
-/// A blocked transport `write` still stops everything until it completes; see
-/// [`Call`].
+/// Without a deadline a blocked transport `write` or `flush` stops progress.
+/// With a timer, expiry during output retires the whole connection because
+/// dropping an output operation can leave indeterminate bytes on the wire.
 ///
 /// # Deadlines
 ///
@@ -173,7 +238,9 @@ where
 /// polled. Waiting for a deadline drops the pending read when the timer fires,
 /// so with a timer, `read` must be cancel-safe even when only one call is
 /// active. The reset of a call that expired is written by the next operation
-/// on the client.
+/// on the client, except that an output deadline retires the connection and
+/// no further transport I/O is attempted. Transport/protocol errors likewise
+/// permanently retire the connection; buffered messages remain retrievable.
 #[derive(Debug)]
 pub struct Client<IO, T = NoTimer> {
     shared: Shared<State<IO>>,
@@ -186,7 +253,10 @@ struct State<IO> {
     /// The transport, or `None` while an operation has it checked out.
     io: Option<IO>,
     /// Tasks waiting for the transport to be checked back in.
-    waiters: Vec<Waker>,
+    waiters: Vec<(usize, Waker)>,
+    next_waiter: usize,
+    /// Once retired, queued bytes must never be sent again.
+    terminal: Option<Status>,
     /// A unary call whose future was dropped before it completed.
     stale_unary: Option<CallId>,
     /// Some call has output to write while the transport is busy: a pending
@@ -202,6 +272,7 @@ struct State<IO> {
 struct IoGuard<'a, IO, T> {
     client: &'a Client<IO, T>,
     io: Option<IO>,
+    output_in_flight: bool,
 }
 
 impl<IO, T> IoGuard<'_, IO, T> {
@@ -215,14 +286,44 @@ impl<IO, T> IoGuard<'_, IO, T> {
 impl<IO, T> Drop for IoGuard<'_, IO, T> {
     fn drop(&mut self) {
         let io = self.io.take();
-        let waiters = self.client.shared.with(|s| {
+        let (waiters, holder) = self.client.shared.with(|s| {
+            if self.output_in_flight {
+                retire(s, Status::unavailable("transport output cancelled"));
+            }
             s.io = io;
-            s.holder = None;
-            core::mem::take(&mut s.waiters)
+            (core::mem::take(&mut s.waiters), s.holder.take())
         });
-        for waiter in waiters {
+        drop(holder);
+        for (_, waiter) in waiters {
             waiter.wake();
         }
+    }
+}
+
+/// Owns one waiter registration even when an acquisition is cancelled.
+struct Registration<'a, IO, T> {
+    client: &'a Client<IO, T>,
+    id: Option<usize>,
+}
+
+impl<IO, T> Drop for Registration<'_, IO, T> {
+    fn drop(&mut self) {
+        let removed = self.client.shared.with(|s| {
+            self.id.and_then(|id| {
+                s.waiters
+                    .iter()
+                    .position(|(key, _)| *key == id)
+                    .map(|index| s.waiters.swap_remove(index))
+            })
+        });
+        drop(removed);
+    }
+}
+
+fn retire<IO>(state: &mut State<IO>, status: Status) {
+    if state.terminal.is_none() {
+        state.inner.fail_all(status.clone());
+        state.terminal = Some(status);
     }
 }
 
@@ -244,6 +345,8 @@ impl<IO: Read + Write, T: Timer> Client<IO, T> {
                 inner: grpc::Client::new(config),
                 io: Some(io),
                 waiters: Vec::new(),
+                next_waiter: 0,
+                terminal: None,
                 stale_unary: None,
                 want_io: false,
                 holder: None,
@@ -272,6 +375,9 @@ impl<IO: Read + Write, T: Timer> Client<IO, T> {
         let id = self.shared.with(|s| {
             s.inner.tick(now);
             cancel_stale_unary(s);
+            if let Some(status) = &s.terminal {
+                return Err(status.clone());
+            }
             let id = s.inner.start_unary_with(path, request, &options)?;
             s.stale_unary = Some(id);
             Ok::<_, Status>(id)
@@ -306,8 +412,22 @@ impl<IO: Read + Write, T: Timer> Client<IO, T> {
         let id = self.shared.with(|s| {
             s.inner.tick(now);
             cancel_stale_unary(s);
+            if let Some(status) = &s.terminal {
+                return Err(status.clone());
+            }
             s.inner.start_streaming_with(path, &options)
         })?;
+        let wake = self.shared.with(|s| {
+            if s.io.is_none() {
+                s.want_io = true;
+                s.holder.take()
+            } else {
+                None
+            }
+        });
+        if let Some(waker) = wake {
+            waker.wake();
+        }
         Ok(Call {
             client: self,
             id,
@@ -339,20 +459,42 @@ impl<IO: Read + Write, T: Timer> Client<IO, T> {
         &self,
         done: &mut impl FnMut(&mut grpc::Client) -> Option<R>,
     ) -> Result<IoGuard<'_, IO, T>, R> {
+        let mut registration = Registration {
+            client: self,
+            id: None,
+        };
         let acquired = poll_fn(|cx| {
-            let (poll, wake) = self.shared.with(|s| {
+            let (poll, wake, discarded) = self.shared.with(|s| {
+                s.inner.tick(self.timer.now());
                 if let Some(value) = done(&mut s.inner) {
-                    return (Poll::Ready(Err(value)), None);
+                    return (Poll::Ready(Err(value)), None, None);
                 }
                 match s.io.take() {
                     Some(io) => {
                         s.want_io = false;
-                        (Poll::Ready(Ok(io)), None)
+                        (Poll::Ready(Ok(io)), None, None)
                     }
                     None => {
-                        if !s.waiters.iter().any(|w| w.will_wake(cx.waker())) {
-                            s.waiters.push(cx.waker().clone());
-                        }
+                        let id = *registration.id.get_or_insert_with(|| {
+                            while s.waiters.iter().any(|(id, _)| *id == s.next_waiter) {
+                                s.next_waiter = s.next_waiter.wrapping_add(1);
+                            }
+                            let id = s.next_waiter;
+                            s.next_waiter = s.next_waiter.wrapping_add(1);
+                            id
+                        });
+                        let discarded = if let Some((_, waker)) =
+                            s.waiters.iter_mut().find(|(key, _)| *key == id)
+                        {
+                            if waker.will_wake(cx.waker()) {
+                                None
+                            } else {
+                                Some(core::mem::replace(waker, cx.waker().clone()))
+                            }
+                        } else {
+                            s.waiters.push((id, cx.waker().clone()));
+                            None
+                        };
                         // Output is waiting but the transport is busy,
                         // probably in a read: ask it to give way.
                         let wake = if s.inner.has_output() {
@@ -361,10 +503,11 @@ impl<IO: Read + Write, T: Timer> Client<IO, T> {
                         } else {
                             None
                         };
-                        (Poll::Pending, wake)
+                        (Poll::Pending, wake, discarded)
                     }
                 }
             });
+            drop(discarded);
             if let Some(waker) = wake {
                 waker.wake();
             }
@@ -374,6 +517,7 @@ impl<IO: Read + Write, T: Timer> Client<IO, T> {
         acquired.map(|io| IoGuard {
             client: self,
             io: Some(io),
+            output_in_flight: false,
         })
     }
 
@@ -387,7 +531,7 @@ impl<IO: Read + Write, T: Timer> Client<IO, T> {
                 Ok(guard) => guard,
                 Err(value) => return value,
             };
-            if self.write_all(guard.io()).await {
+            if self.write_all(&mut guard).await {
                 if let Some(value) = self.shared.with(|s| step(&mut s.inner)) {
                     return value;
                 }
@@ -398,9 +542,12 @@ impl<IO: Read + Write, T: Timer> Client<IO, T> {
 
     /// Write all pending output.
     async fn flush(&self) {
+        if self.shared.with(|s| s.terminal.is_some()) {
+            return;
+        }
         let mut done = |c: &mut grpc::Client| (!c.has_output()).then_some(());
         if let Ok(mut guard) = self.acquire(&mut done).await {
-            self.write_all(guard.io()).await;
+            self.write_all(&mut guard).await;
         }
     }
 
@@ -410,7 +557,10 @@ impl<IO: Read + Write, T: Timer> Client<IO, T> {
     /// Output is copied out in chunks and only consumed once the transport
     /// accepted it, so no borrow of the client state is held while the
     /// transport is awaited.
-    async fn write_all(&self, io: &mut IO) -> bool {
+    async fn write_all(&self, guard: &mut IoGuard<'_, IO, T>) -> bool {
+        if self.shared.with(|s| s.terminal.is_some()) {
+            return false;
+        }
         let mut buf = [0u8; READ_CHUNK];
         loop {
             let n = self.shared.with(|s| {
@@ -422,19 +572,86 @@ impl<IO: Read + Write, T: Timer> Client<IO, T> {
             if n == 0 {
                 break;
             }
-            match io.write(&buf[..n]).await {
-                Ok(0) | Err(_) => {
+            guard.output_in_flight = true;
+            let result = self.output(guard.io().write(&buf[..n])).await;
+            guard.output_in_flight = false;
+            match result {
+                None => return false,
+                Some(Ok(0) | Err(_)) => {
                     self.fail_all("transport write failed");
                     return false;
                 }
-                Ok(written) => self.shared.with(|s| s.inner.consume_output(written)),
+                Some(Ok(written)) => self.shared.with(|s| s.inner.consume_output(written)),
             }
         }
-        if io.flush().await.is_err() {
-            self.fail_all("transport flush failed");
-            return false;
+        guard.output_in_flight = true;
+        let result = self.output(guard.io().flush()).await;
+        guard.output_in_flight = false;
+        match result {
+            None => false,
+            Some(Err(_)) => {
+                self.fail_all("transport flush failed");
+                false
+            }
+            Some(Ok(())) => true,
         }
-        true
+    }
+
+    async fn output<F: Future>(&self, output: F) -> Option<F::Output> {
+        let mut output = pin!(output);
+        // This obligation belongs to the in-flight output, not to the core's
+        // mutable call set. A concurrent tick/cancellation may remove a call,
+        // but cannot make potentially non-cancel-safe output safe to reuse.
+        let mut deadline = self.shared.with(|s| s.inner.next_deadline());
+        let mut sleep = pin!(deadline.map(|d| self.timer.sleep_until(d)));
+        poll_fn(|cx| {
+            if deadline.is_some_and(|d| self.timer.now() >= d)
+                || sleep
+                    .as_mut()
+                    .as_pin_mut()
+                    .is_some_and(|s| s.poll(cx).is_ready())
+            {
+                self.output_expired();
+                return Poll::Ready(None);
+            }
+            let (next, discarded) = self.shared.with(|s| {
+                (
+                    s.inner.next_deadline(),
+                    s.holder.replace(cx.waker().clone()),
+                )
+            });
+            drop(discarded);
+            if next.is_some_and(|next| deadline.is_none_or(|armed| next < armed)) {
+                deadline = next;
+                sleep.set(deadline.map(|d| self.timer.sleep_until(d)));
+            }
+            if deadline.is_some_and(|d| self.timer.now() >= d)
+                || sleep
+                    .as_mut()
+                    .as_pin_mut()
+                    .is_some_and(|s| s.poll(cx).is_ready())
+            {
+                self.output_expired();
+                return Poll::Ready(None);
+            }
+            let result = output.as_mut().poll(cx);
+            // A ready transport may itself advance a platform clock.
+            if deadline.is_some_and(|d| self.timer.now() >= d) {
+                self.output_expired();
+                Poll::Ready(None)
+            } else {
+                result.map(Some)
+            }
+        })
+        .await
+    }
+
+    fn output_expired(&self) {
+        self.shared.with(|s| {
+            // Preserve DEADLINE_EXCEEDED for expired calls before failing peers.
+            s.inner.tick(self.timer.now());
+            retire(s, Status::unavailable("transport output deadline exceeded"));
+        });
     }
 
     /// Read once from the transport. Transport failures fail every call.
@@ -457,12 +674,17 @@ impl<IO: Read + Write, T: Timer> Client<IO, T> {
                 {
                     return Poll::Ready(None);
                 }
-                let yield_now = self.shared.with(|s| {
-                    if !s.want_io && !s.holder.as_ref().is_some_and(|w| w.will_wake(cx.waker())) {
-                        s.holder = Some(cx.waker().clone());
-                    }
-                    s.want_io
+                let (yield_now, discarded) = self.shared.with(|s| {
+                    let discarded = if !s.want_io
+                        && !s.holder.as_ref().is_some_and(|w| w.will_wake(cx.waker()))
+                    {
+                        s.holder.replace(cx.waker().clone())
+                    } else {
+                        None
+                    };
+                    (s.want_io, discarded)
                 });
+                drop(discarded);
                 if yield_now {
                     Poll::Ready(None)
                 } else {
@@ -474,21 +696,23 @@ impl<IO: Read + Write, T: Timer> Client<IO, T> {
         let Some(result) = result else {
             return;
         };
-        self.shared.with(|s| match result {
-            Ok(0) => s.inner.fail_all(Status::unavailable("connection closed")),
-            Ok(n) => {
-                // Errors fail all pending calls inside the client.
-                let _ = s.inner.recv(&buf[..n]);
+        self.shared.with(|s| {
+            s.inner.tick(self.timer.now());
+            match result {
+                Ok(0) => retire(s, Status::unavailable("connection closed")),
+                Ok(n) => {
+                    if s.inner.recv(&buf[..n]).is_err() {
+                        retire(s, Status::unavailable("connection protocol error"));
+                    }
+                }
+                Err(_) => retire(s, Status::unavailable("transport read failed")),
             }
-            Err(_) => s
-                .inner
-                .fail_all(Status::unavailable("transport read failed")),
         });
     }
 
     fn fail_all(&self, message: &'static str) {
         self.shared
-            .with(|s| s.inner.fail_all(Status::unavailable(message)));
+            .with(|s| retire(s, Status::unavailable(message)));
     }
 }
 
@@ -1037,5 +1261,713 @@ mod tests {
         // And the abandoned call can be used again.
         run(open.close_send()).unwrap();
         assert!(run(open.message()).unwrap().is_none());
+    }
+
+    #[test]
+    fn cancelled_acquisitions_release_and_replace_wakers() {
+        let peer = Peer::new();
+        let client = client(&peer);
+        let mut quiet = client.streaming(QUIET).unwrap();
+        let mut other = client.streaming(QUIET).unwrap();
+        let mut reader = pin!(quiet.message());
+        assert!(poll_once(reader.as_mut(), Waker::noop()).is_pending());
+        for _ in 0..100 {
+            let (first, first_count) = Wakes::waker();
+            let (second, second_count) = Wakes::waker();
+            {
+                let mut waiter = pin!(other.message());
+                assert!(poll_once(waiter.as_mut(), &first).is_pending());
+                assert_eq!(client.shared.with(|s| s.waiters.len()), 1);
+                assert_eq!(Arc::strong_count(&first_count), 3);
+                assert!(poll_once(waiter.as_mut(), &second).is_pending());
+                assert_eq!(Arc::strong_count(&first_count), 2);
+                assert_eq!(client.shared.with(|s| s.waiters.len()), 1);
+            }
+            assert_eq!(client.shared.with(|s| s.waiters.len()), 0);
+            assert_eq!(Arc::strong_count(&second_count), 2);
+        }
+    }
+
+    #[derive(Clone)]
+    struct ManualTimer(Rc<core::cell::Cell<core::time::Duration>>);
+
+    impl crate::Clock for ManualTimer {
+        fn now(&self) -> core::time::Duration {
+            self.0.get()
+        }
+    }
+
+    impl Timer for ManualTimer {
+        fn sleep_until(&self, deadline: core::time::Duration) -> impl Future<Output = ()> {
+            poll_fn(move |_| {
+                if self.0.get() >= deadline {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum Fault {
+        Partial,
+        Flush,
+        Read,
+        Eof,
+        Protocol,
+        WritePending,
+        FlushPending,
+        FlushWaking,
+    }
+
+    struct FaultIo {
+        fault: Fault,
+        activity: Rc<core::cell::Cell<usize>>,
+        writes: usize,
+    }
+
+    impl ErrorType for FaultIo {
+        type Error = embedded_io_async::ErrorKind;
+    }
+
+    impl Write for FaultIo {
+        async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+            self.activity.set(self.activity.get() + 1);
+            self.writes += 1;
+            match self.fault {
+                Fault::Partial if self.writes == 1 => Ok(1),
+                Fault::Partial => Err(embedded_io_async::ErrorKind::BrokenPipe),
+                Fault::WritePending => {
+                    poll_fn(|_| {
+                        self.activity.set(self.activity.get() + 1);
+                        Poll::Pending
+                    })
+                    .await
+                }
+                _ => Ok(buf.len()),
+            }
+        }
+        async fn flush(&mut self) -> Result<(), Self::Error> {
+            self.activity.set(self.activity.get() + 1);
+            match self.fault {
+                Fault::Flush => Err(embedded_io_async::ErrorKind::BrokenPipe),
+                Fault::FlushPending => {
+                    poll_fn(|_| {
+                        self.activity.set(self.activity.get() + 1);
+                        Poll::Pending
+                    })
+                    .await
+                }
+                Fault::FlushWaking => {
+                    poll_fn(|cx| {
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    })
+                    .await
+                }
+                _ => Ok(()),
+            }
+        }
+    }
+
+    impl Read for FaultIo {
+        async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+            self.activity.set(self.activity.get() + 1);
+            match self.fault {
+                Fault::Read => Err(embedded_io_async::ErrorKind::BrokenPipe),
+                Fault::Protocol => {
+                    // Invalid SETTINGS frame on stream 1.
+                    buf[..9].copy_from_slice(&[0, 0, 0, 4, 0, 0, 0, 0, 1]);
+                    Ok(9)
+                }
+                _ => Ok(0),
+            }
+        }
+    }
+
+    fn fault_io(fault: Fault) -> (FaultIo, Rc<core::cell::Cell<usize>>) {
+        let activity = Rc::new(core::cell::Cell::new(0));
+        (
+            FaultIo {
+                fault,
+                activity: activity.clone(),
+                writes: 0,
+            },
+            activity,
+        )
+    }
+
+    #[test]
+    fn transport_failures_permanently_retire_async_clients() {
+        for fault in [
+            Fault::Partial,
+            Fault::Flush,
+            Fault::Read,
+            Fault::Eof,
+            Fault::Protocol,
+        ] {
+            let (io, activity) = fault_io(fault);
+            let mut client = Client::new(io, ClientConfig::default());
+            assert_eq!(
+                run(client.unary("/t.T/Echo", b"x")).unwrap_err().code,
+                grpc::Code::Unavailable
+            );
+            let count = activity.get();
+            assert_eq!(
+                run(client.unary("/t.T/Echo", b"again")).unwrap_err().code,
+                grpc::Code::Unavailable
+            );
+            assert!(client.streaming(QUIET).is_err());
+            run(client.flush());
+            assert_eq!(activity.get(), count, "retired connection performed I/O");
+        }
+    }
+
+    #[test]
+    fn output_deadlines_retire_pending_writes_and_flushes() {
+        use core::time::Duration;
+        for fault in [Fault::WritePending, Fault::FlushPending, Fault::FlushWaking] {
+            let (io, activity) = fault_io(fault);
+            let now = Rc::new(core::cell::Cell::new(Duration::ZERO));
+            let client = Client::with_timer(io, ClientConfig::default(), ManualTimer(now.clone()));
+            let mut expired = client
+                .streaming_with(QUIET, CallOptions::timeout(Duration::from_millis(100)))
+                .unwrap();
+            let mut other = client.streaming(QUIET).unwrap();
+            {
+                let mut message = pin!(expired.message());
+                assert!(poll_once(message.as_mut(), Waker::noop()).is_pending());
+                for _ in 0..4 {
+                    assert!(poll_once(message.as_mut(), Waker::noop()).is_pending());
+                }
+                now.set(Duration::from_millis(100));
+                let Poll::Ready(Err(status)) = poll_once(message.as_mut(), Waker::noop()) else {
+                    panic!("output deadline did not finish the call");
+                };
+                assert_eq!(status.code, grpc::Code::DeadlineExceeded);
+            }
+            let count = activity.get();
+            assert_eq!(
+                run(other.message()).unwrap_err().code,
+                grpc::Code::Unavailable
+            );
+            assert_eq!(
+                run(expired.message()).unwrap_err().code,
+                grpc::Code::DeadlineExceeded
+            );
+            assert!(client.streaming(QUIET).is_err());
+            assert_eq!(activity.get(), count);
+        }
+    }
+
+    #[test]
+    fn concurrent_tick_cannot_disarm_expired_output_deadline() {
+        use core::time::Duration;
+        for fault in [Fault::WritePending, Fault::FlushPending] {
+            for later_timeout in [None, Some(Duration::from_secs(10))] {
+                let (io, activity) = fault_io(fault);
+                let now = Rc::new(core::cell::Cell::new(Duration::ZERO));
+                let client =
+                    Client::with_timer(io, ClientConfig::default(), ManualTimer(now.clone()));
+                let mut first = client
+                    .streaming_with(QUIET, CallOptions::timeout(Duration::from_millis(100)))
+                    .unwrap();
+                let mut second;
+                let count;
+                {
+                    let mut pending = pin!(first.message());
+                    assert!(poll_once(pending.as_mut(), Waker::noop()).is_pending());
+                    now.set(Duration::from_millis(100));
+                    let mut options = CallOptions::default();
+                    options.timeout = later_timeout;
+                    // Starting another call ticks the core and removes the
+                    // expired first call from next_deadline().
+                    second = client.streaming_with(QUIET, options).unwrap();
+                    assert_eq!(
+                        client.with_inner(|c| c.next_deadline()),
+                        later_timeout.map(|d| d + now.get())
+                    );
+                    count = activity.get();
+                    let Poll::Ready(Err(status)) = poll_once(pending.as_mut(), Waker::noop())
+                    else {
+                        panic!("concurrent tick disarmed an expired output deadline");
+                    };
+                    assert_eq!(status.code, grpc::Code::DeadlineExceeded);
+                    assert!(client.shared.with(|s| s.terminal.is_some()));
+                }
+                assert_eq!(
+                    run(second.message()).unwrap_err().code,
+                    grpc::Code::Unavailable
+                );
+                assert_eq!(
+                    run(first.message()).unwrap_err().code,
+                    grpc::Code::DeadlineExceeded
+                );
+                assert!(client.streaming(QUIET).is_err());
+                run(client.flush());
+                assert_eq!(
+                    activity.get(),
+                    count,
+                    "retirement must not perform more I/O"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cancellation_cannot_disarm_an_armed_output_deadline() {
+        use core::time::Duration;
+        for fault in [Fault::WritePending, Fault::FlushPending] {
+            let (io, activity) = fault_io(fault);
+            let now = Rc::new(core::cell::Cell::new(Duration::ZERO));
+            let client = Client::with_timer(io, ClientConfig::default(), ManualTimer(now.clone()));
+            let mut first = client.streaming(QUIET).unwrap();
+            let cancelled = client
+                .streaming_with(QUIET, CallOptions::timeout(Duration::from_millis(100)))
+                .unwrap();
+            let count;
+            {
+                let mut pending = pin!(first.message());
+                assert!(poll_once(pending.as_mut(), Waker::noop()).is_pending());
+                drop(cancelled);
+                assert_eq!(client.with_inner(|c| c.next_deadline()), None);
+                now.set(Duration::from_millis(50));
+                assert!(poll_once(pending.as_mut(), Waker::noop()).is_pending());
+                count = activity.get();
+                now.set(Duration::from_millis(100));
+                let Poll::Ready(Err(status)) = poll_once(pending.as_mut(), Waker::noop()) else {
+                    panic!("cancellation disarmed in-flight output");
+                };
+                assert_eq!(status.code, grpc::Code::Unavailable);
+            }
+            assert!(client.streaming(QUIET).is_err());
+            run(client.flush());
+            assert_eq!(activity.get(), count);
+        }
+    }
+
+    #[test]
+    fn dropping_pending_output_retires_the_client() {
+        for fault in [Fault::WritePending, Fault::FlushPending] {
+            let (io, activity) = fault_io(fault);
+            let mut client = Client::new(io, ClientConfig::default());
+            {
+                let mut call = pin!(client.unary("/t.T/Echo", b"x"));
+                assert!(poll_once(call.as_mut(), Waker::noop()).is_pending());
+            }
+            let count = activity.get();
+            assert_eq!(
+                run(client.unary("/t.T/Echo", b"again")).unwrap_err().code,
+                grpc::Code::Unavailable
+            );
+            assert_eq!(activity.get(), count);
+        }
+    }
+
+    struct ServerIo {
+        request: Option<Vec<u8>>,
+        input_seen: bool,
+        stall: Fault,
+    }
+
+    impl ErrorType for ServerIo {
+        type Error = Infallible;
+    }
+    impl Read for ServerIo {
+        async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Infallible> {
+            if let Some(bytes) = self.request.take() {
+                buf[..bytes.len()].copy_from_slice(&bytes);
+                self.input_seen = true;
+                Ok(bytes.len())
+            } else {
+                core::future::pending().await
+            }
+        }
+    }
+    impl Write for ServerIo {
+        async fn write(&mut self, buf: &[u8]) -> Result<usize, Infallible> {
+            if self.input_seen && matches!(self.stall, Fault::WritePending) {
+                core::future::pending().await
+            } else {
+                Ok(buf.len())
+            }
+        }
+        async fn flush(&mut self) -> Result<(), Infallible> {
+            if self.input_seen && matches!(self.stall, Fault::FlushPending) {
+                core::future::pending().await
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn server_io(stall: Fault, timeout: Option<core::time::Duration>) -> ServerIo {
+        let mut client = grpc::Client::new(ClientConfig::default());
+        let mut options = CallOptions::default();
+        options.timeout = timeout;
+        let id = client.start_streaming_with(QUIET, &options).unwrap();
+        client.send_message(id, b"request").unwrap();
+        ServerIo {
+            request: Some(client.take_output()),
+            input_seen: false,
+            stall,
+        }
+    }
+
+    #[test]
+    fn dropping_server_in_read_write_or_flush_cancels_once() {
+        for stall in [Fault::Read, Fault::WritePending, Fault::FlushPending] {
+            let mut handler = Script::default();
+            {
+                let mut server = pin!(serve(
+                    server_io(stall, None),
+                    &mut handler,
+                    ServerConfig::default()
+                ));
+                assert!(poll_once(server.as_mut(), Waker::noop()).is_pending());
+            }
+            assert_eq!(handler.cancelled, 1);
+        }
+    }
+
+    #[test]
+    fn server_output_deadline_cancels_once() {
+        use core::time::Duration;
+        for stall in [Fault::WritePending, Fault::FlushPending] {
+            let now = Rc::new(core::cell::Cell::new(Duration::ZERO));
+            let mut handler = Script::default();
+            {
+                let mut server = pin!(serve_with_timer(
+                    server_io(stall, Some(Duration::from_millis(100))),
+                    &mut handler,
+                    ServerConfig::default(),
+                    ManualTimer(now.clone()),
+                ));
+                assert!(poll_once(server.as_mut(), Waker::noop()).is_pending());
+                now.set(Duration::from_millis(100));
+                assert!(matches!(
+                    poll_once(server.as_mut(), Waker::noop()),
+                    Poll::Ready(Err(Error::OutputDeadline))
+                ));
+            }
+            assert_eq!(handler.cancelled, 1);
+        }
+    }
+
+    struct CompletedHandler {
+        unary: bool,
+        completed: Rc<core::cell::Cell<usize>>,
+        cancelled: Rc<core::cell::Cell<usize>>,
+    }
+
+    impl Handler for CompletedHandler {
+        fn call(&mut self, _: &mut CallContext<'_>, req: &[u8]) -> Option<Result<Vec<u8>, Status>> {
+            assert!(self.unary);
+            self.completed.set(self.completed.get() + 1);
+            Some(Ok(req.to_vec()))
+        }
+        fn method_kind(&self, _: &str) -> Option<MethodKind> {
+            (!self.unary).then_some(MethodKind::ServerStreaming)
+        }
+        fn on_message(&mut self, _: &mut CallContext<'_>, _: &[u8]) -> Result<(), Status> {
+            Ok(())
+        }
+        fn poll_response(
+            &mut self,
+            _: &mut CallContext<'_>,
+            _: &mut Context<'_>,
+        ) -> Poll<Next<Vec<u8>>> {
+            self.completed.set(self.completed.get() + 1);
+            Poll::Ready(Next::Done(Ok(())))
+        }
+        fn on_cancel(&mut self, _: &mut CallContext<'_>) {
+            self.cancelled.set(self.cancelled.get() + 1);
+        }
+    }
+
+    struct CompletedOutputIo {
+        input: ServerIo,
+        completed: Rc<core::cell::Cell<usize>>,
+        written: Rc<RefCell<Vec<u8>>>,
+        activity: Rc<core::cell::Cell<usize>>,
+    }
+    impl ErrorType for CompletedOutputIo {
+        type Error = Infallible;
+    }
+    impl Read for CompletedOutputIo {
+        async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Infallible> {
+            self.activity.set(self.activity.get() + 1);
+            self.input.read(buf).await
+        }
+    }
+    impl Write for CompletedOutputIo {
+        async fn write(&mut self, buf: &[u8]) -> Result<usize, Infallible> {
+            if self.completed.get() > 0 && matches!(self.input.stall, Fault::WritePending) {
+                poll_fn(|_| {
+                    self.activity.set(self.activity.get() + 1);
+                    Poll::<()>::Pending
+                })
+                .await;
+            }
+            self.activity.set(self.activity.get() + 1);
+            self.written.borrow_mut().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        async fn flush(&mut self) -> Result<(), Infallible> {
+            if self.completed.get() > 0 && matches!(self.input.stall, Fault::FlushPending) {
+                poll_fn(|_| {
+                    self.activity.set(self.activity.get() + 1);
+                    Poll::<()>::Pending
+                })
+                .await;
+            }
+            self.activity.set(self.activity.get() + 1);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn completed_server_responses_keep_deadlines_through_write_and_flush() {
+        use core::time::Duration;
+        for unary in [true, false] {
+            for stall in [Fault::WritePending, Fault::FlushPending, Fault::Read] {
+                let mut client = grpc::Client::new(ClientConfig::default());
+                let options = CallOptions::timeout(Duration::from_millis(100));
+                let id = if unary {
+                    client
+                        .start_unary_with("/t.T/Echo", b"request", &options)
+                        .unwrap()
+                } else {
+                    let id = client.start_streaming_with(QUIET, &options).unwrap();
+                    client.send_message(id, b"request").unwrap();
+                    client.close_send(id).unwrap();
+                    id
+                };
+                let completed = Rc::new(core::cell::Cell::new(0));
+                let cancelled = Rc::new(core::cell::Cell::new(0));
+                let written = Rc::new(RefCell::new(Vec::new()));
+                let activity = Rc::new(core::cell::Cell::new(0));
+                let io = CompletedOutputIo {
+                    input: ServerIo {
+                        request: Some(client.take_output()),
+                        input_seen: false,
+                        stall,
+                    },
+                    completed: completed.clone(),
+                    written: written.clone(),
+                    activity: activity.clone(),
+                };
+                let now = Rc::new(core::cell::Cell::new(Duration::ZERO));
+                let mut handler = CompletedHandler {
+                    unary,
+                    completed: completed.clone(),
+                    cancelled: cancelled.clone(),
+                };
+                {
+                    let mut server = pin!(serve_with_timer(
+                        io,
+                        &mut handler,
+                        ServerConfig::default(),
+                        ManualTimer(now.clone())
+                    ));
+                    assert!(poll_once(server.as_mut(), Waker::noop()).is_pending());
+                    assert_eq!(
+                        completed.get(),
+                        1,
+                        "handler must finish before output stalls"
+                    );
+                    if !matches!(stall, Fault::WritePending) {
+                        client.recv(&written.borrow()).unwrap();
+                        if unary {
+                            assert_eq!(
+                                client.take_response(id).unwrap().unwrap().message,
+                                b"request"
+                            );
+                        } else {
+                            assert!(matches!(client.try_next(id), Some(Next::Done(Ok(())))));
+                        }
+                    }
+                    let count = activity.get();
+                    now.set(Duration::from_millis(100));
+                    let result = poll_once(server.as_mut(), Waker::noop());
+                    if matches!(stall, Fault::Read) {
+                        // A successful flush must acknowledge completion and
+                        // disarm the deadline before the next pending read.
+                        assert!(result.is_pending());
+                    } else {
+                        assert!(matches!(result, Poll::Ready(Err(Error::OutputDeadline))));
+                        assert_eq!(
+                            activity.get(),
+                            count,
+                            "expired output must not be polled again"
+                        );
+                    }
+                }
+                assert_eq!(completed.get(), 1);
+                assert_eq!(
+                    cancelled.get(),
+                    0,
+                    "finished handlers must not be cancelled again"
+                );
+            }
+        }
+    }
+
+    struct LateInput {
+        server: grpc::Server,
+        now: ManualTimer,
+    }
+    impl ErrorType for LateInput {
+        type Error = Infallible;
+    }
+    impl Write for LateInput {
+        async fn write(&mut self, buf: &[u8]) -> Result<usize, Infallible> {
+            self.server
+                .recv(
+                    buf,
+                    &mut grpc::FnHandler(|_: &str, req: &[u8]| Some(Ok(req.to_vec()))),
+                )
+                .unwrap();
+            Ok(buf.len())
+        }
+        async fn flush(&mut self) -> Result<(), Infallible> {
+            Ok(())
+        }
+    }
+    impl Read for LateInput {
+        async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Infallible> {
+            self.now.0.set(core::time::Duration::from_millis(101));
+            let n = self.server.pending_output().len();
+            buf[..n].copy_from_slice(self.server.pending_output());
+            self.server.consume_output(n);
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn fresh_clock_rejects_a_late_ready_response() {
+        use core::time::Duration;
+        let timer = ManualTimer(Rc::new(core::cell::Cell::new(Duration::ZERO)));
+        let io = LateInput {
+            server: grpc::Server::new(ServerConfig::default()),
+            now: timer.clone(),
+        };
+        let mut client = Client::with_timer(io, ClientConfig::default(), timer);
+        let status = run(client.unary_with(
+            "/t.T/Echo",
+            b"x",
+            CallOptions::timeout(Duration::from_millis(100)),
+        ))
+        .unwrap_err();
+        assert_eq!(status.code, grpc::Code::DeadlineExceeded);
+    }
+
+    #[test]
+    fn retirement_keeps_buffered_messages_before_terminal_status() {
+        let peer = Peer::new();
+        peer.borrow_mut().script.open = true;
+        let client = client(&peer);
+        let mut call = client.streaming(GATE).unwrap();
+        run(call.send(b"x")).unwrap();
+        let bytes: Vec<u8> = peer.borrow_mut().rx.drain(..).collect();
+        client.shared.with(|s| s.inner.recv(&bytes).unwrap());
+        client.fail_all("scripted transport failure");
+        assert_eq!(run(call.message()).unwrap().unwrap(), b"open");
+        assert_eq!(
+            run(call.message()).unwrap_err().code,
+            grpc::Code::Unavailable
+        );
+        assert_eq!(
+            run(call.message()).unwrap_err().code,
+            grpc::Code::Unavailable
+        );
+    }
+
+    #[test]
+    fn earlier_deadline_rearms_pending_output() {
+        use core::time::Duration;
+        let (io, _) = fault_io(Fault::FlushPending);
+        let now = Rc::new(core::cell::Cell::new(Duration::ZERO));
+        let client = Client::with_timer(io, ClientConfig::default(), ManualTimer(now.clone()));
+        let mut first = client
+            .streaming_with(QUIET, CallOptions::timeout(Duration::from_secs(10)))
+            .unwrap();
+        let (wake, wakes) = Wakes::waker();
+        let mut pending = pin!(first.message());
+        assert!(poll_once(pending.as_mut(), &wake).is_pending());
+        let mut earlier = client
+            .streaming_with(QUIET, CallOptions::timeout(Duration::from_millis(100)))
+            .unwrap();
+        assert_eq!(wakes.count(), 1, "new deadline wakes the output holder");
+        assert!(poll_once(pending.as_mut(), &wake).is_pending());
+        now.set(Duration::from_millis(100));
+        let Poll::Ready(Err(status)) = poll_once(pending.as_mut(), &wake) else {
+            panic!("connection not retired");
+        };
+        assert_eq!(status.code, grpc::Code::Unavailable);
+        assert_eq!(
+            run(earlier.message()).unwrap_err().code,
+            grpc::Code::DeadlineExceeded
+        );
+    }
+
+    struct ReadyAfterDeadline {
+        timer: ManualTimer,
+        late_polls: Rc<core::cell::Cell<usize>>,
+        cancellations: Rc<core::cell::Cell<usize>>,
+    }
+    impl Handler for ReadyAfterDeadline {
+        fn call(&mut self, _: &mut CallContext<'_>, _: &[u8]) -> Option<Result<Vec<u8>, Status>> {
+            None
+        }
+        fn method_kind(&self, _: &str) -> Option<MethodKind> {
+            Some(MethodKind::BidiStreaming)
+        }
+        fn on_message(&mut self, _: &mut CallContext<'_>, _: &[u8]) -> Result<(), Status> {
+            Ok(())
+        }
+        fn poll_response(
+            &mut self,
+            _: &mut CallContext<'_>,
+            _: &mut Context<'_>,
+        ) -> Poll<Next<Vec<u8>>> {
+            if self.timer.0.get() > core::time::Duration::from_millis(100) {
+                self.late_polls.set(self.late_polls.get() + 1);
+                Poll::Ready(Next::Done(Ok(())))
+            } else {
+                Poll::Pending
+            }
+        }
+        fn on_cancel(&mut self, _: &mut CallContext<'_>) {
+            self.cancellations.set(self.cancellations.get() + 1);
+        }
+    }
+
+    #[test]
+    fn server_expires_before_polling_a_newly_ready_handler() {
+        use core::time::Duration;
+        let timer = ManualTimer(Rc::new(core::cell::Cell::new(Duration::ZERO)));
+        let late_polls = Rc::new(core::cell::Cell::new(0));
+        let cancellations = Rc::new(core::cell::Cell::new(0));
+        let mut handler = ReadyAfterDeadline {
+            timer: timer.clone(),
+            late_polls: late_polls.clone(),
+            cancellations: cancellations.clone(),
+        };
+        {
+            let mut server = pin!(serve_with_timer(
+                server_io(Fault::Read, Some(Duration::from_millis(100))),
+                &mut handler,
+                ServerConfig::default(),
+                timer.clone()
+            ));
+            assert!(poll_once(server.as_mut(), Waker::noop()).is_pending());
+            timer.0.set(Duration::from_millis(101));
+            assert!(poll_once(server.as_mut(), Waker::noop()).is_pending());
+            assert_eq!(cancellations.get(), 1);
+            assert_eq!(late_polls.get(), 0);
+        }
+        assert_eq!(cancellations.get(), 1);
     }
 }

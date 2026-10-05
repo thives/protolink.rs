@@ -1,0 +1,30 @@
+[package]
+name = "protolink-grpc-gen-compile-fixture"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+
+# Deliberately isolated: no parent workspace or runtime dev-dependency features.
+[workspace]
+
+[dependencies]
+protolink-grpc = { path = "../../../protolink-grpc", default-features = false, features = ["micropb"] }
+micropb = { version = "0.6", default-features = false, features = ["alloc", "encode", "decode"] }
+
+[build-dependencies]
+protolink-grpc-gen = { path = "../.." }
+micropb-gen = "0.6"
+
+[features]
+default = ["server", "async-client", "blocking-client"]
+server = []
+async-client = []
+blocking-client = []
+unsuffixed-packages = []
+reject-new = []
+reject-into-inner = []
+reject-transport-mut = []
+reject-modules-normalized = []
+reject-modules-qualified = []
+reject-modules-short = []

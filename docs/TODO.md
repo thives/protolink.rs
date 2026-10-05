@@ -3,7 +3,7 @@
 Add:
 * reflection?
 * health checks
-* TLS
+* TLS (transport layer - not here)
 * interceptors
 * load balancing
 * opentelemetry metrics

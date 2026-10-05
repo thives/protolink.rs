@@ -45,6 +45,18 @@
 //! that wants the link to ride them out should swallow them, because corrupt
 //! frames are already dropped and retransmitted.
 //!
+//! # Corruption recovery
+//!
+//! The reliable stack gives ARQ one complete decoded COBS frame at a time.
+//! DAT/FIN frames must have exactly the declared length and a valid type and
+//! CRC; ACKs must be exactly one BCH codeword with a valid reconstructed type
+//! and CRC. Invalid frames are discarded in full, including corrupt length
+//! fields: no suffix is retained and no bytes from the next frame are consumed.
+//! Uncorrectable ACKs and lost frames recover through timed retransmission.
+//!
+//! Standalone [`CobsFramed::read`](Read::read) remains a generic byte stream:
+//! it validates COBS structure, not ARQ integrity, and supports partial reads.
+//!
 //! # Memory
 //!
 //! [`CobsFramed`] is about 1.1 KiB. The full [`reliable_with_timer`] stack is
@@ -58,9 +70,12 @@
 pub mod pump;
 pub mod ring;
 
+use core::future::poll_fn;
+use core::task::Poll;
+
 use embedded_io_async::{ErrorKind, ErrorType, Read, Write};
 
-use arq_io_async::embedded_io::EiaLower;
+use arq_io_async::embedded_io::{EiaFramed, ReadFrame};
 use arq_io_async::{Arq, ArqLayer, BchAckCodec, r};
 
 #[cfg(feature = "std")]
@@ -72,9 +87,12 @@ use cobs_io_async::embedded::{
 use cobs_io_async::max_encoding_length;
 
 /// Largest payload carried in one COBS frame. Matches the ARQ frame size.
-pub const MAX_FRAME_PAYLOAD: usize = 256;
+pub const MAX_FRAME_PAYLOAD: usize = arq_io_async::MAX_FRAME;
 const ENCODED_FRAME: usize = max_encoding_length(MAX_FRAME_PAYLOAD) + 2;
 const RX_RAW: usize = 2 * ENCODED_FRAME;
+// Each step scans at most RX_RAW bytes, then consumes one segment or polls
+// one raw read. Bound both garbage processing and always-ready raw reads.
+const RX_WORK_BUDGET: usize = 32;
 
 /// ARQ retransmission window, in frames.
 pub const ARQ_WINDOW: usize = 8;
@@ -115,6 +133,8 @@ impl<E: embedded_io_async::Error> embedded_io_async::Error for LinkError<E> {
 /// Each `write` call (up to [`MAX_FRAME_PAYLOAD`] bytes) becomes one
 /// zero-delimited COBS frame; `read` returns decoded frame payloads. Corrupt
 /// frames are dropped, and the stream resynchronises on the next delimiter.
+/// Receive work yields cooperatively after 32 bounded steps, even when the
+/// raw stream continuously returns empty/malformed frames or oversized garbage.
 ///
 /// All state lives in the struct, so the `read`/`write` futures may be dropped
 /// and re-created at any await point, as ARQ does. If a `write` future is
@@ -125,6 +145,7 @@ pub struct CobsFramed<S> {
     inner: S,
     rx_raw: [u8; RX_RAW],
     rx_len: usize,
+    rx_discarding: bool,
     frame: [u8; MAX_FRAME_PAYLOAD],
     frame_len: usize,
     frame_pos: usize,
@@ -141,6 +162,7 @@ impl<S> CobsFramed<S> {
             inner,
             rx_raw: [0; RX_RAW],
             rx_len: 0,
+            rx_discarding: false,
             frame: [0; MAX_FRAME_PAYLOAD],
             frame_len: 0,
             frame_pos: 0,
@@ -161,20 +183,33 @@ impl<S: ErrorType> ErrorType for CobsFramed<S> {
     type Error = LinkError<S::Error>;
 }
 
-impl<S: Read> Read for CobsFramed<S> {
-    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
+impl<S: Read> CobsFramed<S> {
+    async fn receive_frame(&mut self) -> Result<bool, LinkError<S::Error>> {
+        let mut work = 0;
         loop {
             if self.frame_pos < self.frame_len {
-                let n = buf.len().min(self.frame_len - self.frame_pos);
-                buf[..n].copy_from_slice(&self.frame[self.frame_pos..self.frame_pos + n]);
-                self.frame_pos += n;
-                return Ok(n);
+                return Ok(true);
             }
+            if work == RX_WORK_BUDGET {
+                // Framing state is already in self. Yield once and arrange a
+                // retry even if the always-ready transport never registers a
+                // waker; dropping this future must not drop buffered input.
+                let mut yielded = false;
+                poll_fn(|cx| {
+                    if yielded {
+                        Poll::Ready(())
+                    } else {
+                        yielded = true;
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                })
+                .await;
+                work = 0;
+            }
+            work += 1;
             if let Some(end) = self.rx_raw[..self.rx_len].iter().position(|&b| b == 0) {
-                if end > 0 {
+                if end > 0 && !self.rx_discarding {
                     let mut segment = &self.rx_raw[..=end];
                     // `&[u8]` is a `BufRead`, so the whole segment is decoded in
                     // one batch. Decoding from memory never suspends.
@@ -185,13 +220,16 @@ impl<S: Read> Read for CobsFramed<S> {
                         self.frame_pos = 0;
                     }
                 }
+                self.rx_discarding = false;
                 self.rx_raw.copy_within(end + 1..self.rx_len, 0);
                 self.rx_len -= end + 1;
                 continue;
             }
             if self.rx_len == self.rx_raw.len() {
-                // No delimiter in a full buffer: garbage, drop it.
+                // Discard the whole oversized frame, not just this buffer:
+                // its suffix must not become a new frame before the delimiter.
                 self.rx_len = 0;
+                self.rx_discarding = true;
             }
             let n = self
                 .inner
@@ -199,10 +237,39 @@ impl<S: Read> Read for CobsFramed<S> {
                 .await
                 .map_err(LinkError::Io)?;
             if n == 0 {
-                return Ok(0);
+                return Ok(false);
             }
             self.rx_len += n;
         }
+    }
+}
+
+impl<S: Read> Read for CobsFramed<S> {
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+        if buf.is_empty() || !self.receive_frame().await? {
+            return Ok(0);
+        }
+        let n = buf.len().min(self.frame_len - self.frame_pos);
+        buf[..n].copy_from_slice(&self.frame[self.frame_pos..self.frame_pos + n]);
+        self.frame_pos += n;
+        Ok(n)
+    }
+}
+
+impl<S: Read> ReadFrame for CobsFramed<S> {
+    async fn read_frame(
+        &mut self,
+        buf: &mut [u8; MAX_FRAME_PAYLOAD],
+    ) -> Result<usize, Self::Error> {
+        // Do not expose a suffix if a caller previously used generic Read.
+        self.frame_pos = self.frame_len;
+        if !self.receive_frame().await? {
+            return Ok(0);
+        }
+        let n = self.frame_len;
+        buf[..n].copy_from_slice(&self.frame[..n]);
+        self.frame_pos = n;
+        Ok(n)
     }
 }
 
@@ -261,7 +328,7 @@ pub type ReliableLink<S, Tmr> = Arq<
     ARQ_WINDOW,
     ARQ_ACK_LEN,
     { r::<ARQ_WINDOW>() },
-    EiaLower<CobsFramed<S>>,
+    EiaFramed<CobsFramed<S>>,
     ::crc::Crc<u16>,
     BchAckCodec,
     Tmr,
@@ -272,7 +339,8 @@ pub type ReliableLink<S, Tmr> = Arq<
 pub type StdReliableLink<S> = ReliableLink<S, StdTimer>;
 
 /// Build the reliable link stack (ARQ over COBS) on a raw byte stream, using
-/// `timer` to schedule retransmissions.
+/// `timer` to schedule retransmissions. Receive validation uses complete COBS
+/// boundaries, so even corrupt ARQ length/type fields are discarded safely.
 ///
 /// Uses an ARQ window of [`ARQ_WINDOW`] frames with the default CRC-16 and
 /// error-correcting ACK codec. Needs about 10.5 KiB of RAM (see the
@@ -285,7 +353,7 @@ where
 {
     ArqLayer::<ARQ_WINDOW, _, _>::new()
         .build_with_timer::<ARQ_ACK_LEN, { r::<ARQ_WINDOW>() }, _, _>(
-            EiaLower(CobsFramed::new(raw)),
+            EiaFramed(CobsFramed::new(raw)),
             timer,
         )
 }

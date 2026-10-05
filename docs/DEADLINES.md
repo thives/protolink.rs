@@ -4,8 +4,8 @@ gRPC deadlines are part of the gRPC over HTTP/2 protocol: the client sends the t
 wait as the `grpc-timeout` request header, and the call ends with `DEADLINE_EXCEEDED` (status 4) when it
 runs out. Both sides enforce it: the client stops waiting, and the server stops working on the call.
 
-**Status: done** for unary and all streaming shapes, in the sans-IO cores and in the async, blocking and
-tokio drivers.
+Deadline enforcement is available for unary and all streaming shapes. Its I/O guarantee depends on
+the driver and transport capabilities below; a clock plus read timeouts alone cannot bound output.
 
 ## Clock model
 
@@ -27,6 +27,7 @@ The drivers turn this into traits in `protolink`:
 | `NoTimer` | `now()` is always zero, `sleep_until` never completes | the default; no enforcement |
 | `tokio::TokioTimer` | tokio's clock (follows `tokio::time::pause`) | `protolink::tokio::{client, serve}` |
 | `blocking::ReadTimeout` | `set_read_timeout(Option<Duration>)` | blocking drivers, to bound a read |
+| `blocking::OutputTimeout` | write and flush timeout hooks | opt-in blocking whole-call I/O bounds |
 
 `protolink::Timer` is unrelated to `protolink::link::Timer` (`arq_io_async::Timer`, the ARQ
 retransmission timer). A target usually implements both on top of its platform timer.
@@ -44,10 +45,16 @@ retransmission timer). A target usually implements both on top of its platform t
 - **Zero timeout.** Fails locally with `DEADLINE_EXCEEDED` without sending anything.
 - **Client expiry.** The call fails with `DEADLINE_EXCEEDED` and the stream is reset with
   `RST_STREAM(CANCEL)`. Messages that were already received are delivered before the status. A late
-  response is ignored.
-- **Server expiry.** The call ends with a trailers-only (or trailing) `DEADLINE_EXCEEDED` response.
-  Streaming handlers get `Handler::on_cancel`, exactly once. A call that has already expired when its
-  request completes never reaches the handler.
+  response is ignored. If expiry interrupts an async write or flush, the entire connection is retired:
+  expired calls retain `DEADLINE_EXCEEDED`, other pending calls receive `UNAVAILABLE`, and no further
+  transport I/O is attempted. Already buffered messages remain available. This avoids reusing a
+  connection after cancelling output with an indeterminate wire state.
+- **Server expiry.** Streaming handlers get `Handler::on_cancel`, exactly once. Flow-control-blocked
+  response DATA is discarded with an immediate reset. Otherwise the server creates trailers-only (or
+  trailing) `DEADLINE_EXCEEDED` output. These newly generated error trailers are best-effort: their
+  delivery is not raced against the already-expired call deadline. A call that has already expired
+  when its request completes never reaches the handler. Previously completed success responses keep
+  their deadline until transport flush acknowledgment; expiry during their output retires the connection.
 - **Malformed header.** A malformed `grpc-timeout` is answered with `INVALID_ARGUMENT`. `0n` is accepted
   and means already expired.
 - **Handlers.** Every `Handler` method gets a `CallContext` (with `path`, `id` and `deadline`). `deadline` is on the
@@ -57,25 +64,41 @@ retransmission timer). A target usually implements both on top of its platform t
 
 | Driver | Enforce with | Notes |
 |---|---|---|
-| sans-IO | call `tick(now)` and wake at `next_deadline()` | |
+| sans-IO | call `tick(now)` and wake at `next_deadline()` | server drivers call `output_flushed()` only after successful flush |
 | async client | `Client::with_timer(io, config, timer)` | `Client::new` has no timer |
 | async server | `serve_with_timer(io, handler, config, timer)` | `serve` has no timer |
 | tokio | `protolink::tokio::{client, serve}` | use a `TokioTimer` |
-| blocking client | `blocking::Client::with_clock(io, config, clock)` | `io: ReadTimeout` |
-| blocking server | `blocking::serve_with_clock`, `serve_wakeable_with_clock` | `io: ReadTimeout`, or `WakeableRead::read_or_wake_timeout` |
+| blocking client, read-bounded | `blocking::Client::with_clock(io, config, clock)` | `io: ReadTimeout`; output can stall indefinitely |
+| blocking server, read-bounded | `blocking::serve_with_clock`, `serve_wakeable_with_clock` | read timeout hook; output can stall indefinitely |
+| blocking client, I/O-bounded | `blocking::Client::with_io_timeouts(io, config, clock)` | `io: ReadTimeout + OutputTimeout` |
+| blocking server, I/O-bounded | `blocking::serve_with_io_timeouts(io, handler, config, clock)` | `io: ReadTimeout + OutputTimeout` |
 
-The async drivers race the transport `read` against `timer.sleep_until(next_deadline())`. When the
-timer wins, the read is dropped and the loop ticks. A call that is started later with an earlier
-deadline wakes the reader through the same mechanism that lets another call write.
+The async drivers race transport reads, writes **and flushes** against
+`timer.sleep_until(next_deadline())`. When a read timer wins, the read is dropped and the loop ticks.
+When an output timer wins, the connection is retired rather than reusing a potentially non-cancel-safe
+write/flush. The server returns `Error::OutputDeadline` and cancels active handlers. Dropping the
+serving future (including Tokio task abortion) also cancels active handlers exactly once. Dropping a
+client operation during pending output retires that client too. A later call with an earlier deadline
+wakes the I/O holder so it can re-evaluate the timer.
+
+Drivers sample clocks immediately before input processing and handler polling. Blocking drivers
+refresh time after output and before calculating the next read budget; a response arriving at or after
+expiry cannot complete successfully using a stale sample. `TokioTimer` uses bounded, re-evaluated
+sleeps, so even `Duration::MAX` does not overflow an `Instant` or Tokio's timer horizon.
 
 The blocking drivers set the transport's read timeout to the time left until the earliest deadline
 before each read, and treat the resulting `ErrorKind::TimedOut` as an idle tick when a clock is in use.
+The opt-in I/O-bounded variants additionally set a fresh timeout before **each write and flush**.
+`OutputTimeout` implementations must actually bound the operation, including buffering and ACK waits;
+`Some(Duration::ZERO)` must not block, and `None` removes the bound. Output errors retire the
+connection, with expiry applied before transport-failure statuses. All clients permanently latch
+transport/protocol failures and reject new calls without replaying queued output.
 
 ## Limitations
 
 - **A running unary handler can't be preempted.** `Handler::call` is synchronous and the server's clock
-  only moves between calls to `tick`, so a handler that overruns its deadline still has its response
-  sent. A client with its own deadline has given up by then. A handler that does long work should check
+  only moves between calls to `tick`. Timer-equipped drivers refresh time before subsequent output,
+  but cannot stop work while the handler runs. A handler that does long work should check
   `ctx.remaining(now)` itself and return `DEADLINE_EXCEEDED` early.
 - **Waiting for a deadline drops a pending read.** With a timer, the transport `read` must be cancel-safe
   even for a unary-only server or a client with one call (see "Known limitations" in
@@ -86,6 +109,11 @@ before each read, and treat the resulting `ErrorKind::TimedOut` as an idle tick 
 - **Blocking reads need a timeout hook.** Without `ReadTimeout` (or `read_or_wake_timeout`) a blocking
   driver only notices a deadline when a read returns. `std` sockets report timeouts as `WouldBlock`,
   which `embedded_io` maps to `ErrorKind::Other`: map it to `TimedOut` in the adapter.
+- **Blocking output requires separate capabilities.** `with_clock`, `serve_with_clock`, and
+  `serve_wakeable_with_clock` only bound reads. Writes and flushes can postpone expiry indefinitely,
+  notably an ARQ flush waiting for acknowledgments. Use the I/O-bounded variants and implement both
+  `OutputTimeout` hooks for a whole-call I/O bound. A transport that cannot bound flush must not claim
+  this capability. Synchronous handler execution and scheduler starvation remain outside the bound.
 - **No propagation.** A server doesn't forward `ctx.deadline` automatically; the handler decides.
 
 ## Tests
@@ -95,7 +123,9 @@ before each read, and treat the resulting `ErrorKind::TimedOut` as an idle tick 
 | `timeout` parse/format | `protolink-grpc/src/timeout.rs` |
 | Sans-IO client, server, handler context | `protolink-grpc/src/tests_deadline.rs` |
 | Async drivers, paused tokio clock | `protolink/tests/deadline.rs` |
-| Blocking drivers | `protolink/tests/blocking_deadline.rs` |
+| Blocking drivers | `protolink/tests/blocking_deadline.rs`, `blocking_driver_regressions.rs` |
+| Cancellation, terminal failures, waiter lifecycle, output races (`std` and `no_std`) | `protolink/src/asynch.rs` unit tests |
+| Timer boundaries and Tokio task abortion | `protolink/tests/deadline.rs` |
 | `h2` interop (wire format, malformed values, `RST_STREAM(CANCEL)`) | `protolink/tests/h2_interop.rs`, module `deadlines` |
 | Generated clients | `protolink-grpc-gen` unit tests, `examples/embedded-device/tests/e2e.rs` |
 | `grpcurl -max-time` | CI job `grpcurl-interop` |

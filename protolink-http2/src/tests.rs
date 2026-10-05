@@ -4,6 +4,11 @@ use super::*;
 use alloc::string::String;
 use alloc::vec;
 
+#[path = "regressions.rs"]
+mod regressions;
+#[path = "review_regressions.rs"]
+mod review_regressions;
+
 fn hf(name: &str, value: &str) -> HeaderField {
     HeaderField {
         name: name.into(),

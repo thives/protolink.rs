@@ -379,7 +379,7 @@ fn reserved_codec_names_are_rejected() {
 fn frame_compresses_only_when_worthwhile() {
     // Compressible: flag set, shorter, and the prefix counts compressed bytes.
     let data = vec![7; 100];
-    let framed = lpm::frame(&data, Some(&RLE), 8);
+    let framed = lpm::frame(&data, Some(&RLE), 8).unwrap();
     assert_eq!(framed[0], 1);
     assert!(framed.len() < data.len());
     let len = u32::from_be_bytes([framed[1], framed[2], framed[3], framed[4]]) as usize;
@@ -418,7 +418,7 @@ fn decoder_handles_every_split_point_with_compressed_messages() {
     ];
     let bytes: Vec<u8> = messages
         .iter()
-        .flat_map(|m| lpm::frame(m, Some(&RLE), 8))
+        .flat_map(|m| lpm::frame(m, Some(&RLE), 8).unwrap())
         .collect();
     assert!(bytes.len() < messages.iter().map(Vec::len).sum::<usize>());
     for split in 0..=bytes.len() {
@@ -436,8 +436,8 @@ fn decoder_handles_every_split_point_with_compressed_messages() {
 #[test]
 fn decoder_reports_wire_length_for_flow_control() {
     let data = vec![9; 1000];
-    let framed = lpm::frame(&data, Some(&RLE), 0);
-    let plain = lpm::encode(b"hello");
+    let framed = lpm::frame(&data, Some(&RLE), 0).unwrap();
+    let plain = lpm::encode(b"hello").unwrap();
     let mut d = decoder(4096, Some(&RLE));
     d.push(&framed);
     d.push(&plain);
@@ -448,7 +448,7 @@ fn decoder_reports_wire_length_for_flow_control() {
 
 #[test]
 fn compressed_messages_stay_compressed_until_taken() {
-    let framed = lpm::frame(&[5; 4000], Some(&RLE), 0);
+    let framed = lpm::frame(&[5; 4000], Some(&RLE), 0).unwrap();
     let mut d = decoder(4096, Some(&RLE));
     for _ in 0..50 {
         d.push(&framed);
@@ -459,7 +459,7 @@ fn compressed_messages_stay_compressed_until_taken() {
 
 #[test]
 fn decoder_rejects_compressed_message_without_codec() {
-    let framed = lpm::frame(&[5; 100], Some(&RLE), 0);
+    let framed = lpm::frame(&[5; 100], Some(&RLE), 0).unwrap();
     let mut d = decoder(1024, None);
     d.push(&framed);
     assert_eq!(d.next().unwrap().unwrap_err().code, Code::Internal);
@@ -469,13 +469,13 @@ fn decoder_rejects_compressed_message_without_codec() {
 #[test]
 fn decompression_bomb_is_resource_exhausted() {
     // 10 000 bytes in about 80 bytes of input, for a 100-byte limit.
-    let bomb = lpm::frame(&[0; 10_000], Some(&RLE), 0);
+    let bomb = lpm::frame(&[0; 10_000], Some(&RLE), 0).unwrap();
     assert!(bomb.len() < lpm::wire_limit(100));
     for codec in [&RLE, &RLE_NO_LIMIT] {
         let mut d = decoder(100, Some(codec));
-        d.push(&lpm::frame(&[1; 50], Some(codec), 0));
+        d.push(&lpm::frame(&[1; 50], Some(codec), 0).unwrap());
         d.push(&bomb);
-        d.push(&lpm::encode(b"after"));
+        d.push(&lpm::encode(b"after").unwrap());
         // Whatever precedes the bomb is delivered; nothing follows it.
         assert_eq!(d.next(), Some(Ok(vec![1; 50])));
         assert_eq!(d.next().unwrap().unwrap_err().code, Code::ResourceExhausted);
@@ -516,13 +516,13 @@ fn oversized_compressed_prefix_is_rejected_before_the_payload() {
 
 #[test]
 fn decode_unary_handles_compressed_and_malformed_bodies() {
-    let framed = lpm::frame(&[8; 200], Some(&RLE), 0);
+    let framed = lpm::frame(&[8; 200], Some(&RLE), 0).unwrap();
     assert_eq!(
         lpm::decode_unary(&framed, 1024, Some(&RLE)),
         Ok(vec![8; 200])
     );
     assert_eq!(
-        lpm::decode_unary(&lpm::encode(b"x"), 1024, None),
+        lpm::decode_unary(&lpm::encode(b"x").unwrap(), 1024, None),
         Ok(b"x".to_vec())
     );
     let code = |body: &[u8], codec| lpm::decode_unary(body, 1024, codec).unwrap_err().code;
@@ -536,9 +536,13 @@ fn decode_unary_handles_compressed_and_malformed_bodies() {
     let two = [framed.clone(), framed].concat();
     assert_eq!(code(&two, Some(&RLE)), Code::Internal);
     assert_eq!(
-        lpm::decode_unary(&lpm::frame(&[8; 200], Some(&RLE), 0), 100, Some(&RLE))
-            .unwrap_err()
-            .code,
+        lpm::decode_unary(
+            &lpm::frame(&[8; 200], Some(&RLE), 0).unwrap(),
+            100,
+            Some(&RLE)
+        )
+        .unwrap_err()
+        .code,
         Code::ResourceExhausted
     );
 }
@@ -869,7 +873,7 @@ fn client_failures_are_reported_per_call() {
             _ => None,
         })
         .unwrap();
-    let reply = lpm::frame(&[1; 100], Some(&RLE), 0);
+    let reply = lpm::frame(&[1; 100], Some(&RLE), 0).unwrap();
     server
         .send_headers(
             stream,
@@ -962,7 +966,7 @@ fn unsupported_request_encoding_lists_what_is_accepted() {
     let ev = raw_call(
         rle(),
         request("/t.T/Echo", &[("grpc-encoding", "gzip")]),
-        &lpm::encode(b"x"),
+        &lpm::encode(b"x").unwrap(),
     );
     let Event::Headers {
         headers,
@@ -980,7 +984,7 @@ fn unsupported_request_encoding_lists_what_is_accepted() {
     let ev = raw_call(
         Compression::NONE,
         request("/t.T/Echo", &[("grpc-encoding", "rle")]),
-        &lpm::encode(b"x"),
+        &lpm::encode(b"x").unwrap(),
     );
     let Event::Headers { headers, .. } = &ev[0] else {
         panic!("{ev:?}");
@@ -999,10 +1003,10 @@ fn identity_and_uncompressed_messages_are_always_accepted() {
             let ev = raw_call(
                 server,
                 request("/t.T/Echo", &[("grpc-encoding", encoding)]),
-                &lpm::encode(b"plain"),
+                &lpm::encode(b"plain").unwrap(),
             );
             assert_eq!(final_status(&ev), Some("0"), "{encoding}: {ev:?}");
-            assert_eq!(response_data(&ev), lpm::encode(b"plain"));
+            assert_eq!(response_data(&ev), lpm::encode(b"plain").unwrap());
         }
     }
 }
@@ -1019,7 +1023,7 @@ fn compressed_request_gets_a_compressed_response() {
                 ("grpc-accept-encoding", "gzip, rle"),
             ],
         ),
-        &lpm::frame(&data, Some(&RLE), 8),
+        &lpm::frame(&data, Some(&RLE), 8).unwrap(),
     );
     let Event::Headers { headers, .. } = &ev[0] else {
         panic!("{ev:?}");
@@ -1042,19 +1046,19 @@ fn response_stays_plain_when_the_client_does_not_accept_the_encoding() {
         let ev = raw_call(
             rle(),
             request("/t.T/Echo", &extra),
-            &lpm::frame(&[3; 500], Some(&RLE), 8),
+            &lpm::frame(&[3; 500], Some(&RLE), 8).unwrap(),
         );
         let Event::Headers { headers, .. } = &ev[0] else {
             panic!("{ev:?}");
         };
         assert_eq!(value(headers, "grpc-encoding"), None, "{accept:?}");
-        assert_eq!(response_data(&ev), lpm::encode(&[3; 500]));
+        assert_eq!(response_data(&ev), lpm::encode(&[3; 500]).unwrap());
     }
 }
 
 #[test]
 fn compressed_flag_needs_an_encoding() {
-    let flagged = lpm::frame(&[3; 100], Some(&RLE), 0);
+    let flagged = lpm::frame(&[3; 100], Some(&RLE), 0).unwrap();
     assert_eq!(flagged[0], 1);
     for extra in [&[][..], &[("grpc-encoding", "identity")]] {
         let ev = raw_call(rle(), request("/t.T/Echo", extra), &flagged);
@@ -1072,7 +1076,7 @@ fn bad_compressed_requests_fail_the_call() {
     let ev = raw_call(
         rle(),
         request("/t.T/Echo", &encoding),
-        &lpm::frame(&[0; 100_000], Some(&RLE), 0),
+        &lpm::frame(&[0; 100_000], Some(&RLE), 0).unwrap(),
     );
     assert_eq!(final_status(&ev), Some("8"), "{ev:?}");
     // A codec that ignores the limit is stopped all the same.
@@ -1080,7 +1084,7 @@ fn bad_compressed_requests_fail_the_call() {
     let ev = raw_call(
         Compression::new(&ACCEPT_BROKEN),
         request("/t.T/Echo", &encoding),
-        &lpm::frame(&[0; 100_000], Some(&RLE_NO_LIMIT), 0),
+        &lpm::frame(&[0; 100_000], Some(&RLE_NO_LIMIT), 0).unwrap(),
     );
     assert_eq!(final_status(&ev), Some("8"), "{ev:?}");
 }
@@ -1096,7 +1100,7 @@ fn broken_compressed_stream_message_cancels_the_streaming_call() {
     let id = conn
         .open_stream(request("/t.T/Stream", &[("grpc-encoding", "rle")]), false)
         .unwrap();
-    let mut body = lpm::frame(&[4; 100], Some(&RLE), 0);
+    let mut body = lpm::frame(&[4; 100], Some(&RLE), 0).unwrap();
     body.extend_from_slice(&[1, 0, 0, 0, 1, 9]);
     conn.send_data(id, body, false).unwrap();
     let cx = &mut Context::from_waker(Waker::noop());
@@ -1205,6 +1209,70 @@ mod miniz {
             decompress(&GZIP, b"not gzip at all", 4096),
             Err(CodecError::Corrupt)
         );
+    }
+
+    #[test]
+    fn gzip_rejects_suffixes_and_concatenated_identical_members() {
+        for data in [Vec::new(), text(1000)] {
+            let good = compress(&GZIP, &data);
+            let mut suffix = good.clone();
+            suffix.splice(good.len() - 8..good.len() - 8, [0, 1, 2, 3]);
+            let concatenated = [good.clone(), good].concat();
+            for bad in [suffix, concatenated] {
+                assert_eq!(
+                    decompress(&GZIP, &bad, data.len()),
+                    Err(CodecError::Corrupt)
+                );
+                let mut framed = vec![1];
+                framed.extend_from_slice(&u32::try_from(bad.len()).unwrap().to_be_bytes());
+                framed.extend_from_slice(&bad);
+                let mut decoder = decoder(4096, Some(&GZIP));
+                decoder.push(&framed);
+                decoder.push(&lpm::encode(b"after").unwrap());
+                assert_eq!(decoder.next().unwrap().unwrap_err().code, Code::Internal);
+                assert_eq!(decoder.message_count(), 0);
+                assert_eq!(decoder.buffered(), 0);
+                let events = raw_call(
+                    Compression::gzip(),
+                    request("/t.T/Echo", &[("grpc-encoding", "gzip")]),
+                    &framed,
+                );
+                assert_eq!(final_status(&events), Some("13"), "{events:?}");
+                assert!(
+                    response_data(&events).is_empty(),
+                    "truncated message delivered"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gzip_empty_exact_limit_and_truncated_deflate() {
+        for level in [0, 1, 6, 10] {
+            let codec = Gzip::new(crate::compression::MinizOxide::new(level));
+            for size in [0, 1, 2, 31, 32, 33, 1000, 4096] {
+                let data = text(size);
+                let packed = compress(&codec, &data);
+                let mut out = b"prefix".to_vec();
+                codec.decompress(&packed, &mut out, size).unwrap();
+                assert_eq!(&out[..6], b"prefix");
+                assert_eq!(&out[6..], data);
+                if size > 0 {
+                    assert_eq!(
+                        decompress(&codec, &packed, size - 1),
+                        Err(CodecError::TooLarge)
+                    );
+                }
+                for body_end in 10..packed.len() - 8 {
+                    let bad = [&packed[..body_end], &packed[packed.len() - 8..]].concat();
+                    assert_eq!(
+                        decompress(&codec, &bad, size),
+                        Err(CodecError::Corrupt),
+                        "{level} {size} {body_end}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

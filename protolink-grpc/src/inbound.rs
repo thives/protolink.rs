@@ -87,10 +87,6 @@ impl Inbound {
         }
     }
 
-    pub(crate) fn has_next(&self) -> bool {
-        self.decoder.has_next()
-    }
-
     pub(crate) fn message_count(&self) -> usize {
         self.decoder.message_count()
     }

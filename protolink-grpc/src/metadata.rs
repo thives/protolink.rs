@@ -9,6 +9,15 @@
 //! (`:`), everything starting with `grpc-`, and `content-type`, `te`, `host`,
 //! `content-length` and the hop-by-hop headers. `user-agent` is not reserved: a
 //! client sends `protolink` unless the call's metadata sets its own.
+//!
+//! Received metadata is limited to 128 expanded entries and 8192 owned bytes
+//! per header/trailer block, independently of the HTTP/2 header-list limit.
+//! Every copied key and decoded binary or ASCII value counts toward the byte
+//! limit; entry storage overhead is separately bounded by the entry limit.
+//! These checks precede key/value allocation, including comma-separated empty
+//! binary values. Strict parsing rejects an over-budget element; lossy parsing
+//! discards it and continues with later elements that fit. Application-created
+//! metadata (`insert`/`insert_bin`) is not subject to these receive-side limits.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -18,6 +27,9 @@ use protolink_http2::HeaderField;
 
 /// Suffix of keys whose values are binary.
 const BIN_SUFFIX: &str = "-bin";
+
+const MAX_RECEIVED_ENTRIES: usize = 128;
+const MAX_RECEIVED_BYTES: usize = 8192;
 
 /// A metadata value.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +55,8 @@ pub enum InvalidMetadata {
     BinarySuffix,
     /// A received `-bin` value is not valid base64.
     Base64,
+    /// Received metadata exceeds 128 expanded entries or 8192 owned key/value bytes.
+    TooLarge,
 }
 
 impl fmt::Display for InvalidMetadata {
@@ -53,6 +67,7 @@ impl fmt::Display for InvalidMetadata {
             Self::Value => "invalid metadata value",
             Self::BinarySuffix => "binary values need a key ending in `-bin`, and only those",
             Self::Base64 => "malformed base64 in a binary metadata value",
+            Self::TooLarge => "received metadata exceeds entry or owned-byte limits",
         })
     }
 }
@@ -64,6 +79,12 @@ impl core::error::Error for InvalidMetadata {}
 /// Keys are lowercase ASCII (`[0-9a-z_.-]`); values are printable ASCII, or
 /// bytes for keys ending in `-bin`. Names reserved for HTTP/2 and gRPC are
 /// refused. A key may repeat, and the order of entries is kept.
+///
+/// Received header/trailer blocks are independently capped at 128 expanded
+/// entries and 8192 owned key/value bytes (including each repeated key copy).
+/// Strict request parsing rejects entries beyond either limit; lossy response
+/// parsing skips over-budget elements while retaining later siblings that fit.
+/// Application-created metadata is not subject to these receive-side limits.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Metadata {
     entries: Vec<(String, MetadataValue)>,
@@ -180,43 +201,88 @@ impl Metadata {
     }
 
     /// The custom metadata among received header `fields`: pseudo-headers and
-    /// reserved names are skipped. Fails on an entry that violates the metadata
-    /// rules.
+    /// reserved names are skipped. Binary fields are split on commas, with
+    /// surrounding spaces and tabs removed from each element. Empty elements
+    /// represent empty binary values. Repeated fields and elements retain
+    /// their wire order. Fails if any entry or element violates the rules.
     pub(crate) fn from_headers(fields: &[HeaderField]) -> Result<Self, InvalidMetadata> {
         let mut md = Self::new();
+        let mut owned_bytes = 0;
         for field in fields {
-            if let Some(entry) = parse_field(field)? {
-                md.entries.push(entry);
-            }
+            parse_field(field, &mut md.entries, &mut owned_bytes, false)?;
         }
         Ok(md)
     }
 
     /// Like [`from_headers`](Self::from_headers), but skips invalid entries.
+    /// For combined binary fields, only malformed elements are skipped;
+    /// valid siblings are retained in order. Elements exceeding the receive-side
+    /// entry or owned-byte limits are also skipped, before key/value allocation.
     pub(crate) fn from_headers_lossy(fields: &[HeaderField]) -> Self {
         let mut md = Self::new();
+        let mut owned_bytes = 0;
         for field in fields {
-            if let Ok(Some(entry)) = parse_field(field) {
-                md.entries.push(entry);
-            }
+            let _ = parse_field(field, &mut md.entries, &mut owned_bytes, true);
         }
         md
     }
 }
 
-fn parse_field(field: &HeaderField) -> Result<Option<(String, MetadataValue)>, InvalidMetadata> {
+fn parse_field(
+    field: &HeaderField,
+    entries: &mut Vec<(String, MetadataValue)>,
+    owned_bytes: &mut usize,
+    lossy: bool,
+) -> Result<(), InvalidMetadata> {
     let key = field.name.as_str();
     if key.starts_with(':') || is_reserved(key) {
-        return Ok(None);
+        return Ok(());
     }
     check_key(key)?;
-    let value = if key.ends_with(BIN_SUFFIX) {
-        MetadataValue::Binary(base64_decode(&field.value).ok_or(InvalidMetadata::Base64)?)
+    if key.ends_with(BIN_SUFFIX) {
+        for element in field.value.split(',') {
+            let element = element.trim_matches([' ', '\t']);
+            let next_bytes = base64_decoded_len(element)
+                .ok_or(InvalidMetadata::Base64)
+                .and_then(|len| received_budget(entries.len(), *owned_bytes, key.len(), len));
+            let next_bytes = match next_bytes {
+                Ok(bytes) => bytes,
+                Err(_) if lossy => continue,
+                Err(error) => return Err(error),
+            };
+            match base64_decode(element) {
+                Some(value) => {
+                    entries.push((key.into(), MetadataValue::Binary(value)));
+                    *owned_bytes = next_bytes;
+                }
+                None if lossy => continue,
+                None => return Err(InvalidMetadata::Base64),
+            }
+        }
     } else {
         check_ascii(&field.value)?;
-        MetadataValue::Ascii(field.value.clone())
-    };
-    Ok(Some((key.into(), value)))
+        let next_bytes =
+            received_budget(entries.len(), *owned_bytes, key.len(), field.value.len())?;
+        entries.push((key.into(), MetadataValue::Ascii(field.value.clone())));
+        *owned_bytes = next_bytes;
+    }
+    Ok(())
+}
+
+fn received_budget(
+    entries: usize,
+    owned_bytes: usize,
+    key_len: usize,
+    value_len: usize,
+) -> Result<usize, InvalidMetadata> {
+    if entries >= MAX_RECEIVED_ENTRIES {
+        return Err(InvalidMetadata::TooLarge);
+    }
+    owned_bytes
+        .checked_add(key_len)
+        .and_then(|bytes| bytes.checked_add(value_len))
+        .filter(|&bytes| bytes <= MAX_RECEIVED_BYTES)
+        .ok_or(InvalidMetadata::TooLarge)
 }
 
 fn is_reserved(key: &str) -> bool {
@@ -274,13 +340,23 @@ fn base64_encode(data: &[u8]) -> String {
     out
 }
 
-/// Standard base64, with or without padding.
-fn base64_decode(s: &str) -> Option<Vec<u8>> {
-    let s = s.trim_end_matches('=');
-    if s.len() % 4 == 1 {
+/// Decoded length from base64's shape, without allocating the decoded value.
+fn base64_decoded_len(s: &str) -> Option<usize> {
+    let unpadded = s.trim_end_matches('=');
+    let padding = s.len() - unpadded.len();
+    if unpadded.len() % 4 == 1
+        || (padding != 0 && (!s.len().is_multiple_of(4) || padding != (4 - unpadded.len() % 4) % 4))
+    {
         return None;
     }
-    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    Some(unpadded.len() / 4 * 3 + unpadded.len() % 4 * 3 / 4)
+}
+
+/// Standard base64, with or without padding.
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    let len = base64_decoded_len(s)?;
+    let s = s.trim_end_matches('=');
+    let mut out = Vec::with_capacity(len);
     let (mut acc, mut bits) = (0u32, 0u32);
     for b in s.bytes() {
         let v = match b {
@@ -299,7 +375,8 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
             acc &= (1 << bits) - 1;
         }
     }
-    Some(out)
+    // Unused bits in the last base64 symbol must be zero.
+    (acc == 0).then_some(out)
 }
 
 #[cfg(test)]
@@ -394,6 +471,190 @@ mod tests {
         assert_eq!(base64_decode("TQ==").as_deref(), Some(&b"M"[..]));
         assert_eq!(base64_decode("T"), None);
         assert_eq!(base64_decode("TW!u"), None);
+    }
+
+    #[test]
+    fn combined_binary_fields_preserve_element_and_field_order() {
+        let fields = vec![
+            hf("trace-bin", " AQ== ,\tAg\t, "),
+            hf("plain", "keep, commas"),
+            hf("trace-bin", "Aw==,, BA"),
+        ];
+        let strict = Metadata::from_headers(&fields).unwrap();
+        assert_eq!(strict, Metadata::from_headers_lossy(&fields));
+        assert_eq!(
+            strict.get_all_bin("trace-bin").collect::<Vec<_>>(),
+            [&[1][..], &[2][..], &[], &[3][..], &[], &[4][..]]
+        );
+        assert_eq!(strict.get("plain"), Some("keep, commas"));
+        assert_eq!(
+            strict.iter().map(|(key, _)| key).collect::<Vec<_>>(),
+            [
+                "trace-bin",
+                "trace-bin",
+                "trace-bin",
+                "plain",
+                "trace-bin",
+                "trace-bin",
+                "trace-bin"
+            ]
+        );
+    }
+
+    #[test]
+    fn combined_binary_fields_handle_malformed_elements_individually() {
+        for bad in [
+            "!", "A", "AQ===", "Ag=", "===", "AB", "A Q", "\nAQ", "\u{a0}AQ",
+        ] {
+            for value in [
+                alloc::format!("{bad},AQ==,Ag"),
+                alloc::format!("AQ==,{bad},Ag"),
+                alloc::format!("AQ==,Ag,{bad}"),
+            ] {
+                let fields = vec![hf("trace-bin", &value), hf("trace-bin", "Aw==")];
+                assert_eq!(
+                    Metadata::from_headers(&fields),
+                    Err(InvalidMetadata::Base64),
+                    "{value:?}"
+                );
+                let lossy = Metadata::from_headers_lossy(&fields);
+                assert_eq!(
+                    lossy.get_all_bin("trace-bin").collect::<Vec<_>>(),
+                    [&[1][..], &[2][..], &[3][..]],
+                    "{value:?}"
+                );
+            }
+        }
+    }
+
+    fn owned_bytes(md: &Metadata) -> usize {
+        md.entries
+            .iter()
+            .map(|(key, value)| {
+                key.capacity()
+                    + match value {
+                        MetadataValue::Ascii(value) => value.capacity(),
+                        MetadataValue::Binary(value) => value.capacity(),
+                    }
+            })
+            .sum()
+    }
+
+    fn assert_receive_bounds(md: &Metadata) {
+        assert!(md.len() <= MAX_RECEIVED_ENTRIES);
+        assert!(md.entries.capacity() <= MAX_RECEIVED_ENTRIES);
+        assert!(owned_bytes(md) <= MAX_RECEIVED_BYTES);
+    }
+
+    #[test]
+    fn long_key_empty_sibling_amplification_is_bounded_before_materialization() {
+        let key = alloc::format!("{}-bin", "a".repeat(3896));
+        let fields = vec![hf(&key, &",".repeat(3900))];
+        assert!(key.len() + fields[0].value.len() + 32 <= 8115);
+        assert_eq!(
+            Metadata::from_headers(&fields),
+            Err(InvalidMetadata::TooLarge)
+        );
+        let lossy = Metadata::from_headers_lossy(&fields);
+        assert_receive_bounds(&lossy);
+        assert_eq!(lossy.len(), MAX_RECEIVED_BYTES / key.len());
+        assert_eq!(owned_bytes(&lossy), 7800);
+        assert!(lossy.get_all_bin(&key).all(<[u8]>::is_empty));
+
+        let valid = vec![hf(&key, "AQ==, Ag")];
+        let strict = Metadata::from_headers(&valid).unwrap();
+        assert_receive_bounds(&strict);
+        assert_eq!(strict, Metadata::from_headers_lossy(&valid));
+        assert_eq!(
+            strict.get_all_bin(&key).collect::<Vec<_>>(),
+            [&[1][..], &[2][..]]
+        );
+    }
+
+    #[test]
+    fn expanded_entry_limit_applies_across_combined_and_repeated_fields() {
+        let exact = vec![hf("k-bin", &",".repeat(MAX_RECEIVED_ENTRIES - 1))];
+        let strict = Metadata::from_headers(&exact).unwrap();
+        assert_eq!(strict.len(), MAX_RECEIVED_ENTRIES);
+        assert_receive_bounds(&strict);
+        assert_eq!(strict, Metadata::from_headers_lossy(&exact));
+
+        for fields in [
+            vec![hf("k-bin", &",".repeat(MAX_RECEIVED_ENTRIES))],
+            vec![hf("k-bin", &",".repeat(64)), hf("k-bin", &",".repeat(64))],
+        ] {
+            assert_eq!(
+                Metadata::from_headers(&fields),
+                Err(InvalidMetadata::TooLarge)
+            );
+            let lossy = Metadata::from_headers_lossy(&fields);
+            assert_receive_bounds(&lossy);
+            assert_eq!(lossy.len(), MAX_RECEIVED_ENTRIES);
+        }
+    }
+
+    #[test]
+    fn owned_byte_limit_counts_keys_ascii_and_decoded_binary_values() {
+        let ascii = vec![hf("k", &"a".repeat(MAX_RECEIVED_BYTES - 1))];
+        let strict = Metadata::from_headers(&ascii).unwrap();
+        assert_eq!(owned_bytes(&strict), MAX_RECEIVED_BYTES);
+        assert_receive_bounds(&strict);
+        assert_eq!(strict, Metadata::from_headers_lossy(&ascii));
+
+        let binary = vec![hf(
+            "k-bin",
+            &base64_encode(&vec![0; MAX_RECEIVED_BYTES - 5]),
+        )];
+        let strict = Metadata::from_headers(&binary).unwrap();
+        assert_eq!(owned_bytes(&strict), MAX_RECEIVED_BYTES);
+        assert_receive_bounds(&strict);
+        assert_eq!(strict, Metadata::from_headers_lossy(&binary));
+
+        for fields in [
+            vec![hf("k", &"a".repeat(MAX_RECEIVED_BYTES)), hf("ok", "v")],
+            vec![
+                hf("k-bin", &base64_encode(&vec![0; MAX_RECEIVED_BYTES - 4])),
+                hf("ok", "v"),
+            ],
+            vec![hf(&"a".repeat(MAX_RECEIVED_BYTES + 1), ""), hf("ok", "v")],
+        ] {
+            assert_eq!(
+                Metadata::from_headers(&fields),
+                Err(InvalidMetadata::TooLarge)
+            );
+            let lossy = Metadata::from_headers_lossy(&fields);
+            assert_receive_bounds(&lossy);
+            assert_eq!(lossy.len(), 1);
+            assert_eq!(lossy.get("ok"), Some("v"));
+        }
+        assert_eq!(
+            received_budget(0, 0, usize::MAX, 1),
+            Err(InvalidMetadata::TooLarge)
+        );
+        assert_eq!(
+            received_budget(0, usize::MAX, 1, 0),
+            Err(InvalidMetadata::TooLarge)
+        );
+    }
+
+    #[test]
+    fn lossy_byte_budget_skips_large_elements_but_keeps_smaller_later_siblings() {
+        let large = base64_encode(&[0; 20]);
+        let fields = vec![
+            hf("k", &"a".repeat(MAX_RECEIVED_BYTES - 13)),
+            hf("k-bin", &alloc::format!("{large},AB,AQ==,,Ag")),
+        ];
+        assert_eq!(
+            Metadata::from_headers(&fields),
+            Err(InvalidMetadata::TooLarge)
+        );
+        let lossy = Metadata::from_headers_lossy(&fields);
+        assert_receive_bounds(&lossy);
+        assert_eq!(
+            lossy.get_all_bin("k-bin").collect::<Vec<_>>(),
+            [&[1][..], &[]]
+        );
+        assert_eq!(owned_bytes(&lossy), MAX_RECEIVED_BYTES - 1);
     }
 
     #[test]

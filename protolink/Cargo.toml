@@ -16,7 +16,7 @@ protolink-grpc = { version = "0", path = "../protolink-grpc" }
 embedded-io-async = { version = "0.7", optional = true }
 embedded-io = { version = "0.7", optional = true }
 cobs-io-async = { version = "0.0.3", default-features = false, features = ["embedded-io"], optional = true }
-arq-io-async = { version = "0.0.2", default-features = false, features = ["embedded-io"], optional = true }
+arq-io-async = { version = "0.0.2", path = "../vendor/arq-io-async", default-features = false, features = ["embedded-io"], optional = true }
 crc = { version = "3.4", optional = true }
 atomic-waker = { version = "1.1", optional = true }
 futures-util = { version = "0.3", optional = true, default-features = false }

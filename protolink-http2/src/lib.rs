@@ -51,7 +51,13 @@ use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;
 use core::fmt;
 
-use zerodds_hpack::{Decoder, Encoder};
+mod headers;
+mod hpack;
+mod huffman;
+
+use headers::Phase;
+use hpack::Decoder;
+use zerodds_hpack::Encoder;
 use zerodds_http2::flow::{decode_window_update, encode_window_update};
 use zerodds_http2::settings::{decode_settings, encode_settings};
 use zerodds_http2::stream::{StreamEvent, is_client_initiated, is_server_initiated, transition};
@@ -94,7 +100,8 @@ pub enum FlowControl {
     ///
     /// Padding, DATA on closed or reset streams and DATA discarded by
     /// [`Connection::reset_stream_after_flush`] are released automatically, as
-    /// is any capacity still held by a stream when it closes or is reset.
+    /// is capacity still held when a stream closes or resets, unless opted into
+    /// [`Connection::retain_receive_capacity`].
     Manual,
 }
 
@@ -105,7 +112,8 @@ pub struct Config {
     pub max_concurrent_streams: u32,
     /// `SETTINGS_INITIAL_WINDOW_SIZE` for our receive windows.
     pub initial_window_size: u32,
-    /// `SETTINGS_MAX_HEADER_LIST_SIZE`. Larger header lists reset the stream.
+    /// `SETTINGS_MAX_HEADER_LIST_SIZE`. Larger decoded lists terminate the
+    /// connection before materializing fields beyond this limit.
     pub max_header_list_size: u32,
     /// Connection-level receive window. HTTP/2 starts every connection at
     /// 65 535 bytes; larger values are announced with a WINDOW_UPDATE right
@@ -187,6 +195,12 @@ pub enum Error {
     WrongRole,
     /// The connection is shutting down; no new streams can be opened.
     GoingAway,
+    /// Retryable: the peer's concurrent-stream limit is currently reached.
+    StreamLimit,
+    /// All locally initiated 31-bit stream IDs have been used.
+    StreamIdExhausted,
+    /// Invalid outbound HTTP message ordering or field section.
+    InvalidHeaders(&'static str),
 }
 
 impl fmt::Display for Error {
@@ -197,6 +211,9 @@ impl fmt::Display for Error {
             Self::StreamClosed(id) => write!(f, "stream {id} is closed for sending"),
             Self::WrongRole => f.write_str("operation not supported for this role"),
             Self::GoingAway => f.write_str("connection is going away"),
+            Self::StreamLimit => f.write_str("peer concurrent stream limit reached"),
+            Self::StreamIdExhausted => f.write_str("stream IDs exhausted"),
+            Self::InvalidHeaders(reason) => write!(f, "invalid HTTP message: {reason}"),
         }
     }
 }
@@ -221,7 +238,13 @@ struct Stream {
     state: StreamState,
     send_window: i64,
     outbound: VecDeque<Outbound>,
-    /// Our receive window as the peer sees it ([`FlowControl::Manual`] only).
+    send_phase: Phase,
+    recv_phase: Phase,
+    send_body: headers::Body,
+    recv_body: headers::Body,
+    request_kind: headers::RequestKind,
+    retain_credit: bool,
+    /// Our receive window as the peer sees it.
     recv_window: i64,
     /// Bytes delivered in [`Event::Data`] but not yet released
     /// ([`FlowControl::Manual`] only).
@@ -237,8 +260,57 @@ impl Stream {
             send_window,
             outbound: VecDeque::new(),
             recv_window,
+            send_phase: Phase::Initial,
+            recv_phase: Phase::Initial,
+            send_body: headers::Body::default(),
+            recv_body: headers::Body::default(),
+            request_kind: headers::RequestKind::default(),
+            retain_credit: false,
             unreleased: 0,
             reset_after_flush: None,
+        }
+    }
+
+    fn checked_headers(
+        &self,
+        fields: &[HeaderField],
+        request: bool,
+        sending: bool,
+        end_stream: bool,
+    ) -> Result<(headers::Section, headers::Body), &'static str> {
+        let (phase, current) = if sending {
+            (self.send_phase, self.send_body)
+        } else {
+            (self.recv_phase, self.recv_body)
+        };
+        let section = headers::validate(fields, request, phase, end_stream)?;
+        let body = if phase == Phase::Body || section.phase == Phase::Informational {
+            current
+        } else {
+            headers::Body::for_section(&section, self.request_kind)
+        };
+        Ok((section, body.checked_data(0, end_stream)?))
+    }
+
+    fn commit_headers(&mut self, section: headers::Section, body: headers::Body, sending: bool) {
+        if sending {
+            self.send_phase = section.phase;
+            self.send_body = body;
+        } else {
+            self.recv_phase = section.phase;
+            self.recv_body = body;
+        }
+        if let Some(method) = section.method {
+            self.request_kind = method;
+        }
+        if self.request_kind == headers::RequestKind::Connect
+            && section
+                .status
+                .is_some_and(|code| (200..300).contains(&code))
+        {
+            // Successful CONNECT turns both halves into opaque tunnel bytes.
+            self.send_body.tunnel();
+            self.recv_body.tunnel();
         }
     }
 
@@ -286,14 +358,16 @@ pub struct Connection {
     config: Config,
     peer: Settings,
     encoder: Encoder,
+    encoder_update_pending: bool,
     decoder: Decoder,
     input: Vec<u8>,
     output: Vec<u8>,
     awaiting_preface: bool,
     awaiting_peer_settings: bool,
     streams: BTreeMap<StreamId, Stream>,
+    retained_credit: BTreeMap<StreamId, usize>,
     conn_send_window: i64,
-    /// Connection receive window as the peer sees it ([`FlowControl::Manual`] only).
+    /// Connection receive window as the peer sees it.
     conn_recv_window: i64,
     /// The peer has acknowledged our SETTINGS.
     local_settings_acked: bool,
@@ -343,12 +417,14 @@ impl Connection {
             config,
             peer: Settings::default(),
             encoder,
+            encoder_update_pending: true,
             decoder: Decoder::new(),
             input: Vec::new(),
             output: Vec::new(),
             awaiting_preface: role == Role::Server,
             awaiting_peer_settings: true,
             streams: BTreeMap::new(),
+            retained_credit: BTreeMap::new(),
             conn_send_window: 65_535,
             conn_recv_window: DEFAULT_WINDOW,
             local_settings_acked: false,
@@ -560,66 +636,7 @@ impl Connection {
         if id == 0 {
             return Err(self.fail(ErrorCode::ProtocolError, "DATA on stream 0"));
         }
-        if self.config.flow_control == FlowControl::Manual {
-            return self.on_data_manual(id, flags, payload);
-        }
-        let flow_len = payload.len() as u32;
-        if flow_len > self.config.initial_window_size.max(65_535) {
-            return Err(self.fail(ErrorCode::FlowControlError, "receive window exceeded"));
-        }
-        // The whole frame (padding included) counts against flow control; we
-        // replenish the connection window immediately, so it never runs dry.
-        if flow_len > 0 {
-            self.write_frame(
-                FrameType::WindowUpdate,
-                0,
-                0,
-                &encode_window_update(flow_len),
-            );
-        }
-        let data = match strip_padding(flags, payload) {
-            Some(d) => d,
-            None => return Err(self.fail(ErrorCode::ProtocolError, "invalid DATA padding")),
-        };
-        let end_stream = flags.has(Flags::END_STREAM);
-
-        let Some(stream) = self.streams.get_mut(&id) else {
-            if self.is_idle_stream(id) {
-                return Err(self.fail(ErrorCode::ProtocolError, "DATA on idle stream"));
-            }
-            // Closed or reset stream: discard.
-            return Ok(());
-        };
-        if !stream.can_recv() {
-            self.reset(id, ErrorCode::StreamClosed);
-            return Ok(());
-        }
-        let discard = stream.reset_after_flush.is_some();
-        if end_stream {
-            stream.apply(StreamEvent::RecvEndStream);
-        } else if flow_len > 0 && !discard {
-            self.write_frame(
-                FrameType::WindowUpdate,
-                0,
-                id,
-                &encode_window_update(flow_len),
-            );
-        }
-        if !discard {
-            self.events.push_back(Event::Data {
-                stream_id: id,
-                data: data.to_vec(),
-                end_stream,
-            });
-        }
-        self.cleanup(id);
-        Ok(())
-    }
-
-    /// [`FlowControl::Manual`] DATA handling: windows are tracked and only
-    /// replenished by [`release_capacity`](Self::release_capacity), except for
-    /// bytes the application never sees.
-    fn on_data_manual(&mut self, id: StreamId, flags: Flags, payload: &[u8]) -> Result<(), Error> {
+        // Both modes enforce the same windows; only credit timing differs.
         let flow_len = payload.len();
         if flow_len as i64 > self.conn_recv_window {
             return Err(self.fail(
@@ -653,14 +670,48 @@ impl Connection {
             self.reset(id, ErrorCode::FlowControlError);
             return Ok(());
         }
+        if stream.recv_phase != Phase::Body {
+            self.release_connection(flow_len);
+            self.reset(id, ErrorCode::ProtocolError);
+            return Ok(());
+        }
+        let Ok(body) = stream.recv_body.checked_data(data.len(), end_stream) else {
+            self.release_connection(flow_len);
+            self.reset(id, ErrorCode::ProtocolError);
+            return Ok(());
+        };
+        stream.recv_body = body;
         stream.recv_window -= flow_len as i64;
         if end_stream {
+            stream.recv_phase = Phase::End;
             stream.apply(StreamEvent::RecvEndStream);
         }
         if stream.reset_after_flush.is_some() {
             // The application has finished with this stream; nobody will
             // release these bytes.
             self.release_connection(flow_len);
+            self.cleanup(id);
+            return Ok(());
+        }
+        if self.config.flow_control == FlowControl::Automatic {
+            let can_recv = stream.can_recv();
+            if can_recv {
+                stream.recv_window += flow_len as i64;
+            }
+            self.release_connection(flow_len);
+            if can_recv && flow_len > 0 {
+                self.write_frame(
+                    FrameType::WindowUpdate,
+                    0,
+                    id,
+                    &encode_window_update(flow_len as u32),
+                );
+            }
+            self.events.push_back(Event::Data {
+                stream_id: id,
+                data: data.to_vec(),
+                end_stream,
+            });
             self.cleanup(id);
             return Ok(());
         }
@@ -700,6 +751,9 @@ impl Connection {
             }
             block = &block[5..];
         }
+        if block.len() > self.encoded_header_limit() {
+            return Err(self.fail(ErrorCode::EnhanceYourCalm, "header block too large"));
+        }
         let pending = PendingBlock {
             stream_id: id,
             end_stream: flags.has(Flags::END_STREAM),
@@ -720,10 +774,14 @@ impl Connection {
         if pending.stream_id != id {
             return Err(self.fail(ErrorCode::ProtocolError, "CONTINUATION on wrong stream"));
         }
-        pending.block.extend_from_slice(payload);
-        if pending.block.len() > 2 * self.config.max_header_list_size as usize + 1024 {
+        if payload.len()
+            > self
+                .encoded_header_limit()
+                .saturating_sub(pending.block.len())
+        {
             return Err(self.fail(ErrorCode::EnhanceYourCalm, "header block too large"));
         }
+        pending.block.extend_from_slice(payload);
         if flags.has(Flags::END_HEADERS) {
             self.on_header_block(pending)
         } else {
@@ -738,15 +796,20 @@ impl Connection {
             end_stream,
             block,
         } = block;
-        // Always decode, even for streams we discard, to keep HPACK state in sync.
-        let headers = match self.decoder.decode(&block) {
+        // Decode even discarded streams. Overflow terminates the connection,
+        // avoiding both unbounded materialization and unsynchronized HPACK state.
+        let headers = match self
+            .decoder
+            .decode(&block, self.config.max_header_list_size as usize)
+        {
             Ok(h) => h,
-            Err(_) => return Err(self.fail(ErrorCode::CompressionError, "HPACK decode failed")),
+            Err(hpack::DecodeError::Limit) => {
+                return Err(self.fail(ErrorCode::EnhanceYourCalm, "decoded header list too large"));
+            }
+            Err(hpack::DecodeError::Compression) => {
+                return Err(self.fail(ErrorCode::CompressionError, "HPACK decode failed"));
+            }
         };
-        let list_size: usize = headers
-            .iter()
-            .map(|h| h.name.len() + h.value.len() + 32)
-            .sum();
 
         if !self.streams.contains_key(&id) {
             if !self.is_peer_initiated(id) {
@@ -780,11 +843,30 @@ impl Connection {
             self.streams.insert(id, stream);
         }
 
-        if list_size > self.config.max_header_list_size as usize {
+        // HTTP/API validation is intentionally after complete raw HPACK decoding:
+        // even rejected octet strings must remain in the shared dynamic table.
+        let Ok(headers) = headers
+            .into_iter()
+            .map(hpack::RawHeader::into_field)
+            .collect::<Result<Vec<_>, _>>()
+        else {
             self.reset(id, ErrorCode::ProtocolError);
             return Ok(());
-        }
+        };
         let Some(stream) = self.streams.get_mut(&id) else {
+            return Ok(());
+        };
+        if !matches!(
+            stream.state,
+            StreamState::Idle | StreamState::Open | StreamState::HalfClosedLocal
+        ) {
+            self.reset(id, ErrorCode::StreamClosed);
+            return Ok(());
+        }
+        let Ok((section, body)) =
+            stream.checked_headers(&headers, self.role == Role::Server, false, end_stream)
+        else {
+            self.reset(id, ErrorCode::ProtocolError);
             return Ok(());
         };
         if !stream.apply(StreamEvent::RecvHeaders) {
@@ -794,6 +876,7 @@ impl Connection {
         if end_stream {
             stream.apply(StreamEvent::RecvEndStream);
         }
+        stream.commit_headers(section, body, false);
         self.events.push_back(Event::Headers {
             stream_id: id,
             headers,
@@ -958,9 +1041,23 @@ impl Connection {
         if self.goaway_received || self.goaway_sent {
             return Err(Error::GoingAway);
         }
+        if self.next_local_id > MAX_WINDOW as u32 {
+            return Err(Error::StreamIdExhausted);
+        }
+        let local_open = self
+            .streams
+            .keys()
+            .filter(|id| !self.is_peer_initiated(**id))
+            .count();
+        if local_open >= self.peer.max_concurrent_streams as usize {
+            return Err(Error::StreamLimit);
+        }
+        let stream = self.new_stream();
+        stream
+            .checked_headers(&headers, true, true, end_stream)
+            .map_err(Error::InvalidHeaders)?;
         let id = self.next_local_id;
         self.next_local_id += 2;
-        let stream = self.new_stream();
         self.streams.insert(id, stream);
         self.send_headers(id, headers, end_stream)?;
         Ok(id)
@@ -974,9 +1071,21 @@ impl Connection {
         end_stream: bool,
     ) -> Result<(), Error> {
         let stream = self.streams.get_mut(&id).ok_or(Error::UnknownStream(id))?;
-        if stream.reset_after_flush.is_some() || !stream.apply(StreamEvent::SendHeaders) {
+        if stream.reset_after_flush.is_some()
+            || !matches!(
+                stream.state,
+                StreamState::Idle | StreamState::Open | StreamState::HalfClosedRemote
+            )
+        {
             return Err(Error::StreamClosed(id));
         }
+        let (section, body) = stream
+            .checked_headers(&headers, self.role == Role::Client, true, end_stream)
+            .map_err(Error::InvalidHeaders)?;
+        if !stream.apply(StreamEvent::SendHeaders) {
+            return Err(Error::StreamClosed(id));
+        }
+        stream.commit_headers(section, body, true);
         if end_stream {
             stream.apply(StreamEvent::SendEndStream);
         }
@@ -1004,7 +1113,16 @@ impl Connection {
         if !stream.can_send() {
             return Err(Error::StreamClosed(id));
         }
+        if stream.send_phase != Phase::Body {
+            return Err(Error::InvalidHeaders("DATA before final headers"));
+        }
+        let body = stream
+            .send_body
+            .checked_data(data.len(), end_stream)
+            .map_err(Error::InvalidHeaders)?;
+        stream.send_body = body;
         if end_stream {
+            stream.send_phase = Phase::End;
             stream.apply(StreamEvent::SendEndStream);
         }
         stream.outbound.push_back(Outbound::Data {
@@ -1087,13 +1205,22 @@ impl Connection {
     ///
     /// Only meaningful with [`FlowControl::Manual`]; a no-op otherwise. `n` is
     /// clamped to the bytes delivered and not yet released. Releasing on a
-    /// stream that has closed or been reset is a no-op, because its remaining
-    /// capacity was released automatically when it was removed.
+    /// stream that has closed or been reset is a no-op unless
+    /// [`retain_receive_capacity`](Self::retain_receive_capacity) was enabled:
+    /// then it releases retained connection credit, but sends no stream update.
     pub fn release_capacity(&mut self, id: StreamId, n: usize) {
         if self.config.flow_control != FlowControl::Manual || self.failed.is_some() {
             return;
         }
         let Some(stream) = self.streams.get_mut(&id) else {
+            if let Some(held) = self.retained_credit.get_mut(&id) {
+                let n = n.min(*held);
+                *held -= n;
+                if *held == 0 {
+                    self.retained_credit.remove(&id);
+                }
+                self.release_connection(n);
+            }
             return;
         };
         let n = n.min(stream.unreleased);
@@ -1114,10 +1241,28 @@ impl Connection {
     }
 
     /// Received body bytes delivered on the stream and not yet released with
-    /// [`release_capacity`](Self::release_capacity). Always `Some(0)` for a
-    /// known stream in [`FlowControl::Automatic`] mode.
+    /// [`release_capacity`](Self::release_capacity), including retained credit
+    /// after removal. Always `Some(0)` for a known automatic-mode stream.
     pub fn unreleased_recv_bytes(&self, id: StreamId) -> Option<usize> {
-        self.streams.get(&id).map(|s| s.unreleased)
+        self.streams
+            .get(&id)
+            .map(|s| s.unreleased)
+            .or_else(|| self.retained_credit.get(&id).copied())
+    }
+
+    /// Keep manual receive-credit ownership beyond protocol stream removal.
+    /// Call before the stream can close (typically immediately after opening).
+    /// Thereafter every delivered body byte must be released with
+    /// [`release_capacity`](Self::release_capacity), even after completion or
+    /// reset. Cancellation must release discarded data too. Retained entries
+    /// do not count as active streams and disappear when their credit is zero.
+    /// A no-op in automatic mode. Credit belongs to this connection and stream ID.
+    pub fn retain_receive_capacity(&mut self, id: StreamId) -> Result<(), Error> {
+        let stream = self.streams.get_mut(&id).ok_or(Error::UnknownStream(id))?;
+        if self.config.flow_control == FlowControl::Manual {
+            stream.retain_credit = true;
+        }
+        Ok(())
     }
 
     /// Start a graceful shutdown: no new peer streams are accepted, existing
@@ -1206,14 +1351,17 @@ impl Connection {
         );
     }
 
-    /// Forget a stream, returning connection-level receive capacity it still
-    /// held. Returns whether the stream existed.
+    /// Forget protocol state, returning credit unless independently retained.
     fn remove_stream(&mut self, id: StreamId) -> bool {
         let Some(stream) = self.streams.remove(&id) else {
             return false;
         };
         self.send_ready.remove(&id);
-        self.release_connection(stream.unreleased);
+        if stream.retain_credit && stream.unreleased > 0 {
+            self.retained_credit.insert(id, stream.unreleased);
+        } else {
+            self.release_connection(stream.unreleased);
+        }
         true
     }
 
@@ -1258,7 +1406,11 @@ impl Connection {
                     let end_stream = *end_stream;
                     let fields = core::mem::take(fields);
                     stream.outbound.pop_front();
-                    let block = self.encoder.encode(&fields);
+                    let mut block = self.encoder.encode(&fields);
+                    if self.encoder_update_pending {
+                        block.insert(0, 0x20);
+                        self.encoder_update_pending = false;
+                    }
                     let mut chunks = block.chunks(max_frame).peekable();
                     let first = chunks.next().unwrap_or(&[]);
                     let mut flags = if end_stream { Flags::END_STREAM } else { 0 };
@@ -1334,6 +1486,12 @@ impl Connection {
         let written =
             encode_frame(&header, payload, &mut self.output[start..], u32::MAX).unwrap_or(0);
         self.output.truncate(start + written);
+    }
+
+    fn encoded_header_limit(&self) -> usize {
+        (self.config.max_header_list_size as usize)
+            .saturating_mul(2)
+            .saturating_add(1024)
     }
 
     fn local_max_frame_size(&self) -> u32 {

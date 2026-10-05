@@ -18,7 +18,10 @@ use protolink_http2::{Connection, ErrorCode, Event, HeaderField};
 // ---------------------------------------------------------------------------
 
 fn encoded(messages: &[&[u8]]) -> Vec<u8> {
-    messages.iter().flat_map(|m| lpm::encode(m)).collect()
+    messages
+        .iter()
+        .flat_map(|m| lpm::encode(m).unwrap())
+        .collect()
 }
 
 fn decode_all(d: &mut lpm::Decoder) -> Vec<Vec<u8>> {
@@ -602,7 +605,8 @@ fn unknown_method_is_a_trailers_only_response() {
     let id = conn
         .open_stream(request_headers("/s.S/Missing"), false)
         .unwrap();
-    conn.send_data(id, lpm::encode(b"x"), false).unwrap();
+    conn.send_data(id, lpm::encode(b"x").unwrap(), false)
+        .unwrap();
     raw_exchange(&mut conn, &mut server, &mut handler);
     let ev = raw_events(&mut conn);
     assert!(
@@ -619,7 +623,8 @@ fn unknown_unary_request_in_one_chunk_is_unimplemented() {
     let id = conn
         .open_stream(request_headers("/s.S/Missing"), false)
         .unwrap();
-    conn.send_data(id, lpm::encode(b"x"), true).unwrap();
+    conn.send_data(id, lpm::encode(b"x").unwrap(), true)
+        .unwrap();
     raw_exchange(&mut conn, &mut server, &mut handler);
     let ev = raw_events(&mut conn);
     assert!(
@@ -717,7 +722,7 @@ fn peer_reset_cancels_the_handler_call() {
     let id = conn
         .open_stream(request_headers("/s.S/Infinite"), false)
         .unwrap();
-    conn.send_data(id, lpm::encode(b""), true).unwrap();
+    conn.send_data(id, lpm::encode(b"").unwrap(), true).unwrap();
     raw_exchange(&mut conn, &mut server, &mut handler);
     assert!(handler.polls > 0);
     conn.reset_stream(id, ErrorCode::Cancel).unwrap();
@@ -860,7 +865,7 @@ fn peer_withholding_window_updates_stalls_the_producer() {
     let id = conn
         .open_stream(request_headers("/s.S/Infinite"), false)
         .unwrap();
-    conn.send_data(id, lpm::encode(b""), true).unwrap();
+    conn.send_data(id, lpm::encode(b"").unwrap(), true).unwrap();
     for _ in 0..8 {
         raw_exchange(&mut conn, &mut server, &mut handler);
     }
@@ -994,7 +999,7 @@ fn error_before_messages_is_trailers_only() {
     let id = conn
         .open_stream(request_headers("/s.S/FailBefore"), false)
         .unwrap();
-    conn.send_data(id, lpm::encode(b""), true).unwrap();
+    conn.send_data(id, lpm::encode(b"").unwrap(), true).unwrap();
     raw_exchange(&mut conn, &mut server, &mut handler);
     let ev = raw_events(&mut conn);
     assert_eq!(ev.len(), 1, "{ev:?}");
@@ -1025,7 +1030,8 @@ fn pending_handler_sends_response_headers() {
     let wait = conn
         .open_stream(request_headers("/s.S/Wait"), false)
         .unwrap();
-    conn.send_data(wait, lpm::encode(b""), true).unwrap();
+    conn.send_data(wait, lpm::encode(b"").unwrap(), true)
+        .unwrap();
     raw_exchange(&mut conn, &mut server, &mut handler);
     let ev = raw_events(&mut conn);
     assert!(
@@ -1043,7 +1049,7 @@ fn error_after_messages_uses_trailers() {
     let id = conn
         .open_stream(request_headers("/s.S/FailAfter"), false)
         .unwrap();
-    conn.send_data(id, lpm::encode(b""), true).unwrap();
+    conn.send_data(id, lpm::encode(b"").unwrap(), true).unwrap();
     raw_exchange(&mut conn, &mut server, &mut handler);
     let ev = raw_events(&mut conn);
     assert!(
@@ -1085,7 +1091,8 @@ fn early_finish_delivers_trailers_before_reset() {
         .open_stream(request_headers("/s.S/EarlyDone"), false)
         .unwrap();
     // The client keeps its side open.
-    conn.send_data(id, lpm::encode(b"hi"), false).unwrap();
+    conn.send_data(id, lpm::encode(b"hi").unwrap(), false)
+        .unwrap();
     raw_exchange(&mut conn, &mut server, &mut handler);
     let ev = raw_events(&mut conn);
     let kinds: Vec<&str> = ev
@@ -1118,12 +1125,14 @@ fn early_finish_waits_for_window_before_reset() {
     let busy = conn
         .open_stream(request_headers("/s.S/Infinite"), false)
         .unwrap();
-    conn.send_data(busy, lpm::encode(b""), true).unwrap();
+    conn.send_data(busy, lpm::encode(b"").unwrap(), true)
+        .unwrap();
     raw_exchange(&mut conn, &mut server, &mut handler);
     let id = conn
         .open_stream(request_headers("/s.S/EarlyDone"), false)
         .unwrap();
-    conn.send_data(id, lpm::encode(&[5; 100]), false).unwrap();
+    conn.send_data(id, lpm::encode(&[5; 100]).unwrap(), false)
+        .unwrap();
     raw_exchange(&mut conn, &mut server, &mut handler);
     // Connection window exhausted: the response headers went out (they are
     // not flow-controlled) but the echo is queued, with no trailers yet.
@@ -1151,7 +1160,7 @@ fn early_finish_waits_for_window_before_reset() {
         })
         .collect();
     assert!(
-        matches!(&ev[0], Event::Data { data, .. } if *data == lpm::encode(&[5; 100])),
+        matches!(&ev[0], Event::Data { data, .. } if *data == lpm::encode(&[5; 100]).unwrap()),
         "{ev:?}"
     );
     assert!(

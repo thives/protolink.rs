@@ -1,0 +1,21 @@
+syntax = "proto3";
+package fixture.type;
+
+message Request { message Inner { uint32 value = 1; } }
+message Reply { uint32 value = 1; }
+
+service Type {
+  rpc Type(Request.Inner) returns (Reply);
+  rpc Match(Request.Inner) returns (stream Reply);
+  rpc Async(stream Request.Inner) returns (Reply);
+  rpc Gen(stream Request.Inner) returns (stream Reply);
+}
+
+// These exercise trait identifiers as well as service module identifiers.
+service match {}
+service Self {}
+service crate {}
+service _ {}
+service extern {}
+service async {}
+service gen {}

@@ -1,0 +1,8 @@
+syntax = "proto3";
+package builtins;
+message Message {}
+service Lifecycle {
+  rpc New(Message) returns (Message);
+  rpc IntoInner(Message) returns (stream Message);
+  rpc TransportMut(stream Message) returns (stream Message);
+}

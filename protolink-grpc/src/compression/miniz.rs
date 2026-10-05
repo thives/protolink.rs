@@ -1,9 +1,14 @@
 //! The stock DEFLATE backend, built on `miniz_oxide`.
 
+use alloc::boxed::Box;
+use alloc::vec;
 use alloc::vec::Vec;
 
 use miniz_oxide::deflate::compress_to_vec;
-use miniz_oxide::inflate::{TINFLStatus, decompress_to_vec_with_limit};
+use miniz_oxide::inflate::TINFLStatus;
+use miniz_oxide::inflate::core::{
+    DecompressorOxide, decompress, inflate_flags::TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF,
+};
 
 use super::{Codec, CodecError, Compression, Deflate, Gzip};
 
@@ -51,10 +56,32 @@ impl Deflate for MinizOxide {
     }
 
     fn inflate(&self, input: &[u8], out: &mut Vec<u8>, limit: usize) -> Result<(), CodecError> {
-        let data = decompress_to_vec_with_limit(input, limit).map_err(|e| match e.status {
-            TINFLStatus::HasMoreOutput => CodecError::TooLarge,
-            _ => CodecError::Corrupt,
-        })?;
+        let mut input = input;
+        let mut data = vec![0; input.len().saturating_mul(2).max(1).min(limit)];
+        let mut state = Box::<DecompressorOxide>::default();
+        let mut written = 0;
+        loop {
+            let (status, consumed, produced) = decompress(
+                &mut state,
+                input,
+                &mut data,
+                written,
+                TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF,
+            );
+            written += produced;
+            input = input.get(consumed..).ok_or(CodecError::Corrupt)?;
+            match status {
+                TINFLStatus::Done if input.is_empty() => {
+                    data.truncate(written);
+                    break;
+                }
+                TINFLStatus::HasMoreOutput if data.len() < limit => {
+                    data.resize(data.len().saturating_mul(2).max(1).min(limit), 0);
+                }
+                TINFLStatus::HasMoreOutput => return Err(CodecError::TooLarge),
+                _ => return Err(CodecError::Corrupt),
+            }
+        }
         if out.is_empty() {
             *out = data;
         } else {

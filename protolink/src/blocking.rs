@@ -32,6 +32,28 @@ pub trait ReadTimeout {
     fn set_read_timeout(&mut self, timeout: Option<Duration>);
 }
 
+/// Optional output timeout capabilities for whole-call deadline enforcement.
+///
+/// Each hook must bound the next `write` or `flush`, including buffered output
+/// and acknowledgment waits. `Some(Duration::ZERO)` must not block; `None`
+/// removes the bound. Timeout errors must use `ErrorKind::TimedOut`. A driver
+/// retires the connection after any output error because accepted bytes may
+/// be indeterminate. Read timeouts alone cannot bound output stalls.
+pub trait OutputTimeout {
+    /// Bound each following write until changed.
+    fn set_write_timeout(&mut self, timeout: Option<Duration>);
+    /// Bound each following flush, including acknowledgment waits, until changed.
+    fn set_flush_timeout(&mut self, timeout: Option<Duration>);
+}
+
+fn set_output_timeout<IO: OutputTimeout>(io: &mut IO, timeout: Option<Duration>, flush: bool) {
+    if flush {
+        io.set_flush_timeout(timeout);
+    } else {
+        io.set_write_timeout(timeout);
+    }
+}
+
 fn timed_out(kind: ErrorKind) -> bool {
     matches!(kind, ErrorKind::TimedOut | ErrorKind::Interrupted)
 }
@@ -76,7 +98,42 @@ where
         handler,
         &mut cx,
         &NoTimer,
+        |_, _, _| {},
         |io, buf, _| io.read(buf).map(Some),
+    );
+    server.cancel_all(handler);
+    result
+}
+
+/// Serve with deadline-aware reads, writes and flushes.
+///
+/// The transport must implement both timeout capabilities honestly, including
+/// flush acknowledgment waits. Any output error closes the connection and
+/// cancels active handlers. Synchronous handler execution cannot be preempted.
+pub fn serve_with_io_timeouts<IO, H, C>(
+    mut io: IO,
+    handler: &mut H,
+    config: ServerConfig,
+    clock: C,
+) -> Result<(), Error<IO::Error>>
+where
+    IO: Read + Write + ReadTimeout + OutputTimeout,
+    H: Handler + ?Sized,
+    C: Clock,
+{
+    let mut server = grpc::Server::new(config);
+    let mut cx = Context::from_waker(Waker::noop());
+    let result = serve_connection(
+        &mut io,
+        &mut server,
+        handler,
+        &mut cx,
+        &clock,
+        set_output_timeout::<IO>,
+        |io, buf, timeout| {
+            io.set_read_timeout(timeout);
+            io.read(buf).map(Some)
+        },
     );
     server.cancel_all(handler);
     result
@@ -92,7 +149,8 @@ where
 ///
 /// Before each read the transport's read timeout is set to the time left until
 /// the earliest deadline (see [`ReadTimeout`]); the resulting
-/// [`ErrorKind::TimedOut`] is an idle tick, as in [`serve`].
+/// [`ErrorKind::TimedOut`] is an idle tick, as in [`serve`]. Writes and flushes
+/// are not bounded; use [`serve_with_io_timeouts`] to bound output too.
 pub fn serve_with_clock<IO, H, C>(
     mut io: IO,
     handler: &mut H,
@@ -112,6 +170,7 @@ where
         handler,
         &mut cx,
         &clock,
+        |_, _, _| {},
         |io, buf, timeout| {
             io.set_read_timeout(timeout);
             io.read(buf).map(Some)
@@ -247,6 +306,7 @@ where
         handler,
         &mut cx,
         &NoTimer,
+        |_, _, _| {},
         |io, buf, _| io.read_or_wake(buf),
     );
     server.cancel_all(handler);
@@ -279,6 +339,7 @@ where
         handler,
         &mut cx,
         &clock,
+        |_, _, _| {},
         |io, buf, timeout| io.read_or_wake_timeout(buf, timeout),
     );
     server.cancel_all(handler);
@@ -299,6 +360,7 @@ fn serve_connection<IO, H, C, R>(
     handler: &mut H,
     cx: &mut Context<'_>,
     clock: &C,
+    set_output: fn(&mut IO, Option<Duration>, bool),
     mut read: R,
 ) -> Result<(), Error<IO::Error>>
 where
@@ -312,18 +374,29 @@ where
         server.tick(clock.now(), &mut *handler);
         // Producing output can make room for more, so poll until idle.
         loop {
+            server.tick(clock.now(), &mut *handler);
             server.poll(&mut *handler, cx);
             if !server.has_output() {
                 break;
             }
-            io.write_all(server.pending_output()).map_err(Error::Io)?;
-            server.consume_output(server.pending_output().len());
+            set_output(io, remaining(server.next_deadline(), clock.now()), false);
+            let n = io.write(server.pending_output()).map_err(Error::Io)?;
+            if n == 0 {
+                return Err(Error::WriteZero);
+            }
+            server.consume_output(n);
         }
+        set_output(io, remaining(server.next_deadline(), clock.now()), true);
         io.flush().map_err(Error::Io)?;
+        server.tick(clock.now(), &mut *handler);
+        server.output_flushed();
+        if server.has_output() {
+            continue;
+        }
         if server.is_closed() {
             return Ok(());
         }
-        let timeout = remaining(server.next_deadline(), server.now());
+        let timeout = remaining(server.next_deadline(), clock.now());
         let n = match read(io, &mut buf, timeout) {
             Ok(None) => continue,
             Ok(Some(0)) => return Ok(()),
@@ -334,8 +407,12 @@ where
         // Calls that start with this input get their deadline from now.
         server.tick(clock.now(), &mut *handler);
         if let Err(e) = server.recv(&buf[..n], handler) {
-            let _ = io.write_all(server.pending_output());
-            let _ = io.flush();
+            if io.write_all(server.pending_output()).is_ok() {
+                server.consume_output(server.pending_output().len());
+                if io.flush().is_ok() {
+                    server.output_flushed();
+                }
+            }
             return Err(Error::Protocol(e));
         }
     }
@@ -364,12 +441,19 @@ where
 /// timeout is set to the time left, so a read that finds no data returns in
 /// time; see [`ReadTimeout`]. A client built with [`new`](Self::new) has no
 /// clock and leaves enforcement to the server.
+///
+/// `with_clock` only bounds reads: a blocked write or flush can postpone
+/// expiry indefinitely. Use [`with_io_timeouts`](Self::with_io_timeouts) for
+/// deadline-aware output too. Transport/protocol failures permanently retire
+/// the connection; new calls are rejected and no further I/O is attempted,
+/// but buffered messages and terminal statuses remain retrievable.
 #[derive(Debug)]
 pub struct Client<IO, C = NoTimer> {
     state: RefCell<State<IO>>,
     clock: C,
     /// Sets the transport's read timeout; a no-op without a clock.
     set_timeout: fn(&mut IO, Option<Duration>),
+    set_output_timeout: Option<fn(&mut IO, Option<Duration>, bool)>,
     /// Read timeouts are idle ticks, not failures.
     idle_timeouts: bool,
 }
@@ -380,6 +464,7 @@ struct State<IO> {
     inner: grpc::Client,
     /// The read timeout last set on the transport.
     timeout: Option<Duration>,
+    terminal: Option<Status>,
 }
 
 impl<IO: Read + Write> Client<IO> {
@@ -393,12 +478,32 @@ impl<IO: Read + Write> Client<IO> {
 
 impl<IO: Read + Write + ReadTimeout, C: Clock> Client<IO, C> {
     /// Create a client that enforces call timeouts using `clock`; the HTTP/2
-    /// preface is sent with the first call.
+    /// preface is sent with the first call. Only reads are bounded; writes and
+    /// flushes can stall indefinitely. See [`with_io_timeouts`](Self::with_io_timeouts).
     ///
     /// Read errors of kind [`ErrorKind::TimedOut`] or [`ErrorKind::Interrupted`]
     /// are treated as idle ticks, not as transport failures.
     pub fn with_clock(io: IO, config: ClientConfig, clock: C) -> Self {
         Self::build(io, config, clock, IO::set_read_timeout, true)
+    }
+}
+
+impl<IO: Read + Write + ReadTimeout + OutputTimeout, C: Clock> Client<IO, C> {
+    /// Enforce deadlines across reads, writes and flushes. Unlike
+    /// [`with_clock`](Self::with_clock), output stalls are bounded too.
+    /// Any output timeout retires this connection; expired calls retain
+    /// `DEADLINE_EXCEEDED`, other calls fail with `UNAVAILABLE`.
+    pub fn with_io_timeouts(io: IO, config: ClientConfig, clock: C) -> Self {
+        let mut client = Self::with_clock(io, config, clock);
+        client.set_output_timeout = Some(set_output_timeout::<IO>);
+        client
+    }
+}
+
+fn retire<IO>(state: &mut State<IO>, status: Status) {
+    if state.terminal.is_none() {
+        state.inner.fail_all(status.clone());
+        state.terminal = Some(status);
     }
 }
 
@@ -415,9 +520,11 @@ impl<IO: Read + Write, C: Clock> Client<IO, C> {
                 io,
                 inner: grpc::Client::new(config),
                 timeout: None,
+                terminal: None,
             }),
             clock,
             set_timeout,
+            set_output_timeout: None,
             idle_timeouts,
         }
     }
@@ -444,14 +551,19 @@ impl<IO: Read + Write, C: Clock> Client<IO, C> {
         options: CallOptions,
     ) -> Result<Response<Vec<u8>>, Status> {
         self.tick();
-        let id = self.with(|s| s.inner.start_unary_with(path, request, &options))?;
+        let id = self.with(|s| {
+            if let Some(status) = &s.terminal {
+                return Err(status.clone());
+            }
+            s.inner.start_unary_with(path, request, &options)
+        })?;
         loop {
             self.tick();
             if let Some(result) = self.with(|s| s.inner.take_response(id)) {
                 return result;
             }
             if self.write_output() && self.with(|s| s.inner.is_pending(id)) {
-                self.read_input();
+                self.read_input(id);
             }
         }
     }
@@ -472,7 +584,12 @@ impl<IO: Read + Write, C: Clock> Client<IO, C> {
         options: CallOptions,
     ) -> Result<Call<'_, IO, C>, Status> {
         self.tick();
-        let id = self.with(|s| s.inner.start_streaming_with(path, &options))?;
+        let id = self.with(|s| {
+            if let Some(status) = &s.terminal {
+                return Err(status.clone());
+            }
+            s.inner.start_streaming_with(path, &options)
+        })?;
         Ok(Call {
             client: self,
             id,
@@ -501,35 +618,80 @@ impl<IO: Read + Write, C: Clock> Client<IO, C> {
     /// transport failed.
     fn write_output(&self) -> bool {
         self.with(|s| {
-            let State { io, inner, .. } = s;
-            let pending = inner.pending_output().len();
-            if io.write_all(inner.pending_output()).is_err() || io.flush().is_err() {
-                inner.fail_all(Status::unavailable("transport write failed"));
+            if s.terminal.is_some() {
                 return false;
             }
-            inner.consume_output(pending);
+            s.inner.tick(self.clock.now());
+            while s.inner.has_output() {
+                let deadline = s.inner.next_deadline();
+                if let Some(set) = self.set_output_timeout {
+                    set(&mut s.io, remaining(deadline, self.clock.now()), false);
+                }
+                let result = s.io.write(s.inner.pending_output());
+                match result {
+                    Ok(n) if n > 0 => s.inner.consume_output(n),
+                    _ => {
+                        s.inner.tick(self.clock.now());
+                        retire(s, Status::unavailable("transport write failed"));
+                        return false;
+                    }
+                }
+                s.inner.tick(self.clock.now());
+                if self.set_output_timeout.is_some()
+                    && deadline.is_some_and(|d| self.clock.now() >= d)
+                {
+                    retire(s, Status::unavailable("transport output deadline exceeded"));
+                    return false;
+                }
+            }
+            let deadline = s.inner.next_deadline();
+            if let Some(set) = self.set_output_timeout {
+                set(&mut s.io, remaining(deadline, self.clock.now()), true);
+            }
+            let result = s.io.flush();
+            s.inner.tick(self.clock.now());
+            if result.is_err() {
+                retire(s, Status::unavailable("transport flush failed"));
+                return false;
+            }
+            if self.set_output_timeout.is_some() && deadline.is_some_and(|d| self.clock.now() >= d)
+            {
+                retire(s, Status::unavailable("transport output deadline exceeded"));
+                return false;
+            }
             true
         })
     }
 
-    fn read_input(&self) {
+    fn read_input(&self, id: CallId) {
         let mut buf = [0u8; READ_CHUNK];
         let idle_timeouts = self.idle_timeouts;
         self.with(|s| {
-            let timeout = remaining(s.inner.next_deadline(), s.inner.now());
+            if s.terminal.is_some() {
+                return;
+            }
+            s.inner.tick(self.clock.now());
+            // Output/expiry may have completed the last call. Never start an
+            // unbounded read after its deadline has already elapsed.
+            if !s.inner.is_pending(id) {
+                return;
+            }
+            let timeout = remaining(s.inner.next_deadline(), self.clock.now());
             if timeout != s.timeout {
                 (self.set_timeout)(&mut s.io, timeout);
                 s.timeout = timeout;
             }
-            match s.io.read(&mut buf) {
-                Ok(0) => s.inner.fail_all(Status::unavailable("connection closed")),
+            let result = s.io.read(&mut buf);
+            s.inner.tick(self.clock.now());
+            match result {
+                Ok(0) => retire(s, Status::unavailable("connection closed")),
                 Ok(n) => {
-                    let _ = s.inner.recv(&buf[..n]);
+                    if s.inner.recv(&buf[..n]).is_err() {
+                        retire(s, Status::unavailable("connection protocol error"));
+                    }
                 }
                 Err(e) if idle_timeouts && timed_out(e.kind()) => {}
-                Err(_) => s
-                    .inner
-                    .fail_all(Status::unavailable("transport read failed")),
+                Err(_) => retire(s, Status::unavailable("transport read failed")),
             }
         });
     }
@@ -587,11 +749,11 @@ impl<IO: Read + Write, C: Clock> Call<'_, IO, C> {
         let id = self.id;
         loop {
             client.tick();
-            if client.with(|s| s.inner.can_send(id)) {
+            if client.with(|s| s.inner.can_send(id) || !s.inner.is_pending(id)) {
                 break;
             }
             if client.write_output() && !client.with(|s| s.inner.can_send(id)) {
-                client.read_input();
+                client.read_input(id);
             }
         }
         let queued = client.with(|s| {
@@ -650,7 +812,7 @@ impl<IO: Read + Write, C: Clock> Call<'_, IO, C> {
                 None => {}
             }
             if client.write_output() && client.with(|s| s.inner.is_pending(id)) {
-                client.read_input();
+                client.read_input(id);
             }
         }
     }
