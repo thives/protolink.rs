@@ -17,6 +17,22 @@ versus `a_b`, or a qualified name versus another service's short name),
 generation returns an error identifying both services instead of emitting
 uncompilable Rust.
 
+When messages are included in the same Rust module as the bindings (the default
+`messages_path`), a service module that would shadow a message-side name (a
+root package module, or for empty packages a top-level message, enum, or
+nested-type module) gets a `_grpc` suffix on its normalized name. With default
+suffixing, `package foo; service Foo_` becomes `foo__grpc`; with
+`suffixed_package_names(false)`, `package foo; service Foo` becomes `foo_grpc`.
+Names that do not collide are unchanged. If the fallback also collides with a
+message module or another service, generation fails and names the conflicting
+items. A `messages_path` naming a different module never triggers the rename.
+
+Generated code refers to runtime types only through the `__rt` alias
+(`__rt::Status`, `__rt::__private::Context`, ...) and dispatches through
+`<S as self::Service>`, so services may be named `S`, `Status`, `Context`,
+`Poll`, `Vec`, `Result`, `Option`, or `__rt`. `messages_path` values beginning with `crate::` or `::` (or
+equal to `crate`) are absolute; others, like `crate_messages`, are relative.
+
 RPC collisions are checked in the generated Rust namespaces. Clients reserve
 `new`, `into_inner`, and `transport_mut`, so RPCs named `New`, `IntoInner`, or
 `TransportMut` are rejected when either client flavor is enabled. They remain
@@ -34,8 +50,8 @@ names, nested message types, package-qualified modules, and server-only RPCs
 whose names would conflict with client built-ins.
 
 The integration tests run real `cargo check` invocations for combined,
-server-only, async-client-only, blocking-client-only, and unsuffixed-package
-configurations. Negative cases verify that each client flavor rejects its
+server-only, async-client-only, blocking-client-only, and combined
+configurations, each with and without package suffixes. Negative cases verify that each client flavor rejects its
 built-in names and that normalized/qualified module collisions fail during
 generation, rather than in the downstream Rust compiler.
 

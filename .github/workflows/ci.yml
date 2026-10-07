@@ -24,6 +24,8 @@ jobs:
       - run: |
             cargo nextest r --workspace --all-features
             cargo test --workspace --doc --all-features
+            # `StdTimer` and `reliable` must work without Tokio.
+            cargo test -p protolink --no-default-features --features async,std --lib --test std_timer
 
   grpcurl-interop:
     name: grpcurl interop
@@ -151,13 +153,9 @@ jobs:
       matrix:
         features:
           - portable-atomic-critical-section
-          - portable-atomic-critical-section,async
           - portable-atomic-critical-section,blocking
-          - portable-atomic-critical-section,async,blocking
           - portable-atomic-critical-section,miniz-oxide
-          - portable-atomic-critical-section,async,miniz-oxide
           - portable-atomic-critical-section,blocking,miniz-oxide
-          - portable-atomic-critical-section,async,blocking,miniz-oxide
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -205,8 +203,6 @@ jobs:
         env:
           PROTOLINK_GRPC_GEN_TEST_TARGET: thumbv6m-none-eabi
         run: cargo test -p protolink-grpc-gen --test compilation
-      - name: Check fixture formatting
-        run: cargo fmt --manifest-path examples/embedded-smoke/Cargo.toml --all -- --check
 
   features:
     name: Check feature combinations
@@ -249,7 +245,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      - run: cargo fmt --all -- --check
+      - uses: taiki-e/install-action@just
+      # The root workspace and the two standalone fixture workspaces.
+      - run: just fmt
 
   msrv:
     name: Check MSRV

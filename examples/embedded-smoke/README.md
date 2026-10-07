@@ -51,8 +51,8 @@ cargo check --manifest-path examples/embedded-smoke/Cargo.toml \
 
 The CI consumer matrix independently checks `async`, `blocking`,
 `async,blocking`, and each combination with `compression`. Separately, the
-runtime matrix checks `portable-atomic-critical-section` with all combinations
-of explicit `async`, `blocking`, and `miniz-oxide`, using only `--lib` (not tests,
+runtime matrix checks `portable-atomic-critical-section` (which implies `async`)
+with all combinations of `blocking` and `miniz-oxide`, using only `--lib` (not tests,
 examples, or `--all-targets`, which could pull in std dev-dependencies). Separate
 sans-I/O checks cover no codec, micropb, miniz-oxide, and both codecs without
 `protolink`'s default micropb dependency unifying their features.

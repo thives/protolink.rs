@@ -1,0 +1,8 @@
+syntax = "proto3";
+package foo;
+
+message Msg { uint32 value = 1; }
+
+// Messages live in a separate `crate_messages` module, so this service keeps
+// its ordinary module name even though the package is also `foo`.
+service Foo { rpc Call(Msg) returns (Msg); }

@@ -283,6 +283,9 @@ impl Stream {
         } else {
             (self.recv_phase, self.recv_body)
         };
+        if current.is_tunnel() {
+            return Err("HEADERS on an established tunnel");
+        }
         let section = headers::validate(fields, request, phase, end_stream)?;
         let body = if phase == Phase::Body || section.phase == Phase::Informational {
             current
@@ -312,6 +315,38 @@ impl Stream {
             self.send_body.tunnel();
             self.recv_body.tunnel();
         }
+    }
+
+    /// Validate `fields` as the next outbound header block (a request if
+    /// `request`) and queue it, changing nothing if it is rejected.
+    fn queue_headers(
+        &mut self,
+        id: StreamId,
+        fields: Vec<HeaderField>,
+        request: bool,
+        end_stream: bool,
+    ) -> Result<(), Error> {
+        if self.reset_after_flush.is_some()
+            || !matches!(
+                self.state,
+                StreamState::Idle | StreamState::Open | StreamState::HalfClosedRemote
+            )
+        {
+            return Err(Error::StreamClosed(id));
+        }
+        let (section, body) = self
+            .checked_headers(&fields, request, true, end_stream)
+            .map_err(Error::InvalidHeaders)?;
+        if !self.apply(StreamEvent::SendHeaders) {
+            return Err(Error::StreamClosed(id));
+        }
+        self.commit_headers(section, body, true);
+        if end_stream {
+            self.apply(StreamEvent::SendEndStream);
+        }
+        self.outbound
+            .push_back(Outbound::Headers { fields, end_stream });
+        Ok(())
     }
 
     fn can_send(&self) -> bool {
@@ -378,6 +413,8 @@ pub struct Connection {
     continuation: Option<PendingBlock>,
     events: VecDeque<Event>,
     goaway_sent: bool,
+    /// The last-stream-ID advertised by the first GOAWAY; later ones repeat it.
+    goaway_last_stream_id: Option<StreamId>,
     goaway_received: bool,
     failed: Option<Error>,
 }
@@ -434,6 +471,7 @@ impl Connection {
             continuation: None,
             events: VecDeque::new(),
             goaway_sent: false,
+            goaway_last_stream_id: None,
             goaway_received: false,
             failed: None,
         };
@@ -581,6 +619,13 @@ impl Connection {
     }
 
     fn handle_frame(&mut self, raw: &[u8], max_frame: u32) -> Result<(), Error> {
+        // RFC 9113 §3.4: the peer's first frame must be a non-ACK SETTINGS, so
+        // this precedes the unknown-frame early return.
+        if self.awaiting_peer_settings
+            && (raw[3] != FrameType::Settings as u8 || Flags(raw[4]).has(Flags::ACK))
+        {
+            return Err(self.fail(ErrorCode::ProtocolError, "first frame must be SETTINGS"));
+        }
         let Ok(frame_type) = FrameType::from_u8(raw[3]) else {
             // RFC 9113 §4.1: unknown frame types MUST be ignored, except in the
             // middle of a header block.
@@ -598,12 +643,7 @@ impl Connection {
         } = frame.header;
         let payload = frame.payload;
 
-        if self.awaiting_peer_settings {
-            if frame_type != FrameType::Settings || flags.has(Flags::ACK) {
-                return Err(self.fail(ErrorCode::ProtocolError, "first frame must be SETTINGS"));
-            }
-            self.awaiting_peer_settings = false;
-        }
+        self.awaiting_peer_settings = false;
         if self.continuation.is_some() && frame_type != FrameType::Continuation {
             return Err(self.fail(ErrorCode::ProtocolError, "expected CONTINUATION"));
         }
@@ -693,42 +733,16 @@ impl Connection {
             self.cleanup(id);
             return Ok(());
         }
-        if self.config.flow_control == FlowControl::Automatic {
-            let can_recv = stream.can_recv();
-            if can_recv {
-                stream.recv_window += flow_len as i64;
-            }
-            self.release_connection(flow_len);
-            if can_recv && flow_len > 0 {
-                self.write_frame(
-                    FrameType::WindowUpdate,
-                    0,
-                    id,
-                    &encode_window_update(flow_len as u32),
-                );
-            }
-            self.events.push_back(Event::Data {
-                stream_id: id,
-                data: data.to_vec(),
-                end_stream,
-            });
-            self.cleanup(id);
-            return Ok(());
-        }
-        stream.unreleased += data.len();
-        // Padding is never delivered, so credit it back straight away.
-        if padding > 0 {
-            if stream.can_recv() {
-                stream.recv_window += padding as i64;
-                self.write_frame(
-                    FrameType::WindowUpdate,
-                    0,
-                    id,
-                    &encode_window_update(padding as u32),
-                );
-            }
-            self.release_connection(padding);
-        }
+        // Credit that goes back at once: the whole frame in automatic mode, but
+        // in manual mode only the padding, which is never delivered. The
+        // application releases the rest.
+        let credit = if self.config.flow_control == FlowControl::Manual {
+            stream.unreleased += data.len();
+            padding
+        } else {
+            flow_len
+        };
+        self.credit_received(id, credit);
         self.events.push_back(Event::Data {
             stream_id: id,
             data: data.to_vec(),
@@ -830,12 +844,8 @@ impl Connection {
             if self.goaway_sent {
                 return Ok(());
             }
-            let peer_open = self
-                .streams
-                .keys()
-                .filter(|k| self.is_peer_initiated(**k))
-                .count();
-            if peer_open >= self.config.max_concurrent_streams as usize {
+            // Without server push every open stream is peer-initiated here.
+            if self.streams.len() >= self.config.max_concurrent_streams as usize {
                 self.reset(id, ErrorCode::RefusedStream);
                 return Ok(());
             }
@@ -1044,22 +1054,17 @@ impl Connection {
         if self.next_local_id > MAX_WINDOW as u32 {
             return Err(Error::StreamIdExhausted);
         }
-        let local_open = self
-            .streams
-            .keys()
-            .filter(|id| !self.is_peer_initiated(**id))
-            .count();
-        if local_open >= self.peer.max_concurrent_streams as usize {
+        // Without server push every open stream is ours.
+        if self.streams.len() >= self.peer.max_concurrent_streams as usize {
             return Err(Error::StreamLimit);
         }
-        let stream = self.new_stream();
-        stream
-            .checked_headers(&headers, true, true, end_stream)
-            .map_err(Error::InvalidHeaders)?;
+        // Validate on the candidate, so a rejection leaves no trace.
+        let mut stream = self.new_stream();
         let id = self.next_local_id;
+        stream.queue_headers(id, headers, true, end_stream)?;
         self.next_local_id += 2;
         self.streams.insert(id, stream);
-        self.send_headers(id, headers, end_stream)?;
+        self.flush_stream(id);
         Ok(id)
     }
 
@@ -1071,28 +1076,7 @@ impl Connection {
         end_stream: bool,
     ) -> Result<(), Error> {
         let stream = self.streams.get_mut(&id).ok_or(Error::UnknownStream(id))?;
-        if stream.reset_after_flush.is_some()
-            || !matches!(
-                stream.state,
-                StreamState::Idle | StreamState::Open | StreamState::HalfClosedRemote
-            )
-        {
-            return Err(Error::StreamClosed(id));
-        }
-        let (section, body) = stream
-            .checked_headers(&headers, self.role == Role::Client, true, end_stream)
-            .map_err(Error::InvalidHeaders)?;
-        if !stream.apply(StreamEvent::SendHeaders) {
-            return Err(Error::StreamClosed(id));
-        }
-        stream.commit_headers(section, body, true);
-        if end_stream {
-            stream.apply(StreamEvent::SendEndStream);
-        }
-        stream.outbound.push_back(Outbound::Headers {
-            fields: headers,
-            end_stream,
-        });
+        stream.queue_headers(id, headers, self.role == Role::Client, end_stream)?;
         self.flush_stream(id);
         Ok(())
     }
@@ -1228,16 +1212,7 @@ impl Connection {
             return;
         }
         stream.unreleased -= n;
-        if stream.can_recv() {
-            stream.recv_window += n as i64;
-            self.write_frame(
-                FrameType::WindowUpdate,
-                0,
-                id,
-                &encode_window_update(n as u32),
-            );
-        }
-        self.release_connection(n);
+        self.credit_received(id, n);
     }
 
     /// Received body bytes delivered on the stream and not yet released with
@@ -1276,7 +1251,8 @@ impl Connection {
     fn send_goaway(&mut self, code: ErrorCode) {
         self.goaway_sent = true;
         let mut payload = [0u8; 8];
-        payload[..4].copy_from_slice(&self.last_peer_id.to_be_bytes());
+        let last_stream_id = *self.goaway_last_stream_id.get_or_insert(self.last_peer_id);
+        payload[..4].copy_from_slice(&last_stream_id.to_be_bytes());
         payload[4..].copy_from_slice(&(code as u32).to_be_bytes());
         self.write_frame(FrameType::GoAway, 0, 0, &payload);
     }
@@ -1335,6 +1311,26 @@ impl Connection {
         for stream in self.streams.values_mut() {
             stream.recv_window += delta;
         }
+    }
+
+    /// Credit `n` received bytes back to the peer: on the stream while it can
+    /// still receive, then on the connection.
+    fn credit_received(&mut self, id: StreamId, n: usize) {
+        if n == 0 {
+            return;
+        }
+        if let Some(stream) = self.streams.get_mut(&id)
+            && stream.can_recv()
+        {
+            stream.recv_window += n as i64;
+            self.write_frame(
+                FrameType::WindowUpdate,
+                0,
+                id,
+                &encode_window_update(n as u32),
+            );
+        }
+        self.release_connection(n);
     }
 
     /// Credit `n` bytes back to the peer's connection-level send window.

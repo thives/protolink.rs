@@ -9,8 +9,10 @@
 //!
 //! # Why
 //!
-//! ARQ polls its lower layer by hand. On every poll it creates a fresh `read`,
-//! `write` or `flush` future, polls it once, and drops it if it is pending (see
+//! ARQ polls its lower layer by hand. On every poll protolink's
+//! [`CobsTransport`](super::CobsTransport) creates a fresh `read_frame`,
+//! `write` or `flush` future on [`CobsFramed`](super::CobsFramed), which drives
+//! the raw stream, polls it once, and drops it if it is pending (see
 //! [the requirements](super#requirements-on-the-raw-stream)). That is harmless
 //! for a driver backed by a buffer that is filled and drained in the background
 //! (an interrupt-driven or ring-buffered UART). It breaks a driver that starts a

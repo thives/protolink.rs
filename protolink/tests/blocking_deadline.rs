@@ -260,19 +260,20 @@ fn expired(result: Option<Result<(), Status>>) {
     assert_eq!(status.code, Code::DeadlineExceeded, "{status:?}");
 }
 
-#[test]
-fn server_with_a_clock_expires_a_quiet_call() {
+/// A server driven by `run` ends a quiet call at its deadline, not before, and
+/// sets its read timeout to the time left.
+fn expires_a_quiet_call<F>(run: F)
+where
+    F: FnOnce(ChannelIo, &mut Quiet) -> ServerResult + Send + 'static,
+{
     let (io, mut peer) = connect();
     let handler = peer.handler();
-    let server = spawn(io, handler, |io, h| {
-        serve_with_clock(io, h, ServerConfig::default(), Wall::new())
-    });
+    let server = spawn(io, handler, run);
     let started = Instant::now();
     let id = peer.start(DEADLINE);
     expired(peer.end(id, TIMEOUT));
     assert!(started.elapsed() >= DEADLINE, "expired early");
     assert_eq!(peer.cancelled.load(SeqCst), 1);
-    // The read timeout was set to the time left until the deadline.
     let timeouts = peer.timeouts.lock().unwrap().clone();
     assert!(
         timeouts.iter().any(|t| t.is_some_and(|t| t <= DEADLINE)),
@@ -283,24 +284,15 @@ fn server_with_a_clock_expires_a_quiet_call() {
 }
 
 #[test]
+fn server_with_a_clock_expires_a_quiet_call() {
+    expires_a_quiet_call(|io, h| serve_with_clock(io, h, ServerConfig::default(), Wall::new()));
+}
+
+#[test]
 fn wakeable_server_with_a_clock_expires_a_quiet_call() {
-    let (io, mut peer) = connect();
-    let handler = peer.handler();
-    let server = spawn(io, handler, |io, h| {
+    expires_a_quiet_call(|io, h| {
         serve_wakeable_with_clock(io, h, ServerConfig::default(), Wall::new())
     });
-    let started = Instant::now();
-    let id = peer.start(DEADLINE);
-    expired(peer.end(id, TIMEOUT));
-    assert!(started.elapsed() >= DEADLINE, "expired early");
-    assert_eq!(peer.cancelled.load(SeqCst), 1);
-    let timeouts = peer.timeouts.lock().unwrap().clone();
-    assert!(
-        timeouts.iter().any(|t| t.is_some_and(|t| t <= DEADLINE)),
-        "{timeouts:?}"
-    );
-    peer.eof();
-    server.join().unwrap().unwrap();
 }
 
 #[test]

@@ -2,7 +2,8 @@
 //!
 //! [`Metadata`] is an ordered list of entries that may repeat a key. Keys are
 //! lowercase ASCII (`[0-9a-z_.-]`). A value is either ASCII text (printable
-//! characters, `0x20..=0x7e`) or, for keys ending in `-bin`, arbitrary bytes
+//! characters, `0x20..=0x7e`, without leading or trailing spaces, which HTTP/2
+//! field values can't carry; inserting such a value is an error, not trimmed) or, for keys ending in `-bin`, arbitrary bytes
 //! that are base64-encoded on the wire.
 //!
 //! Names that belong to HTTP/2 or gRPC themselves can't be used: pseudo-headers
@@ -48,7 +49,8 @@ pub enum InvalidMetadata {
     Key,
     /// The key is reserved for HTTP/2 or gRPC.
     ReservedKey,
-    /// The ASCII value has characters outside `0x20..=0x7e`.
+    /// The ASCII value has characters outside `0x20..=0x7e`, or starts or ends
+    /// with a space.
     Value,
     /// A text value was given for a key ending in `-bin`, or a binary value
     /// for a key that doesn't.
@@ -64,7 +66,9 @@ impl fmt::Display for InvalidMetadata {
         f.write_str(match self {
             Self::Key => "invalid metadata key",
             Self::ReservedKey => "reserved metadata key",
-            Self::Value => "invalid metadata value",
+            Self::Value => {
+                "invalid metadata value: only printable ASCII, without leading or trailing spaces"
+            }
             Self::BinarySuffix => "binary values need a key ending in `-bin`, and only those",
             Self::Base64 => "malformed base64 in a binary metadata value",
             Self::TooLarge => "received metadata exceeds entry or owned-byte limits",
@@ -109,6 +113,12 @@ impl Metadata {
     }
 
     /// Append a text entry. A key already present gets another value.
+    ///
+    /// The value must be printable ASCII (`0x20..=0x7e`) and must not start or
+    /// end with a space: HTTP/2 can't carry boundary whitespace, and the value
+    /// is rejected with [`InvalidMetadata::Value`] rather than trimmed.
+    /// Empty values and internal spaces are fine. A rejected insertion leaves
+    /// the metadata unchanged.
     pub fn insert(&mut self, key: &str, value: &str) -> Result<(), InvalidMetadata> {
         check_key(key)?;
         if key.ends_with(BIN_SUFFIX) {
@@ -118,6 +128,14 @@ impl Metadata {
         self.entries
             .push((key.into(), MetadataValue::Ascii(value.into())));
         Ok(())
+    }
+
+    /// Append a text entry without validating the value, to exercise defensive
+    /// outbound checks with input the public API refuses.
+    #[cfg(test)]
+    pub(crate) fn insert_unchecked_for_test(&mut self, key: &str, value: &str) {
+        self.entries
+            .push((key.into(), MetadataValue::Ascii(value.into())));
     }
 
     /// Append a binary entry; `key` must end in `-bin`.
@@ -317,7 +335,12 @@ fn check_key(key: &str) -> Result<(), InvalidMetadata> {
 }
 
 fn check_ascii(value: &str) -> Result<(), InvalidMetadata> {
-    if value.bytes().all(|b| (0x20..=0x7e).contains(&b)) {
+    // HTTP/2 field values can't start or end with whitespace, so such values
+    // could never be sent.
+    if value.bytes().all(|b| (0x20..=0x7e).contains(&b))
+        && !value.starts_with(' ')
+        && !value.ends_with(' ')
+    {
         Ok(())
     } else {
         Err(InvalidMetadata::Value)

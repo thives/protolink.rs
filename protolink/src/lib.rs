@@ -86,7 +86,7 @@ pub use protolink_grpc as grpc;
 pub use protolink_grpc::{
     BlockingStreamingCall, BlockingStreamingTransport, BlockingUnaryTransport, CallContext, CallId,
     CallOptions, ClientConfig, Code, Compression, Handler, InvalidMetadata, Metadata,
-    MetadataValue, MethodKind, Next, Response, ResponseMetadata, ServerConfig, Status,
+    MetadataValue, MethodKind, Next, Response, ResponseMetadata, Scheme, ServerConfig, Status,
     StreamingCall, StreamingTransport, UnaryTransport, compression,
 };
 

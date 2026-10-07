@@ -6,5 +6,5 @@ members = [
     "protolink-grpc-gen",
     "examples/embedded-device"
 ]
-exclude = ["vendor/arq-io-async", "examples/embedded-smoke"]
+exclude = ["examples/embedded-smoke"]
 resolver = "3"

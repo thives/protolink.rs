@@ -61,6 +61,10 @@ impl Body {
         }
     }
 
+    pub(crate) fn is_tunnel(&self) -> bool {
+        self.rule == BodyRule::Tunnel
+    }
+
     pub(crate) fn tunnel(&mut self) {
         self.rule = BodyRule::Tunnel;
     }

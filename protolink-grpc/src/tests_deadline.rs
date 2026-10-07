@@ -3,21 +3,15 @@
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::task::{Context, Poll, Waker};
+use core::task::{Context, Poll};
 use core::time::Duration;
 
 use super::*;
+use crate::test_support::{header, hf, pump};
 use protolink_http2::{Connection, ErrorCode, Event, HeaderField};
 
 fn ms(n: u64) -> Duration {
     Duration::from_millis(n)
-}
-
-fn header<'a>(headers: &'a [HeaderField], name: &str) -> Option<&'a str> {
-    headers
-        .iter()
-        .find(|h| h.name == name)
-        .map(|h| h.value.as_str())
 }
 
 /// An HTTP/2 server connection that only records what the client sent.
@@ -223,15 +217,6 @@ fn echo(path: &str, req: &[u8]) -> Option<Result<Vec<u8>, Status>> {
     (path == "/t.T/Echo").then(|| Ok(req.to_vec()))
 }
 
-fn pump(client: &mut Client, server: &mut Server, handler: &mut impl Handler) {
-    let mut cx = Context::from_waker(Waker::noop());
-    for _ in 0..16 {
-        server.recv(&client.take_output(), handler).unwrap();
-        server.poll(handler, &mut cx);
-        client.recv(&server.take_output()).unwrap();
-    }
-}
-
 #[test]
 fn a_call_that_completes_in_time_is_unaffected() {
     let mut client = Client::new(ClientConfig::default());
@@ -354,13 +339,6 @@ fn late_response_after_the_deadline_is_ignored() {
 // ---------------------------------------------------------------------------
 // Server
 // ---------------------------------------------------------------------------
-
-fn hf(name: &str, value: &str) -> HeaderField {
-    HeaderField {
-        name: name.into(),
-        value: value.into(),
-    }
-}
 
 /// A raw HTTP/2 client talking to a [`Server`], so that requests the real
 /// client would never send can be made.

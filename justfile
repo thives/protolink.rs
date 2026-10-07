@@ -1,4 +1,4 @@
-all: check build embedded features test clippy fmt docs coverage miri
+all: build embedded features test clippy fmt docs miri
 
 # no_std crates that must build for embedded targets
 no_std := "-p protolink -p protolink-grpc -p protolink-http2"
@@ -6,8 +6,11 @@ no_std := "-p protolink -p protolink-grpc -p protolink-http2"
 clippy:
   cargo clippy --workspace --all-features --all-targets -- -D warnings
 
+# The root workspace and the two standalone fixture workspaces
 fmt:
   cargo fmt --all -- --check
+  cargo fmt --manifest-path examples/embedded-smoke/Cargo.toml --all -- --check
+  cargo fmt --manifest-path protolink-grpc-gen/tests/compile-fixture/Cargo.toml --all -- --check
 
 check:
   cargo check --workspace --all-features

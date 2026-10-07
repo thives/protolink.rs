@@ -1,9 +1,11 @@
 extern crate std;
 
 use super::*;
+use crate::test_support::{hf, pump, send_raw};
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
-use protolink_http2::{Connection, Event, HeaderField};
+use protolink_http2::{Event, HeaderField};
 
 fn echo(path: &str, req: &[u8]) -> Option<Result<Vec<u8>, Status>> {
     match path {
@@ -14,24 +16,12 @@ fn echo(path: &str, req: &[u8]) -> Option<Result<Vec<u8>, Status>> {
     }
 }
 
-fn run(client: &mut Client, server: &mut Server, handler: &mut impl Handler) {
-    for _ in 0..16 {
-        if !client.has_output() && !server.has_output() {
-            return;
-        }
-        let out = client.take_output();
-        server.recv(&out, handler).unwrap();
-        let out = server.take_output();
-        client.recv(&out).unwrap();
-    }
-}
-
 fn call(path: &str, req: &[u8]) -> Result<Vec<u8>, Status> {
     let mut client = Client::new(ClientConfig::default());
     let mut server = Server::new(ServerConfig::default());
     let mut handler = FnHandler(echo);
     let id = client.start_unary(path, req).unwrap();
-    run(&mut client, &mut server, &mut handler);
+    pump(&mut client, &mut server, &mut handler);
     client
         .take_response(id)
         .expect("call finished")
@@ -110,7 +100,7 @@ fn oversized_request_is_rejected() {
     let id = client
         .start_unary("/test.Echo/Echo", &vec![0; 50_000])
         .unwrap();
-    run(&mut client, &mut server, &mut handler);
+    pump(&mut client, &mut server, &mut handler);
     assert_eq!(
         client.take_response(id).unwrap().unwrap_err().code,
         Code::ResourceExhausted
@@ -124,13 +114,13 @@ fn multiple_calls_on_one_connection() {
     let mut handler = FnHandler(echo);
     let a = client.start_unary("/test.Echo/Echo", b"a").unwrap();
     let b = client.start_unary("/test.Echo/Echo", b"b").unwrap();
-    run(&mut client, &mut server, &mut handler);
+    pump(&mut client, &mut server, &mut handler);
     let body =
         |r: Option<Result<Response<Vec<u8>>, Status>>| r.map(|r| r.map(Response::into_message));
     assert_eq!(body(client.take_response(a)), Some(Ok(b"a".to_vec())));
     assert_eq!(body(client.take_response(b)), Some(Ok(b"b".to_vec())));
     let c = client.start_unary("/test.Echo/Echo", b"c").unwrap();
-    run(&mut client, &mut server, &mut handler);
+    pump(&mut client, &mut server, &mut handler);
     assert_eq!(body(client.take_response(c)), Some(Ok(b"c".to_vec())));
 }
 
@@ -150,23 +140,8 @@ fn tuple_handlers_route_in_order() {
 
 /// Drive the server with a raw HTTP/2 client to check non-gRPC requests.
 fn raw_request(headers: Vec<HeaderField>, body: &[u8]) -> Vec<Event> {
-    let mut conn = Connection::client(Default::default());
     let mut server = Server::new(ServerConfig::default());
-    let mut handler = FnHandler(echo);
-    let id = conn.open_stream(headers, false).unwrap();
-    conn.send_data(id, body.to_vec(), true).unwrap();
-    for _ in 0..8 {
-        server.recv(&conn.take_output(), &mut handler).unwrap();
-        conn.recv(&server.take_output()).unwrap();
-    }
-    core::iter::from_fn(|| conn.poll_event()).collect()
-}
-
-fn hf(n: &str, v: &str) -> HeaderField {
-    HeaderField {
-        name: n.into(),
-        value: v.into(),
-    }
+    send_raw(&mut server, &mut FnHandler(echo), headers, body)
 }
 
 #[test]
@@ -187,28 +162,58 @@ fn wrong_content_type_is_415() {
 }
 
 #[test]
-fn compressed_message_without_encoding_is_internal() {
-    let ev = raw_request(
-        vec![
-            hf(":method", "POST"),
-            hf(":scheme", "http"),
-            hf(":path", "/test.Echo/Echo"),
-            hf("content-type", "application/grpc"),
-        ],
-        &[1, 0, 0, 0, 0],
-    );
-    // The flag needs a `grpc-encoding` the call agreed on (see
-    // `tests_compression`).
-    assert!(
-        matches!(&ev[0], Event::Headers { headers, end_stream: true, .. }
-            if headers.iter().any(|h| h.name == "grpc-status" && h.value == "13")),
-        "{ev:?}"
-    );
-}
-
-#[test]
 fn grpc_message_percent_encoding_round_trips() {
     let s = "a%b\n\u{e6}";
     assert_eq!(status::decode_message(&status::encode_message(s)), s);
-    assert_eq!(status::encode_message("100%"), "100%25");
+    for (input, encoded) in [
+        ("", ""),
+        (" denied", "%20denied"),
+        ("denied ", "denied%20"),
+        ("   ", "%20%20%20"),
+        ("access denied", "access%20denied"),
+        ("100%", "100%25"),
+    ] {
+        assert_eq!(status::encode_message(input), encoded);
+        assert_eq!(status::decode_message(encoded), input);
+    }
+    for input in ["a\tb", "line\nbreak\r\n", "caf\u{e9} \u{1f600}", "\t \n"] {
+        assert_eq!(
+            status::decode_message(&status::encode_message(input)),
+            input
+        );
+    }
+}
+
+/// The `:scheme` of the request headers a bare HTTP/2 server receives.
+fn request_scheme(config: ClientConfig, streaming: bool) -> String {
+    let mut client = Client::new(config);
+    let mut server = protolink_http2::Connection::server(protolink_http2::Config::default());
+    if streaming {
+        client.start_streaming("/test.Echo/Echo").unwrap();
+    } else {
+        client.start_unary("/test.Echo/Echo", b"x").unwrap();
+    }
+    server.recv(&client.take_output()).unwrap();
+    core::iter::from_fn(|| server.poll_event())
+        .find_map(|e| match e {
+            Event::Headers { headers, .. } => headers
+                .into_iter()
+                .find(|h| h.name == ":scheme")
+                .map(|h| h.value),
+            _ => None,
+        })
+        .expect("request headers with :scheme")
+}
+
+#[test]
+fn request_scheme_is_configurable() {
+    assert_eq!(ClientConfig::default().scheme, Scheme::Http);
+    for streaming in [false, true] {
+        assert_eq!(request_scheme(ClientConfig::default(), streaming), "http");
+        let https = ClientConfig {
+            scheme: Scheme::Https,
+            ..ClientConfig::default()
+        };
+        assert_eq!(request_scheme(https, streaming), "https");
+    }
 }

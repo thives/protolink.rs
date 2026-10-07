@@ -1,39 +1,5 @@
 use super::*;
 
-fn wire_frame(kind: FrameType, id: StreamId, flags: u8, payload: &[u8]) -> Vec<u8> {
-    let mut out = vec![0; 9 + payload.len()];
-    encode_frame(
-        &FrameHeader {
-            length: payload.len() as u32,
-            frame_type: kind,
-            flags: Flags(flags),
-            stream_id: id,
-        },
-        payload,
-        &mut out,
-        u32::MAX,
-    )
-    .unwrap();
-    out
-}
-
-fn wire_headers(
-    conn: &mut Connection,
-    encoder: &mut Encoder,
-    id: StreamId,
-    fields: &[HeaderField],
-    end: bool,
-) {
-    let block = encoder.encode(fields);
-    conn.recv(&wire_frame(
-        FrameType::Headers,
-        id,
-        Flags::END_HEADERS | if end { Flags::END_STREAM } else { 0 },
-        &block,
-    ))
-    .unwrap();
-}
-
 fn setting(conn: &mut Connection, id: SettingId, value: u32) {
     conn.recv(&wire_frame(
         FrameType::Settings,
@@ -42,17 +8,6 @@ fn setting(conn: &mut Connection, id: SettingId, value: u32) {
         &encode_settings(&[Setting { id, value }]),
     ))
     .unwrap();
-}
-
-fn assert_reset(conn: &mut Connection, id: StreamId, code: ErrorCode) {
-    assert_eq!(
-        events(conn),
-        vec![Event::Reset {
-            stream_id: id,
-            error_code: code
-        }]
-    );
-    assert!(!conn.is_closed());
 }
 
 #[test]
@@ -168,18 +123,32 @@ fn initial_zero_encoder_update_precedes_fragmentation_and_is_not_repeated() {
                 .into_iter()
                 .map(|h| h.into_field().unwrap())
                 .collect::<Vec<_>>(),
-            headers
+            headers.clone()
         );
         s.recv(&first).unwrap();
         assert_eq!(s.decoder.decode(&[], 1).unwrap(), vec![]);
+        assert_eq!(
+            events(&mut s),
+            vec![Event::Headers {
+                stream_id: 1,
+                headers,
+                end_stream: true
+            }]
+        );
         // A later reduction needs no further update: the synchronized table is already zero.
         setting(&mut c, SettingId::HeaderTableSize, 0);
         c.take_output();
         c.open_stream(request_headers(), true).unwrap();
-        let f = frames(&c.take_output());
+        let second = c.take_output();
+        let f = frames(&second);
         assert_ne!(f[0].3[0], 0x20);
         let block: Vec<_> = f.iter().flat_map(|f| f.3.iter().copied()).collect();
         strict.decode(&block, 8192).unwrap();
+        s.recv(&second).unwrap();
+        assert!(matches!(
+            &events(&mut s)[..],
+            [Event::Headers { stream_id: 3, headers, end_stream: true }] if *headers == request_headers()
+        ));
     }
 }
 
@@ -414,26 +383,203 @@ fn response_and_trailer_validation_is_atomic_outbound_and_stream_local_inbound()
     }
 }
 
-#[test]
-fn connect_and_empty_terminal_trailers_are_accepted() {
+fn connect_headers() -> Vec<HeaderField> {
+    vec![hf(":method", "CONNECT"), hf(":authority", "host:443")]
+}
+
+/// A client and server with an established CONNECT tunnel on stream 1, all
+/// events and output drained.
+fn tunnel() -> (Connection, Connection, StreamId) {
     let mut c = Connection::client(Config::default());
     let mut s = Connection::server(Config::default());
     exchange(&mut c, &mut s);
-    let id = c
-        .open_stream(
-            vec![hf(":method", "CONNECT"), hf(":authority", "host:443")],
-            false,
-        )
-        .unwrap();
-    c.send_headers(id, vec![], true).unwrap();
+    let id = c.open_stream(connect_headers(), false).unwrap();
     exchange(&mut c, &mut s);
-    assert_eq!(events(&mut s).len(), 2);
     s.send_headers(id, vec![hf(":status", "200")], false)
         .unwrap();
-    s.send_headers(id, vec![], true).unwrap();
+    exchange(&mut c, &mut s);
+    events(&mut c);
+    events(&mut s);
+    (c, s, id)
+}
+
+#[test]
+fn established_connect_closes_through_data() {
+    let (mut c, mut s, id) = tunnel();
+    c.send_data(id, b"up".to_vec(), true).unwrap();
+    s.send_data(id, b"down".to_vec(), true).unwrap();
+    exchange(&mut c, &mut s);
+    assert_eq!(events(&mut c).len(), 1);
+    assert_eq!(events(&mut s).len(), 1);
+    assert!(!c.has_stream(id));
+    assert!(!s.has_stream(id));
+}
+
+#[test]
+fn established_connect_rejects_outbound_headers_atomically() {
+    for fields in [vec![], vec![hf("x-trailer", "1")]] {
+        for from_client in [true, false] {
+            let (mut c, mut s, id) = tunnel();
+            let conn = if from_client { &mut c } else { &mut s };
+            let (phase, state) = (conn.streams[&id].send_phase, conn.streams[&id].state);
+            assert!(matches!(
+                conn.send_headers(id, fields.clone(), true),
+                Err(Error::InvalidHeaders(_))
+            ));
+            assert_eq!(conn.streams[&id].send_phase, phase);
+            assert_eq!(conn.streams[&id].state, state);
+            assert!(!conn.has_output());
+            conn.send_data(id, b"still open".to_vec(), true).unwrap();
+            exchange(&mut c, &mut s);
+            assert!(!events(if from_client { &mut s } else { &mut c }).is_empty());
+        }
+    }
+}
+
+#[test]
+fn established_connect_resets_on_inbound_headers() {
+    for fields in [vec![], vec![hf("x-trailer", "1")]] {
+        for to_client in [true, false] {
+            let (mut c, mut s, id) = tunnel();
+            let target = if to_client { &mut c } else { &mut s };
+            wire_headers(target, &mut Encoder::new(), id, &fields, true);
+            assert_reset(target, id, ErrorCode::ProtocolError);
+            // Other streams keep working.
+            let other = c.open_stream(request_headers(), true).unwrap();
+            exchange(&mut c, &mut s);
+            let ev = events(&mut s);
+            assert!(
+                ev.iter()
+                    .any(|e| matches!(e, Event::Headers { stream_id, .. } if *stream_id == other)),
+                "{ev:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn connect_before_establishment_keeps_ordinary_header_rules() {
+    // Informational responses precede the successful one.
+    let mut c = Connection::client(Config::default());
+    let mut s = Connection::server(Config::default());
+    exchange(&mut c, &mut s);
+    let id = c.open_stream(connect_headers(), false).unwrap();
+    exchange(&mut c, &mut s);
+    s.send_headers(id, vec![hf(":status", "103")], false)
+        .unwrap();
+    s.send_headers(id, vec![hf(":status", "200")], false)
+        .unwrap();
     exchange(&mut c, &mut s);
     assert_eq!(events(&mut c).len(), 2);
+
+    // An unsuccessful CONNECT response is an ordinary response with trailers.
+    let id = c.open_stream(connect_headers(), false).unwrap();
+    exchange(&mut c, &mut s);
+    s.send_headers(id, vec![hf(":status", "404")], false)
+        .unwrap();
+    s.send_data(id, b"no".to_vec(), false).unwrap();
+    s.send_headers(id, vec![hf("x-trailer", "1")], true)
+        .unwrap();
+    exchange(&mut c, &mut s);
+    assert!(events(&mut c).len() >= 3);
+
+    // Ordinary requests accept trailers.
+    let id = c.open_stream(request_headers(), false).unwrap();
+    c.send_data(id, b"x".to_vec(), false).unwrap();
+    c.send_headers(id, vec![hf("x-trailer", "1")], true)
+        .unwrap();
+    exchange(&mut c, &mut s);
+    assert!(events(&mut s).iter().any(
+        |e| matches!(e, Event::Headers { stream_id, end_stream: true, .. } if *stream_id == id)
+    ));
+}
+
+fn goaway_ids(out: &[u8]) -> Vec<(StreamId, u32)> {
+    frames(out)
+        .into_iter()
+        .filter(|f| f.0 == FrameType::GoAway as u8)
+        .map(|f| {
+            (
+                u32::from_be_bytes([f.3[0], f.3[1], f.3[2], f.3[3]]),
+                u32::from_be_bytes([f.3[4], f.3[5], f.3[6], f.3[7]]),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn goaway_cutoff_never_increases_across_frames() {
+    let mut c = Connection::client(Config::default());
+    let mut s = Connection::server(Config::default());
+    exchange(&mut c, &mut s);
+    // A raw client keeps one HPACK table across the blocks below.
+    let mut encoder = Encoder::new();
+    wire_headers(&mut s, &mut encoder, 1, &request_headers(), true);
+    assert!(s.has_stream(1));
+    events(&mut s);
+    s.go_away(ErrorCode::NoError);
+    assert_eq!(goaway_ids(&s.take_output()), [(1, 0)]);
+    // The client has not seen the GOAWAY yet.
+    wire_headers(&mut s, &mut encoder, 3, &request_headers(), true);
+    assert!(!s.has_stream(3));
+    assert!(events(&mut s).is_empty());
+    // Discarded blocks are still decoded: a later indexed block stays in sync.
+    wire_headers(&mut s, &mut encoder, 5, &request_headers(), true);
+    assert!(!s.has_stream(5));
+    assert!(events(&mut s).is_empty());
+    assert!(!s.is_closed());
+    // Repeated graceful shutdown stays silent.
+    s.go_away(ErrorCode::NoError);
+    assert!(!s.has_output());
+    s.recv(&wire_frame(FrameType::Settings, 1, 0, &[]))
+        .unwrap_err();
+    assert_eq!(
+        goaway_ids(&s.take_output()),
+        [(1, ErrorCode::ProtocolError as u32)]
+    );
+}
+
+#[test]
+fn goaway_before_any_request_keeps_cutoff_zero() {
+    let mut c = Connection::client(Config::default());
+    let mut s = Connection::server(Config::default());
+    exchange(&mut c, &mut s);
+    s.go_away(ErrorCode::NoError);
+    assert_eq!(goaway_ids(&s.take_output()), [(0, 0)]);
+    wire_headers(&mut s, &mut Encoder::new(), 1, &request_headers(), true);
+    assert!(events(&mut s).is_empty());
+    s.recv(&wire_frame(FrameType::Settings, 1, 0, &[]))
+        .unwrap_err();
+    assert_eq!(
+        goaway_ids(&s.take_output()),
+        [(0, ErrorCode::ProtocolError as u32)]
+    );
+}
+
+#[test]
+fn existing_streams_complete_after_graceful_shutdown() {
+    let mut c = Connection::client(Config::default());
+    let mut s = Connection::server(Config::default());
+    exchange(&mut c, &mut s);
+    let id = c.open_stream(request_headers(), false).unwrap();
+    exchange(&mut c, &mut s);
+    s.go_away(ErrorCode::NoError);
+    exchange(&mut c, &mut s);
+    c.send_data(id, b"body".to_vec(), true).unwrap();
+    exchange(&mut c, &mut s);
+    s.send_headers(id, vec![hf(":status", "200")], false)
+        .unwrap();
+    s.send_data(id, b"ok".to_vec(), true).unwrap();
+    exchange(&mut c, &mut s);
+    assert!(!s.has_stream(id));
     assert!(!c.has_stream(id));
+    assert!(events(&mut c).iter().any(|e| matches!(
+        e,
+        Event::Data {
+            end_stream: true,
+            ..
+        }
+    )));
 }
 
 #[test]
@@ -469,20 +615,30 @@ fn automatic_small_window_valid_data_and_padding_are_replenished() {
     let id = c.open_stream(request_headers(), false).unwrap();
     exchange(&mut c, &mut s);
     events(&mut s);
-    for _ in 0..3 {
-        let mut frame = data_frame(id, 100, Flags::PADDED);
-        frame[9] = 6;
+    for padded in [true, false, true] {
+        let mut frame = data_frame(id, 100, if padded { Flags::PADDED } else { 0 });
+        if padded {
+            frame[9] = 6;
+        }
         s.recv(&frame).unwrap();
-        assert_eq!(data_len(&events(&mut s), id), 93);
+        assert_eq!(data_len(&events(&mut s), id), if padded { 93 } else { 100 });
         assert_eq!(s.streams[&id].recv_window, 100);
         assert_eq!(s.conn_recv_window, DEFAULT_WINDOW);
+        // The whole frame is credited at once, the stream first.
         let updates = frames(&s.take_output());
-        assert_eq!(updates.len(), 2);
+        assert_eq!(
+            updates.iter().map(|f| f.2).collect::<Vec<_>>(),
+            [id, 0],
+            "stream first, then connection"
+        );
         assert!(
             updates
                 .iter()
                 .all(|f| f.0 == FrameType::WindowUpdate as u8 && f.3 == 100u32.to_be_bytes())
         );
+        assert_eq!(s.unreleased_recv_bytes(id), Some(0));
+        s.release_capacity(id, 100);
+        assert!(!s.has_output(), "release_capacity is a no-op");
     }
 }
 

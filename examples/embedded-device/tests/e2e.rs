@@ -147,31 +147,6 @@ async fn async_over_tcp() {
     .await;
 }
 
-#[test]
-fn blocking_client_and_server_over_tcp() {
-    use embedded_io_adapters::std::FromStd;
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server = std::thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
-        let mut handler = ServiceServer(Device::default());
-        protolink::blocking::serve(FromStd::new(stream), &mut handler, ServerConfig::default())
-            .unwrap();
-    });
-    let stream = std::net::TcpStream::connect(addr).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
-    let mut client = ServiceBlockingClient::new(protolink::blocking::Client::new(
-        FromStd::new(stream),
-        ClientConfig::default(),
-    ));
-    let reply = client.command(&get_status(Some(11))).unwrap();
-    assert_eq!(reply.correlation_id(), Some(&11));
-    drop(client);
-    server.join().unwrap();
-}
-
 #[tokio::test]
 async fn grpc_over_cobs_framing() {
     use protolink::link::CobsFramed;
@@ -369,9 +344,32 @@ fn blocking_streaming_over_tcp() {
         ClientConfig::default(),
     ));
 
+    // An empty replay is a trailers-only response: all its metadata is
+    // trailing.
     let mut events = client.event_subscribe(&EventSubscribe {}).unwrap();
     assert!(events.message().unwrap().is_none());
+    assert!(events.headers().is_none());
+    assert_eq!(
+        events.trailers().unwrap().get("x-events-replayed"),
+        Some("0")
+    );
     drop(events);
+
+    // Request metadata is echoed in the response headers.
+    let mut metadata = Metadata::new();
+    metadata.insert("x-request-id", "req-7").unwrap();
+    let reply = client
+        .command_with_options(&get_status(Some(3)), CallOptions::metadata(metadata))
+        .unwrap();
+    assert_eq!(reply.headers.get("x-request-id"), Some("req-7"));
+    assert_eq!(reply.trailers.get("x-device-uptime-ms"), Some("0"));
+
+    // A call that fails: its trailers are in the status.
+    let err = client
+        .command_with_options(&Command::default(), CallOptions::new())
+        .unwrap_err();
+    assert_eq!(err.code, Code::InvalidArgument);
+    assert_eq!(err.metadata.get("x-device-uptime-ms"), Some("0"));
 
     let mut batch = client.command_batch().unwrap();
     batch.send(&set_output(2, true)).unwrap();
@@ -596,54 +594,4 @@ async fn metadata_through_generated_clients() {
         assert!(events.trailers().is_none(), "the call is still running");
     })
     .await;
-}
-
-#[test]
-fn blocking_metadata_over_tcp() {
-    use embedded_io_adapters::std::FromStd;
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server = std::thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
-        let mut handler = ServiceServer(Device::default());
-        protolink::blocking::serve(FromStd::new(stream), &mut handler, ServerConfig::default())
-            .unwrap();
-    });
-    let stream = std::net::TcpStream::connect(addr).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
-    let mut client = ServiceBlockingClient::new(protolink::blocking::Client::new(
-        FromStd::new(stream),
-        ClientConfig::default(),
-    ));
-
-    let mut metadata = Metadata::new();
-    metadata.insert("x-request-id", "req-7").unwrap();
-    let reply = client
-        .command_with_options(&get_status(Some(3)), CallOptions::metadata(metadata))
-        .unwrap();
-    assert_eq!(reply.headers.get("x-request-id"), Some("req-7"));
-    assert_eq!(reply.trailers.get("x-device-uptime-ms"), Some("0"));
-
-    // A call that fails: its trailers are in the status.
-    let err = client
-        .command_with_options(&Command::default(), CallOptions::new())
-        .unwrap_err();
-    assert_eq!(err.code, Code::InvalidArgument);
-    assert_eq!(err.metadata.get("x-device-uptime-ms"), Some("0"));
-
-    // An empty replay is a trailers-only response: all its metadata is
-    // trailing.
-    let mut events = client.event_subscribe(&EventSubscribe {}).unwrap();
-    assert!(events.message().unwrap().is_none());
-    assert!(events.headers().is_none());
-    assert_eq!(
-        events.trailers().unwrap().get("x-events-replayed"),
-        Some("0")
-    );
-
-    drop(events);
-    drop(client);
-    server.join().unwrap();
 }

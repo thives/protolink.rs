@@ -100,7 +100,7 @@ async fn h2_client_against_protolink_server() {
         let (_, body, trailers) = h2_call(&mut sender, "/echo.Echo/Fail", lpm(b"")).await;
         assert!(body.is_empty());
         assert_eq!(trailers["grpc-status"], "5");
-        assert_eq!(trailers["grpc-message"], "no such thing");
+        assert_eq!(trailers["grpc-message"], "no%20such%20thing");
 
         let (_, _, trailers) = h2_call(&mut sender, "/echo.Echo/Missing", lpm(b"")).await;
         assert_eq!(trailers["grpc-status"], "12");

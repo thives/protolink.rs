@@ -78,6 +78,7 @@ mod client;
 #[cfg(feature = "micropb")]
 pub mod codec;
 pub mod compression;
+mod fields;
 mod handler;
 mod inbound;
 pub mod lpm;
@@ -88,7 +89,7 @@ mod timeout;
 
 pub use protolink_http2 as http2;
 
-pub use client::{CallOptions, Client, ClientConfig};
+pub use client::{CallOptions, Client, ClientConfig, Scheme};
 pub use compression::Compression;
 pub use handler::{CallContext, FnHandler, Handler, ResponseMetadata};
 pub use metadata::{InvalidMetadata, Metadata, MetadataValue};
@@ -341,6 +342,8 @@ impl<T: BlockingStreamingTransport + ?Sized> BlockingStreamingTransport for &mut
     }
 }
 
+#[cfg(test)]
+mod test_support;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

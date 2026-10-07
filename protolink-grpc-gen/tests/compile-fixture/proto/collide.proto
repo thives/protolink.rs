@@ -1,0 +1,9 @@
+syntax = "proto3";
+package foo;
+
+message Msg { uint32 value = 1; }
+
+// With default suffixing `Foo_` is `foo_`, the package module; without it `Foo`
+// is `foo`, the package module's raw name. The colliding service is renamed.
+service Foo_ { rpc Call(Msg) returns (Msg); }
+service Foo { rpc Call(Msg) returns (Msg); }

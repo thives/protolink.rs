@@ -7,7 +7,7 @@ Implementation follow-up to `REVIEW.md`. The original review is preserved as the
 | Finding | Implementation and regressions |
 |---|---|
 | 1 — HPACK allocation bounds | `protolink-http2/src/hpack.rs` and `huffman.rs`: bounded literal/Huffman decoding, indexed-size checks before cloning, negotiated dynamic-table maximum; decoder materialization regressions. Oversized lists terminate the connection rather than desynchronize HPACK. |
-| 2 — Corrupted ARQ lengths | `protolink/src/link.rs` and `vendor/arq-io-async`: complete COBS frames enter exact-length/type/CRC/BCH validation. Invalid frames are discarded whole. Corrupt lengths, payloads, ACKs, fragmented/adjacent frames, retransmission and flush regressions. Noise processing yields after bounded work. |
+| 2 — Corrupted ARQ lengths | `protolink/src/link.rs` (originally with a vendored ARQ patch; now the published `arq-io-async` 0.0.3, see `LINK.md`): complete COBS frames enter exact-length/type/CRC/BCH validation. Invalid frames are discarded whole. Corrupt lengths, payloads, ACKs, fragmented/adjacent frames, retransmission and flush regressions. Noise processing yields after bounded work. |
 | 3 — Transport replay | Blocking and async client terminal-failure latches reject subsequent calls and perform no further I/O. Scripted partial-write and flush failures verify no replay; buffered results remain accessible. |
 | 4 — Async server cancellation | Serving-state RAII guard cancels active handlers exactly once on completion, error, future drop, and task abortion, including suspended read/write/flush. |
 | 5 — Server draining deadlines | Handler completion and output completion are separate. Draining records retain deadlines through transport flush. Expiry resets flow-control-blocked output immediately; fully framed success output retains its expiry obligation so drivers retire indeterminate connections. |
@@ -37,7 +37,7 @@ Implementation follow-up to `REVIEW.md`. The original review is preserved as the
 - Transport/protocol failure permanently retires a client. Output deadline/cancellation retires the connection because a write or flush may not be cancel-safe. New `Error::WriteZero` and `Error::OutputDeadline` variants can affect exhaustive matches.
 - Blocking whole-call I/O bounds require `ReadTimeout + OutputTimeout` and `with_io_timeouts` / `serve_with_io_timeouts`. Existing clock/read-timeout APIs do not bound write or ACK-waiting flush stalls.
 - Received metadata blocks are capped at **128 expanded entries** and **8192 owned key/value bytes**, checked before allocation. These limits are independent of HTTP/2 limits; application-created metadata is not capped by the receive parser.
-- `ReliableLink` uses the framed ARQ adapter. Constructors remain available, but explicitly spelled concrete adapter types may need migration. The link wire format is unchanged.
+- `ReliableLink` is now a struct over `arq-io-async` 0.0.3 and protolink's own `CobsTransport`; its error type is `ReliableError`. Constructors remain available, but code that spelled out the previous alias must migrate. **The ARQ wire format changed (ACK frames are 17 bytes, not 16): both endpoints must be upgraded together.** ARQ now gives up after 16 unacknowledged retransmission rounds with a terminal `Timeout`. `link::StdTimer` is owned by protolink. See `LINK.md`.
 - Generators reject RPC names colliding with enabled client built-ins rather than emitting uncompilable code; such names can still be used in server-only bindings.
 
 ## Embedded validation
@@ -56,13 +56,13 @@ Implementation follow-up to `REVIEW.md`. The original review is preserved as the
 - Host and embedded library checks, including `thumbv7em-none-eabihf` and no-CAS `thumbv6m-none-eabi`.
 - Embedded feature matrices and linked smoke builds with and without compression.
 - Generator fixture compilation on host, `thumbv6m-none-eabi` and `thumbv7em-none-eabihf`.
-- Vendored ARQ: **57 unit tests and 2 doctests**.
+- Historical: the vendored ARQ patch had **57 unit tests and 2 doctests**; the vendor directory was later removed in favour of the published crate.
 - Final Miri configurations: ring buffer **11 tests**, async RefCell state **17 tests**, async mutex state **17 tests**; all passed.
 
 ## Explicit limitations and release follow-up
 
 - The public HTTP/2 `HeaderField` remains UTF-8-based. HPACK itself retains raw octets and synchronizes fully before HTTP/API validation, but legal non-UTF-8 `obs-text` values are rejected stream-locally, not converted lossily. A byte-capable public field API would be a separate compatibility expansion.
 - Newly generated deadline-error trailers are best-effort after the call has already expired; their transmission is not raced against the expired deadline. Previously completed success output retains its deadline through flush. Synchronous handlers and scheduler starvation cannot be preempted by these drivers.
-- The ARQ framed API is a local dependency patch. Before publishing to crates.io, upstream it or publish a renamed/versioned patched dependency and update the manifest; the published upstream 0.0.2 is not an API-compatible replacement.
+- (Resolved) The ARQ framed API used to be a local dependency patch. The link now builds on published `arq-io-async` 0.0.3 and `cobs-io-async` 0.0.4, so no path dependency blocks publishing.
 - Cross-compilation and linking do not prove hardware execution, allocator sizing, interrupt stress behavior or runtime stack bounds. No hardware execution is claimed. The smoke allocator is intentionally not suitable for a long-lived server.
 - Existing grpcurl CI coverage is preserved; grpcurl itself was not run locally during this implementation.

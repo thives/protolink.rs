@@ -303,9 +303,17 @@ Interoperability is tested against the `h2` crate (the HTTP/2 stack under hyper 
 
 ## Status of the reliable link
 
-`protolink::link` composes ARQ (`arq-io-async`) over COBS (`cobs-io-async`). The raw ARQ,
-composed-link, and embedded-device end-to-end tests are enabled in `tests/link.rs` and
-`examples/embedded-device/tests/e2e.rs`. COBS framing alone (`protolink::link::CobsFramed`) is also tested.
+`protolink::link` composes ARQ (`arq-io-async` 0.0.3) over COBS framing (`cobs-io-async` 0.0.4).
+ARQ is a poll-based state machine, so protolink supplies the adapters: `CobsTransport` (ARQ's framed
+lower transport over a raw stream), `ReliableLink` (the `embedded_io_async` `Read`/`Write` interface,
+with `ReliableError`) and `StdTimer`. The raw ARQ, composed-link, and embedded-device end-to-end
+tests are enabled in `tests/link.rs` and `examples/embedded-device/tests/e2e.rs`. COBS framing alone
+(`protolink::link::CobsFramed`) is also tested. See [docs/LINK.md](docs/LINK.md).
+
+**Compatibility:** the ARQ wire format changed with `arq-io-async` 0.0.3 (ACK frames are 17 bytes),
+so both ends of a link must run the same protolink generation. ARQ also gives up after 16
+retransmission rounds without acknowledgement (about a minute for a silent peer); the link then fails
+with a terminal `ReliableError(ArqError::Timeout)`.
 
 ARQ retransmits on a timeout, so it needs a time source (the `arq_io_async::Timer` trait, re-exported
 as `protolink::link::Timer`, which is not the `protolink::Timer` used for [deadlines](#deadlines)):
@@ -313,15 +321,15 @@ as `protolink::link::Timer`, which is not the `protolink::Timer` used for [deadl
 | Constructor | Requires | Timer |
 |---|---|---|
 | `link::reliable_with_timer(raw, timer)` | `async` | any `Timer` implementation; the `no_std` path |
-| `link::reliable(raw)` | `async` + `std` (implied by `tokio`) | `link::StdTimer` (a helper thread per link; works with any executor) |
+| `link::reliable(raw)` | `async` + `std` (implied by `tokio`) | `link::StdTimer` (one reusable helper thread per link; works with any executor) |
 
 On `no_std` targets, implement `Timer` on top of the platform timer (for example `embassy-time`) and
-call `reliable_with_timer`. `std` is the only feature that turns on ARQ's `std` feature, so embedded
-builds do not pull it in.
+call `reliable_with_timer`. `StdTimer` exists only with the `std` feature, so embedded builds do not
+pull it in.
 
 ### DMA UARTs
 
-ARQ drops its lower layer's futures after every poll, so the raw stream must be cancel-safe. Buffered
+`CobsTransport` drops its raw futures after every poll (ARQ polls by hand), so the raw stream must be cancel-safe. Buffered
 and interrupt-driven UARTs are; one-shot DMA drivers are not (a dropped read loses bytes, a dropped
 write is aborted part-way). `link::pump` is an optional lower layer for those: it owns the DMA
 halves, completes every transfer, and gives the link a cancel-safe `PumpHandle`. See the module

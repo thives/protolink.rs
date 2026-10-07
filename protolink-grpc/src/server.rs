@@ -10,6 +10,7 @@ use protolink_http2::{
 };
 
 use crate::compression::{Codec, Compression};
+use crate::fields::{field, header};
 use crate::handler::unimplemented;
 use crate::inbound::Inbound;
 use crate::status::encode_message;
@@ -76,8 +77,6 @@ struct Call {
     end_delivered: bool,
     /// Request messages delivered to the handler.
     requests: usize,
-    /// Response HEADERS were sent.
-    headers_sent: bool,
     /// Encoding of the response messages, negotiated from the request.
     response_codec: Option<&'static dyn Codec>,
     /// Custom metadata of the request.
@@ -227,10 +226,6 @@ impl Server {
             .filter_map(|c| c.deadline)
             .chain(self.draining.values().filter_map(|deadline| *deadline))
             .min()
-    }
-
-    fn retain_draining(&mut self, id: StreamId, deadline: Option<Duration>) {
-        self.draining.insert(id, deadline);
     }
 
     /// End the call with `DEADLINE_EXCEEDED`.
@@ -413,12 +408,7 @@ impl Server {
                             // Nothing will serve this call: answer now
                             // instead of waiting for the client to finish
                             // sending.
-                            self.send_status(
-                                stream_id,
-                                false,
-                                end_stream,
-                                Err(unimplemented(&path)),
-                            );
+                            self.send_status(stream_id, end_stream, Err(unimplemented(&path)));
                             return;
                         }
                         Ok(path) => {
@@ -432,7 +422,6 @@ impl Server {
                                     None => {
                                         self.send_status(
                                             stream_id,
-                                            false,
                                             end_stream,
                                             Err(Status::invalid_argument("malformed grpc-timeout")),
                                         );
@@ -447,7 +436,6 @@ impl Server {
                                 Err(e) => {
                                     self.send_status(
                                         stream_id,
-                                        false,
                                         end_stream,
                                         Err(Status::invalid_argument(alloc::format!(
                                             "malformed request metadata: {e}"
@@ -468,7 +456,6 @@ impl Server {
                                 }
                                 self.send_status_with(
                                     stream_id,
-                                    false,
                                     end_stream,
                                     Err(Status::unimplemented("unsupported grpc-encoding")),
                                     extra,
@@ -492,7 +479,6 @@ impl Server {
                                     half_closed: end_stream,
                                     end_delivered: false,
                                     requests: 0,
-                                    headers_sent: false,
                                     response_codec,
                                     request_metadata,
                                     response: ResponseMetadata::default(),
@@ -844,10 +830,11 @@ impl Server {
         let Some(call) = self.calls.get_mut(&id) else {
             return false;
         };
-        if call.headers_sent {
+        // From here on the handler can no longer add initial metadata, which
+        // is also how a call remembers that its headers went out.
+        let Some(initial) = call.response.initial.take() else {
             return true;
-        }
-        call.headers_sent = true;
+        };
         let mut headers = vec![
             field(":status", "200"),
             field("content-type", "application/grpc"),
@@ -858,10 +845,7 @@ impl Server {
         if let Some(accept) = self.compression.accept_header() {
             headers.push(field("grpc-accept-encoding", &accept));
         }
-        // From here on the handler can no longer add initial metadata.
-        if let Some(initial) = call.response.initial.take() {
-            initial.append_fields(&mut headers);
-        }
+        initial.append_fields(&mut headers);
         if self.conn.send_headers(id, headers, false).is_err() {
             let _ = self.conn.reset_stream(id, ErrorCode::InternalError);
             return false;
@@ -882,34 +866,34 @@ impl Server {
     /// trailers-only response. Queued messages are delivered first; if the
     /// client is still sending, the stream is then reset with `NO_ERROR`.
     fn finish(&mut self, id: StreamId, result: Result<(), Status>) {
-        let Some(mut call) = self.calls.remove(&id) else {
-            return;
-        };
-        let response = core::mem::take(&mut call.response);
-        self.send_status_with(
-            id,
-            call.headers_sent,
-            call.half_closed,
-            result,
-            Vec::new(),
-            response,
-        );
-        self.retain_draining(id, call.deadline);
+        self.end_call(id, result);
     }
 
-    /// Send the final status of a stream: trailers after a response, or a
-    /// trailers-only response if no headers were sent. If the client is still
-    /// sending, the stream is reset with `NO_ERROR` after the output flushed.
-    fn send_status(
-        &mut self,
-        id: StreamId,
-        headers_sent: bool,
-        half_closed: bool,
-        result: Result<(), Status>,
-    ) {
+    /// End a streaming call the handler did not finish itself.
+    fn abort<H: Handler + ?Sized>(&mut self, id: StreamId, status: Status, handler: &mut H) {
+        // The status and metadata go out first; the handler is told after,
+        // with the call's original deadline in its context.
+        if let Some(mut call) = self.end_call(id, Err(status)) {
+            handler.on_cancel(&mut call.ctx(id));
+        }
+    }
+
+    /// Remove the call, send its final status with the metadata its handler
+    /// set, and keep its response draining until delivery is acknowledged.
+    fn end_call(&mut self, id: StreamId, result: Result<(), Status>) -> Option<Call> {
+        let mut call = self.calls.remove(&id)?;
+        let response = core::mem::take(&mut call.response);
+        self.send_status_with(id, call.half_closed, result, Vec::new(), response);
+        self.draining.insert(id, call.deadline);
+        Some(call)
+    }
+
+    /// Send the final status of a stream that never became a call: a
+    /// trailers-only response. If the client is still sending, the stream is
+    /// reset with `NO_ERROR` after the output flushed.
+    fn send_status(&mut self, id: StreamId, half_closed: bool, result: Result<(), Status>) {
         self.send_status_with(
             id,
-            headers_sent,
             half_closed,
             result,
             Vec::new(),
@@ -920,24 +904,22 @@ impl Server {
     /// [`send_status`](Self::send_status) with `extra` header fields in a
     /// trailers-only response (ignored if the headers were already sent), and
     /// the metadata the handler set. Initial metadata is only sent in a
-    /// trailers-only response; otherwise it went out with the headers.
+    /// trailers-only response; otherwise it went out with the headers, and
+    /// `response.initial` is `None`.
     fn send_status_with(
         &mut self,
         id: StreamId,
-        headers_sent: bool,
         half_closed: bool,
         result: Result<(), Status>,
         extra: Vec<HeaderField>,
         response: ResponseMetadata,
     ) {
         let mut fields = Vec::new();
-        if !headers_sent {
+        if let Some(initial) = &response.initial {
             fields.push(field(":status", "200"));
             fields.push(field("content-type", "application/grpc"));
             fields.extend(extra);
-            if let Some(initial) = &response.initial {
-                initial.append_fields(&mut fields);
-            }
+            initial.append_fields(&mut fields);
         }
         let status_metadata = match result {
             Ok(()) => {
@@ -963,24 +945,6 @@ impl Server {
         if !half_closed {
             let _ = self.conn.reset_stream_after_flush(id, ErrorCode::NoError);
         }
-    }
-
-    /// End a streaming call the handler did not finish itself.
-    fn abort<H: Handler + ?Sized>(&mut self, id: StreamId, status: Status, handler: &mut H) {
-        let Some(mut call) = self.calls.remove(&id) else {
-            return;
-        };
-        let response = core::mem::take(&mut call.response);
-        self.send_status_with(
-            id,
-            call.headers_sent,
-            call.half_closed,
-            Err(status),
-            Vec::new(),
-            response,
-        );
-        self.retain_draining(id, call.deadline);
-        handler.on_cancel(&mut call.ctx(id));
     }
 }
 
@@ -1010,18 +974,4 @@ fn validate_request(headers: &[HeaderField]) -> Result<String, &'static str> {
         Some(p) if p.starts_with('/') => Ok(p.into()),
         _ => Err("400"),
     }
-}
-
-fn field(name: &str, value: &str) -> HeaderField {
-    HeaderField {
-        name: name.into(),
-        value: value.into(),
-    }
-}
-
-fn header<'a>(headers: &'a [HeaderField], name: &str) -> Option<&'a str> {
-    headers
-        .iter()
-        .find(|h| h.name == name)
-        .map(|h| h.value.as_str())
 }

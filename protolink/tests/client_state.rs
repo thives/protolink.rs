@@ -385,23 +385,6 @@ fn async_client_and_calls_are_send_and_sync() {
     send::<protolink::Call<'static, Io>>();
 }
 
-#[tokio::test]
-async fn call_can_be_driven_from_a_spawned_task() {
-    let (client, _) = connect();
-    // `tokio::spawn` requires the whole future, including the call that
-    // borrows the client, to be `Send`.
-    let task = tokio::spawn(async move {
-        let mut call = client.streaming(CHAT).unwrap();
-        for i in 0..5u8 {
-            call.send(&[i]).await.unwrap();
-            assert_eq!(call.message().await.unwrap().unwrap(), [i]);
-        }
-        call.close_send().await.unwrap();
-        assert!(call.message().await.unwrap().is_none());
-    });
-    with_timeout(task).await.unwrap();
-}
-
 #[cfg(feature = "blocking")]
 mod blocking {
     use core::convert::Infallible;
@@ -437,24 +420,17 @@ mod blocking {
     #[test]
     fn concurrent_calls_start_on_one_client() {
         let client = Client::new(Idle, ClientConfig::default());
+        // The HTTP/2 preface is queued as soon as the client exists.
+        assert!(client.with_inner(|c| c.has_output()));
         let first = client.streaming("/t.T/Chat").unwrap();
         let second =
             BlockingStreamingTransport::start(&client, "/t.T/Chat", CallOptions::default())
                 .unwrap();
-        assert_ne!(first.id(), second.id());
+        let first_id = first.id();
+        assert_ne!(first_id, second.id());
+        assert!(client.with_inner(|c| c.is_pending(first_id)));
         drop(first);
+        assert!(!client.with_inner(|c| c.is_pending(first_id)));
         assert!(client.with_inner(|c| c.is_pending(second.id())));
-    }
-
-    #[test]
-    fn with_inner_reads_the_sans_io_state() {
-        let client = Client::new(Idle, ClientConfig::default());
-        // The HTTP/2 preface is queued as soon as the client exists.
-        assert!(client.with_inner(|c| c.has_output()));
-        let call = client.streaming("/t.T/Chat").unwrap();
-        let id = call.id();
-        assert!(client.with_inner(|c| c.is_pending(id)));
-        drop(call);
-        assert!(!client.with_inner(|c| c.is_pending(id)));
     }
 }

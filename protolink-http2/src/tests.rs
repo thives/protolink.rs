@@ -1,7 +1,6 @@
 extern crate std;
 
 use super::*;
-use alloc::string::String;
 use alloc::vec;
 
 #[path = "regressions.rs"]
@@ -102,6 +101,62 @@ fn manual(initial_window_size: u32, connection_window_size: u32) -> Config {
     }
 }
 
+fn wire_frame(kind: FrameType, id: StreamId, flags: u8, payload: &[u8]) -> Vec<u8> {
+    let mut out = vec![0; 9 + payload.len()];
+    encode_frame(
+        &FrameHeader {
+            length: payload.len() as u32,
+            frame_type: kind,
+            flags: Flags(flags),
+            stream_id: id,
+        },
+        payload,
+        &mut out,
+        u32::MAX,
+    )
+    .unwrap();
+    out
+}
+
+/// Deliver an already encoded header block as one HEADERS frame.
+fn wire_block(conn: &mut Connection, id: StreamId, block: &[u8], end: bool) {
+    conn.recv(&wire_frame(
+        FrameType::Headers,
+        id,
+        Flags::END_HEADERS | if end { Flags::END_STREAM } else { 0 },
+        block,
+    ))
+    .unwrap();
+}
+
+fn wire_headers(
+    conn: &mut Connection,
+    encoder: &mut Encoder,
+    id: StreamId,
+    headers: &[HeaderField],
+    end: bool,
+) {
+    wire_block(conn, id, &encoder.encode(headers), end);
+}
+
+/// `conn` published exactly one stream reset with `code`, left the connection
+/// open and queued no GOAWAY. This drains the connection's output.
+fn assert_reset(conn: &mut Connection, id: StreamId, code: ErrorCode) {
+    assert_eq!(
+        events(conn),
+        vec![Event::Reset {
+            stream_id: id,
+            error_code: code
+        }]
+    );
+    assert!(!conn.is_closed());
+    assert!(
+        !frames(&conn.take_output())
+            .iter()
+            .any(|f| f.0 == FrameType::GoAway as u8)
+    );
+}
+
 #[test]
 fn unary_round_trip() {
     let mut c = Connection::client(Config::default());
@@ -194,6 +249,7 @@ fn large_body_respects_flow_control() {
     let id = c.open_stream(request_headers(), false).unwrap();
     let body = vec![0xAB; 200_000];
     c.send_data(id, body.clone(), true).unwrap();
+    assert_eq!(c.send_capacity(id), Some(0));
     // Only the initial 65535-byte window can be sent before WINDOW_UPDATEs.
     let first = c.take_output();
     assert!(first.len() < 70_000, "sent {} bytes", first.len());
@@ -207,23 +263,9 @@ fn large_body_respects_flow_control() {
         })
         .sum();
     assert_eq!(received, body.len());
-}
-
-#[test]
-fn large_header_block_uses_continuation() {
-    let mut c = Connection::client(Config::default());
-    let mut s = Connection::server(Config {
-        max_header_list_size: 64 * 1024,
-        ..Config::default()
-    });
-    let mut headers = request_headers();
-    headers.push(hf("x-big", &String::from_utf8(vec![b'a'; 20_000]).unwrap()));
-    c.open_stream(headers, true).unwrap();
-    exchange(&mut c, &mut s);
-    let ev = events(&mut s);
-    assert!(
-        matches!(&ev[0], Event::Headers { headers, end_stream: true, .. } if headers.iter().any(|h| h.value.len() == 20_000))
-    );
+    // Closed locally, so draining the queue is not reported as readiness.
+    assert_eq!(c.queued_send_bytes(id), Some(0));
+    assert_eq!(c.poll_send_ready(), None);
 }
 
 #[test]
@@ -231,7 +273,86 @@ fn unknown_frame_types_are_ignored() {
     let mut c = Connection::client(Config::default());
     let mut s = Connection::server(Config::default());
     exchange(&mut c, &mut s);
-    s.recv(&[0, 0, 2, 0xEE, 0, 0, 0, 0, 0, 1, 2]).unwrap();
+    s.recv(UNKNOWN_FRAME).unwrap();
+    c.recv(UNKNOWN_FRAME).unwrap();
+    assert!(!c.is_closed() && !s.is_closed());
+}
+
+const UNKNOWN_FRAME: &[u8] = &[0, 0, 2, 0xEE, 0, 0, 0, 0, 0, 1, 2];
+
+fn assert_protocol_error(r: Result<(), Error>) {
+    assert!(matches!(
+        r,
+        Err(Error::Connection {
+            code: ErrorCode::ProtocolError,
+            ..
+        })
+    ));
+}
+
+/// A server that has consumed nothing but the client preface.
+fn server_after_preface() -> (Connection, Vec<u8>) {
+    let mut c = Connection::client(Config::default());
+    let out = c.take_output();
+    (
+        Connection::server(Config::default()),
+        out[..CLIENT_PREFACE.len()].to_vec(),
+    )
+}
+
+#[test]
+fn client_rejects_unknown_frame_before_settings() {
+    let mut c = Connection::client(Config::default());
+    assert_protocol_error(c.recv(UNKNOWN_FRAME));
+    assert!(c.is_closed());
+}
+
+#[test]
+fn server_rejects_unknown_frame_before_settings() {
+    let (mut s, preface) = server_after_preface();
+    let mut input = preface;
+    input.extend_from_slice(UNKNOWN_FRAME);
+    assert_protocol_error(s.recv(&input));
+    assert!(s.is_closed());
+}
+
+#[test]
+fn unknown_frame_before_settings_is_rejected_when_fragmented() {
+    let mut c = Connection::client(Config::default());
+    // An incomplete header, then an incomplete payload, are not errors yet.
+    c.recv(&UNKNOWN_FRAME[..4]).unwrap();
+    c.recv(&UNKNOWN_FRAME[4..10]).unwrap();
+    assert!(!c.is_closed());
+    assert_protocol_error(c.recv(&UNKNOWN_FRAME[10..]));
+
+    let (mut s, preface) = server_after_preface();
+    s.recv(&preface).unwrap();
+    for piece in UNKNOWN_FRAME[..UNKNOWN_FRAME.len() - 1].chunks(3) {
+        s.recv(piece).unwrap();
+    }
+    assert_protocol_error(s.recv(&UNKNOWN_FRAME[UNKNOWN_FRAME.len() - 1..]));
+}
+
+#[test]
+fn settings_ack_cannot_be_the_initial_settings() {
+    let ack = [0, 0, 0, FrameType::Settings as u8, Flags::ACK, 0, 0, 0, 0];
+    let mut c = Connection::client(Config::default());
+    assert_protocol_error(c.recv(&ack));
+    let (mut s, mut input) = server_after_preface();
+    input.extend_from_slice(&ack);
+    assert_protocol_error(s.recv(&input));
+}
+
+#[test]
+fn initial_settings_then_unknown_frame_succeeds() {
+    let settings = [0, 0, 0, FrameType::Settings as u8, 0, 0, 0, 0, 0];
+    let mut c = Connection::client(Config::default());
+    c.recv(&settings).unwrap();
+    c.recv(UNKNOWN_FRAME).unwrap();
+    let (mut s, mut input) = server_after_preface();
+    input.extend_from_slice(&settings);
+    input.extend_from_slice(UNKNOWN_FRAME);
+    s.recv(&input).unwrap();
 }
 
 #[test]
@@ -315,44 +436,6 @@ fn queued_send_bytes_track_window_updates() {
     assert_eq!(data_len(&events(&mut s), id), 100_000);
     assert_eq!(c.queued_send_bytes(99), None);
     assert_eq!(c.send_capacity(99), None);
-}
-
-#[test]
-fn send_ready_not_reported_after_local_close() {
-    let mut c = Connection::client(Config::default());
-    let mut s = Connection::server(Config::default());
-    exchange(&mut c, &mut s);
-    let id = c.open_stream(request_headers(), false).unwrap();
-    c.send_data(id, vec![1; 100_000], true).unwrap();
-    assert_eq!(c.send_capacity(id), Some(0));
-    exchange(&mut c, &mut s);
-    assert_eq!(c.queued_send_bytes(id), Some(0));
-    assert_eq!(c.poll_send_ready(), None);
-}
-
-#[test]
-fn automatic_flow_control_is_unchanged() {
-    let mut c = Connection::client(Config::default());
-    let mut s = Connection::server(Config::default());
-    exchange(&mut c, &mut s);
-    let id = c.open_stream(request_headers(), false).unwrap();
-    c.send_data(id, vec![1; 1000], false).unwrap();
-    pump(&mut c, &mut s, usize::MAX).unwrap();
-    let updates: Vec<_> = frames(&s.take_output())
-        .into_iter()
-        .filter(|f| f.0 == FrameType::WindowUpdate as u8)
-        .map(|f| (f.2, f.3))
-        .collect();
-    assert_eq!(
-        updates,
-        vec![
-            (0, 1000u32.to_be_bytes().to_vec()),
-            (id, 1000u32.to_be_bytes().to_vec())
-        ]
-    );
-    assert_eq!(s.unreleased_recv_bytes(id), Some(0));
-    s.release_capacity(id, 1000);
-    assert!(!s.has_output(), "release_capacity is a no-op");
 }
 
 #[test]

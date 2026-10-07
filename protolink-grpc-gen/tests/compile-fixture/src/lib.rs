@@ -125,3 +125,145 @@ impl lifecycle::lifecycle::Lifecycle for Lifecycle {
 pub fn lifecycle_server() -> impl Handler {
     lifecycle::lifecycle::LifecycleServer::new(Lifecycle)
 }
+
+#[allow(non_snake_case, non_camel_case_types, unused, unused_parens)]
+pub mod names {
+    include!(concat!(env!("OUT_DIR"), "/names_messages.rs"));
+    include!(concat!(env!("OUT_DIR"), "/names_grpc.rs"));
+}
+
+#[allow(non_snake_case, non_camel_case_types, unused, unused_parens)]
+pub mod collide {
+    include!(concat!(env!("OUT_DIR"), "/collide_messages.rs"));
+    include!(concat!(env!("OUT_DIR"), "/collide_grpc.rs"));
+}
+
+#[allow(non_snake_case, non_camel_case_types, unused, unused_parens)]
+pub mod relative {
+    pub mod crate_messages {
+        include!(concat!(env!("OUT_DIR"), "/relative_messages.rs"));
+    }
+    include!(concat!(env!("OUT_DIR"), "/relative_grpc.rs"));
+}
+
+#[cfg(feature = "unsuffixed-packages")]
+use names::r#names::Msg as NamesMsg;
+#[cfg(not(feature = "unsuffixed-packages"))]
+use names::names_::Msg as NamesMsg;
+
+// Every service gets a usable server, including `S`, which is also the
+// generic parameter of the generated wrapper.
+#[cfg(feature = "server")]
+pub fn name_servers() {
+    macro_rules! implement {
+        ($($module:ident::$service:ident => $server:ident),*) => {$(
+            impl names::$module::$service for Impl {
+                fn unary(
+                    &mut self,
+                    _: &mut CallContext<'_>,
+                    request: NamesMsg,
+                ) -> Result<NamesMsg, Status> {
+                    Ok(request)
+                }
+            }
+            handler(names::$module::$server::new(Impl));
+        )*};
+    }
+    struct Impl;
+    fn handler(_: impl Handler) {}
+    implement!(
+        s::S => SServer,
+        status::Status => StatusServer,
+        context::Context => ContextServer,
+        poll::Poll => PollServer,
+        vec::Vec => VecServer
+    );
+}
+
+#[cfg(feature = "async-client")]
+pub async fn name_async_calls<T>(transport: T, request: &NamesMsg) -> Result<(), Status>
+where
+    T: protolink_grpc::UnaryTransport + protolink_grpc::StreamingTransport,
+{
+    let mut client = names::status::StatusClient::new(transport);
+    let _: NamesMsg = client.unary(request).await?;
+    drop(client.stream().await?);
+    drop(client.fan(request).await?);
+    let mut client = names::vec::VecClient::new(client.into_inner());
+    let _: NamesMsg = client.unary(request).await?;
+    Ok(())
+}
+
+#[cfg(feature = "blocking-client")]
+pub fn name_blocking_calls<T>(transport: T, request: &NamesMsg) -> Result<(), Status>
+where
+    T: protolink_grpc::BlockingUnaryTransport + protolink_grpc::BlockingStreamingTransport,
+{
+    let mut client = names::poll::PollBlockingClient::new(transport);
+    let _: NamesMsg = client.unary(request)?;
+    drop(client.stream()?);
+    drop(client.fan(request)?);
+    let mut client = names::context::ContextBlockingClient::new(client.into_inner());
+    let _: NamesMsg = client.unary(request)?;
+    Ok(())
+}
+
+// Renamed service modules are used under their documented fallback names.
+#[cfg(all(feature = "server", not(feature = "unsuffixed-packages")))]
+pub fn collision_servers() {
+    use collide::foo_::Msg;
+    struct Impl;
+    impl collide::foo__grpc::Foo_ for Impl {
+        fn call(&mut self, _: &mut CallContext<'_>, request: Msg) -> Result<Msg, Status> {
+            Ok(request)
+        }
+    }
+    impl collide::foo::Foo for Impl {
+        fn call(&mut self, _: &mut CallContext<'_>, request: Msg) -> Result<Msg, Status> {
+            Ok(request)
+        }
+    }
+    fn handler(_: impl Handler) {}
+    handler(collide::foo__grpc::Foo_Server::new(Impl));
+    handler(collide::foo::FooServer::new(Impl));
+}
+
+#[cfg(all(feature = "server", feature = "unsuffixed-packages"))]
+pub fn collision_servers() {
+    use collide::r#foo::Msg;
+    struct Impl;
+    impl collide::foo_grpc::Foo for Impl {
+        fn call(&mut self, _: &mut CallContext<'_>, request: Msg) -> Result<Msg, Status> {
+            Ok(request)
+        }
+    }
+    impl collide::foo_::Foo_ for Impl {
+        fn call(&mut self, _: &mut CallContext<'_>, request: Msg) -> Result<Msg, Status> {
+            Ok(request)
+        }
+    }
+    fn handler(_: impl Handler) {}
+    handler(collide::foo_grpc::FooServer::new(Impl));
+    handler(collide::foo_::Foo_Server::new(Impl));
+}
+
+// Relative paths beginning with `crate` resolve from the inclusion point.
+#[cfg(all(feature = "server", feature = "unsuffixed-packages"))]
+use relative::crate_messages::r#foo::Msg as RelativeMsg;
+#[cfg(all(feature = "server", not(feature = "unsuffixed-packages")))]
+use relative::crate_messages::foo_::Msg as RelativeMsg;
+
+#[cfg(feature = "server")]
+pub fn relative_server() -> impl Handler {
+    struct Impl;
+    impl relative::foo::Foo for Impl {
+        fn call(
+            &mut self,
+            _: &mut CallContext<'_>,
+            request: RelativeMsg,
+        ) -> Result<RelativeMsg, Status> {
+            Ok(request)
+        }
+    }
+    relative::foo::FooServer::new(Impl)
+}

@@ -156,7 +156,7 @@ impl core::error::Error for Status {}
 pub fn encode_message(msg: &str) -> String {
     let mut out = String::with_capacity(msg.len());
     for &b in msg.as_bytes() {
-        if (0x20..=0x7e).contains(&b) && b != b'%' {
+        if (0x21..=0x7e).contains(&b) && b != b'%' {
             out.push(b as char);
         } else {
             const HEX: &[u8; 16] = b"0123456789ABCDEF";

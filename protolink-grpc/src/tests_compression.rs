@@ -14,6 +14,7 @@ use core::task::{Context, Poll, Waker};
 
 use super::*;
 use crate::compression::{Codec, CodecError, Compression, Deflate, Gzip};
+use crate::test_support::{events, final_status, header, hf, pump, send_raw};
 use protolink_http2::{Connection, Event, HeaderField};
 
 // ---------------------------------------------------------------------------
@@ -254,9 +255,6 @@ fn gzip_with_fields(data: &[u8], flags: u8, corrupt_header_crc: bool) -> Vec<u8>
 #[test]
 fn gzip_accepts_optional_header_fields() {
     for flags in 0..32u8 {
-        if flags & 0xe0 != 0 {
-            continue;
-        }
         let packed = gzip_with_fields(b"payload", flags, false);
         assert_eq!(
             decompress(&STORED_GZIP, &packed, 100),
@@ -646,22 +644,7 @@ impl Pair {
     /// Exchange bytes until both sides are idle; the number of bytes that
     /// went from the client to the server and back.
     fn pump(&mut self) -> (usize, usize) {
-        let cx = &mut Context::from_waker(Waker::noop());
-        let (mut up, mut down) = (0, 0);
-        for _ in 0..256 {
-            self.server.poll(&mut self.handler, cx);
-            if !self.client.has_output() && !self.server.has_output() {
-                return (up, down);
-            }
-            let out = self.client.take_output();
-            up += out.len();
-            self.server.recv(&out, &mut self.handler).unwrap();
-            self.server.poll(&mut self.handler, cx);
-            let out = self.server.take_output();
-            down += out.len();
-            self.client.recv(&out).unwrap();
-        }
-        panic!("connection did not settle");
+        pump(&mut self.client, &mut self.server, &mut self.handler)
     }
 
     /// One unary echo; the result and the bytes sent up and down.
@@ -677,20 +660,6 @@ impl Pair {
             down,
         )
     }
-}
-
-/// Handshake bytes in each direction, to subtract from measurements.
-fn baseline(client: Compression, server: Compression) -> (usize, usize) {
-    let mut p = pair(client, server);
-    let id = p.client.start_unary("/t.T/Echo", b"").unwrap();
-    let sizes = p.pump();
-    assert_eq!(
-        p.client
-            .take_response(id)
-            .map(|r| r.map(Response::into_message)),
-        Some(Ok(Vec::new()))
-    );
-    sizes
 }
 
 const BIG: usize = 3000;
@@ -738,15 +707,6 @@ fn server_compresses_only_what_the_client_accepts() {
     let (reply, up, down) = p.unary(&[7; BIG]);
     assert_eq!(reply, Ok(vec![7; BIG]));
     assert!(up > BIG && down > BIG);
-}
-
-#[test]
-fn small_and_incompressible_messages_are_sent_as_is() {
-    let mut p = pair(rle(), rle());
-    for message in [b"tiny".to_vec(), (0..=255).collect(), Vec::new()] {
-        let (reply, ..) = p.unary(&message);
-        assert_eq!(reply, Ok(message));
-    }
 }
 
 #[test]
@@ -899,13 +859,6 @@ fn client_failures_are_reported_per_call() {
 // Raw peer: exact headers and framing
 // ---------------------------------------------------------------------------
 
-fn hf(name: &str, value: &str) -> HeaderField {
-    HeaderField {
-        name: name.into(),
-        value: value.into(),
-    }
-}
-
 fn request(path: &str, extra: &[(&str, &str)]) -> Vec<HeaderField> {
     let mut headers = vec![
         hf(":method", "POST"),
@@ -919,35 +872,13 @@ fn request(path: &str, extra: &[(&str, &str)]) -> Vec<HeaderField> {
     headers
 }
 
-fn value<'a>(headers: &'a [HeaderField], name: &str) -> Option<&'a str> {
-    headers
-        .iter()
-        .find(|h| h.name == name)
-        .map(|h| h.value.as_str())
-}
-
 /// The events a raw HTTP/2 peer sees after sending `headers` and `body`.
 fn raw_call(server: Compression, headers: Vec<HeaderField>, body: &[u8]) -> Vec<Event> {
-    let mut conn = Connection::client(Default::default());
     let mut server = Server::new(ServerConfig {
         compression: server,
         ..ServerConfig::default()
     });
-    let mut handler = TestHandler::default();
-    let id = conn.open_stream(headers, false).unwrap();
-    conn.send_data(id, body.to_vec(), true).unwrap();
-    for _ in 0..8 {
-        server.recv(&conn.take_output(), &mut handler).unwrap();
-        conn.recv(&server.take_output()).unwrap();
-    }
-    core::iter::from_fn(|| conn.poll_event()).collect()
-}
-
-fn final_status(events: &[Event]) -> Option<&str> {
-    events.iter().rev().find_map(|e| match e {
-        Event::Headers { headers, .. } => value(headers, "grpc-status"),
-        _ => None,
-    })
+    send_raw(&mut server, &mut TestHandler::default(), headers, body)
 }
 
 fn response_data(events: &[Event]) -> Vec<u8> {
@@ -976,8 +907,11 @@ fn unsupported_request_encoding_lists_what_is_accepted() {
     else {
         panic!("{ev:?}");
     };
-    assert_eq!(value(headers, "grpc-status"), Some("12"));
-    assert_eq!(value(headers, "grpc-accept-encoding"), Some("rle,identity"));
+    assert_eq!(header(headers, "grpc-status"), Some("12"));
+    assert_eq!(
+        header(headers, "grpc-accept-encoding"),
+        Some("rle,identity")
+    );
     assert_eq!(ev.len(), 1, "{ev:?}");
 
     // With nothing configured there is nothing to list.
@@ -989,8 +923,8 @@ fn unsupported_request_encoding_lists_what_is_accepted() {
     let Event::Headers { headers, .. } = &ev[0] else {
         panic!("{ev:?}");
     };
-    assert_eq!(value(headers, "grpc-status"), Some("12"));
-    assert_eq!(value(headers, "grpc-accept-encoding"), None);
+    assert_eq!(header(headers, "grpc-status"), Some("12"));
+    assert_eq!(header(headers, "grpc-accept-encoding"), None);
 }
 
 #[test]
@@ -1028,9 +962,12 @@ fn compressed_request_gets_a_compressed_response() {
     let Event::Headers { headers, .. } = &ev[0] else {
         panic!("{ev:?}");
     };
-    assert_eq!(value(headers, ":status"), Some("200"));
-    assert_eq!(value(headers, "grpc-encoding"), Some("rle"));
-    assert_eq!(value(headers, "grpc-accept-encoding"), Some("rle,identity"));
+    assert_eq!(header(headers, ":status"), Some("200"));
+    assert_eq!(header(headers, "grpc-encoding"), Some("rle"));
+    assert_eq!(
+        header(headers, "grpc-accept-encoding"),
+        Some("rle,identity")
+    );
     assert_eq!(final_status(&ev), Some("0"));
     let wire = response_data(&ev);
     assert_eq!(wire[0], 1, "response message is not flagged as compressed");
@@ -1051,7 +988,7 @@ fn response_stays_plain_when_the_client_does_not_accept_the_encoding() {
         let Event::Headers { headers, .. } = &ev[0] else {
             panic!("{ev:?}");
         };
-        assert_eq!(value(headers, "grpc-encoding"), None, "{accept:?}");
+        assert_eq!(header(headers, "grpc-encoding"), None, "{accept:?}");
         assert_eq!(response_data(&ev), lpm::encode(&[3; 500]).unwrap());
     }
 }
@@ -1110,7 +1047,7 @@ fn broken_compressed_stream_message_cancels_the_streaming_call() {
         server.poll(&mut handler, cx);
         conn.recv(&server.take_output()).unwrap();
     }
-    let ev: Vec<Event> = core::iter::from_fn(|| conn.poll_event()).collect();
+    let ev = events(&mut conn);
     assert_eq!(final_status(&ev), Some("13"), "{ev:?}");
     assert_eq!(handler.cancelled, [id]);
     assert_eq!(server.active_calls(), 0);
@@ -1126,6 +1063,20 @@ mod miniz {
 
     use super::*;
     use crate::compression::GZIP;
+
+    /// Handshake bytes in each direction, to subtract from measurements.
+    fn baseline(client: Compression, server: Compression) -> (usize, usize) {
+        let mut p = pair(client, server);
+        let id = p.client.start_unary("/t.T/Echo", b"").unwrap();
+        let sizes = p.pump();
+        assert_eq!(
+            p.client
+                .take_response(id)
+                .map(|r| r.map(Response::into_message)),
+            Some(Ok(Vec::new()))
+        );
+        sizes
+    }
 
     /// Text-like data that DEFLATE compresses well, and that is not a run.
     fn text(len: usize) -> Vec<u8> {

@@ -1,0 +1,49 @@
+syntax = "proto3";
+package names;
+
+message Msg { uint32 value = 1; }
+
+// Service names that collide with the runtime types the generated code uses.
+service S {
+  rpc Unary(Msg) returns (Msg);
+  rpc Stream(stream Msg) returns (stream Msg);
+  rpc Fan(Msg) returns (stream Msg);
+}
+service Status {
+  rpc Unary(Msg) returns (Msg);
+  rpc Stream(stream Msg) returns (stream Msg);
+  rpc Fan(Msg) returns (stream Msg);
+}
+service Context {
+  rpc Unary(Msg) returns (Msg);
+  rpc Stream(stream Msg) returns (stream Msg);
+  rpc Fan(Msg) returns (stream Msg);
+}
+service Poll {
+  rpc Unary(Msg) returns (Msg);
+  rpc Stream(stream Msg) returns (stream Msg);
+  rpc Fan(Msg) returns (stream Msg);
+}
+service Vec {
+  rpc Unary(Msg) returns (Msg);
+  rpc Stream(stream Msg) returns (stream Msg);
+  rpc Fan(Msg) returns (stream Msg);
+}
+service Result {
+  rpc Unary(Msg) returns (Msg);
+  rpc Stream(stream Msg) returns (stream Msg);
+  rpc Fan(Msg) returns (stream Msg);
+  rpc Collect(stream Msg) returns (Msg);
+}
+service Option {
+  rpc Unary(Msg) returns (Msg);
+  rpc Stream(stream Msg) returns (stream Msg);
+  rpc Fan(Msg) returns (stream Msg);
+  rpc Collect(stream Msg) returns (Msg);
+}
+service __rt {
+  rpc Unary(Msg) returns (Msg);
+  rpc Stream(stream Msg) returns (stream Msg);
+  rpc Fan(Msg) returns (stream Msg);
+  rpc Collect(stream Msg) returns (Msg);
+}

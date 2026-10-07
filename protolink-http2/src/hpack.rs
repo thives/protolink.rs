@@ -29,11 +29,14 @@ impl RawHeader {
     }
 }
 
+/// The table size the peer may use: our SETTINGS_HEADER_TABLE_SIZE, which is
+/// never changed from the default.
+const NEGOTIATED_MAX: usize = 4096;
+
 pub(crate) struct Decoder {
     dynamic: VecDeque<RawHeader>,
     size: usize,
     max: usize,
-    negotiated_max: usize,
     #[cfg(test)]
     pub(crate) materialized: usize,
 }
@@ -43,8 +46,7 @@ impl Decoder {
         Self {
             dynamic: VecDeque::new(),
             size: 0,
-            max: 4096,
-            negotiated_max: 4096,
+            max: NEGOTIATED_MAX,
             #[cfg(test)]
             materialized: 0,
         }
@@ -86,7 +88,7 @@ impl Decoder {
         while let Some(&first) = input.first() {
             if first & 0xe0 == 0x20 {
                 let size = integer(&mut input, 5)?;
-                if seen_field || size > self.negotiated_max {
+                if seen_field || size > NEGOTIATED_MAX {
                     return Err(DecodeError::Compression);
                 }
                 self.max = size;

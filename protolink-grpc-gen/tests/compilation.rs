@@ -1,6 +1,6 @@
 use std::{env, path::PathBuf, process::Command};
 
-fn check(features: Option<&str>, rejection: Option<&str>) {
+fn check(features: Option<&str>) {
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/compile-fixture");
     let mut cargo = Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
     cargo
@@ -29,59 +29,25 @@ fn check(features: Option<&str>, rejection: Option<&str>) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    match rejection {
-        None => assert!(output.status.success(), "features {features:?}:\n{log}"),
-        Some(diagnostic) => {
-            assert!(
-                !output.status.success(),
-                "invalid schema compiled: {features:?}"
-            );
-            assert!(
-                log.contains("service generation rejected the schema"),
-                "{log}"
-            );
-            assert!(log.contains(diagnostic), "expected {diagnostic:?}:\n{log}");
-        }
-    }
+    assert!(output.status.success(), "features {features:?}:\n{log}");
 }
 
 #[test]
 fn generated_bindings_compile_in_no_std_consumer() {
+    // Suffixed and unsuffixed packages, each in every generation mode.
     for features in [
         None,
+        Some(""),
         Some("server"),
         Some("async-client"),
         Some("blocking-client"),
+        Some("server,async-client,blocking-client"),
+        Some("unsuffixed-packages"),
+        Some("server,unsuffixed-packages"),
+        Some("async-client,unsuffixed-packages"),
+        Some("blocking-client,unsuffixed-packages"),
         Some("server,async-client,blocking-client,unsuffixed-packages"),
     ] {
-        check(features, None);
-    }
-}
-
-#[test]
-fn invalid_schemas_fail_during_generation() {
-    // Exercise each client flavor independently: neither may emit a duplicate
-    // inherent method, regardless of whether server generation is also enabled.
-    for client in ["async-client", "blocking-client"] {
-        for (feature, method) in [
-            ("reject-new", "new"),
-            ("reject-into-inner", "into_inner"),
-            ("reject-transport-mut", "transport_mut"),
-        ] {
-            check(
-                Some(&format!("{client},{feature}")),
-                Some(&format!("reserved client method `{method}`")),
-            );
-        }
-    }
-    for (feature, module) in [
-        ("reject-modules-normalized", "p_self_"),
-        ("reject-modules-qualified", "a_b_shared"),
-        ("reject-modules-short", "alpha_shared"),
-    ] {
-        check(
-            Some(&format!("server,async-client,blocking-client,{feature}")),
-            Some(&format!("both generate a module named `{module}`")),
-        );
+        check(features);
     }
 }

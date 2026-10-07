@@ -7,6 +7,7 @@ use core::time::Duration;
 use protolink_http2::{Config, Connection, Error, ErrorCode, Event, FlowControl, HeaderField};
 
 use crate::compression::Compression;
+use crate::fields::{field, header};
 use crate::status::decode_message;
 use crate::{
     CallId, Code, DEFAULT_MAX_MESSAGE_SIZE, Metadata, Next, Response, Status, lpm, timeout,
@@ -67,6 +68,28 @@ impl CallOptions {
     }
 }
 
+/// The `:scheme` pseudo-header sent with every request.
+///
+/// This only labels requests. Selecting [`Scheme::Https`] does **not**
+/// establish TLS: the caller must run the client over a TLS-backed transport.
+/// Drivers never infer the scheme from the authority, port or transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scheme {
+    /// `:scheme: http`, for cleartext transports.
+    Http,
+    /// `:scheme: https`, for TLS-protected transports.
+    Https,
+}
+
+impl Scheme {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Https => "https",
+        }
+    }
+}
+
 /// Client configuration.
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
@@ -95,6 +118,9 @@ pub struct ClientConfig {
     pub max_retained_calls: usize,
     /// `:authority` sent with every request.
     pub authority: String,
+    /// `:scheme` sent with every request. Defaults to [`Scheme::Http`]. It does
+    /// not enable TLS; see [`Scheme`].
+    pub scheme: Scheme,
     /// Message compression. Off by default.
     ///
     /// If [`Compression::send`] is set, every request is compressed with it,
@@ -116,6 +142,7 @@ impl Default for ClientConfig {
             max_buffered_response_bytes: 1024 * 1024,
             max_retained_calls: 64,
             authority: "localhost".into(),
+            scheme: Scheme::Http,
             compression: Compression::NONE,
             default_timeout: None,
         }
@@ -302,6 +329,7 @@ pub struct Client {
     finished_metadata: BTreeMap<CallId, (Option<Metadata>, Metadata)>,
     max_message_size: usize,
     authority: String,
+    scheme: Scheme,
     compression: Compression,
     default_timeout: Option<Duration>,
     /// Latest time reported through [`Client::tick`].
@@ -321,6 +349,7 @@ impl Client {
             finished_metadata: BTreeMap::new(),
             max_message_size: config.max_message_size,
             authority: config.authority,
+            scheme: config.scheme,
             compression: config.compression,
             default_timeout: config.default_timeout,
             now: Duration::ZERO,
@@ -392,7 +421,7 @@ impl Client {
         }
         let mut headers = vec![
             field(":method", "POST"),
-            field(":scheme", "http"),
+            field(":scheme", self.scheme.as_str()),
             field(":path", path),
             field(":authority", &self.authority),
         ];
@@ -893,10 +922,18 @@ fn inactive() -> Status {
 }
 
 fn trailers_status(headers: &[HeaderField]) -> Result<(), Status> {
-    let Some(code) = header(headers, "grpc-status") else {
+    let mut fields = headers.iter().filter(|h| h.name == "grpc-status");
+    let Some(field) = fields.next() else {
         return Err(Status::internal("missing grpc-status"));
     };
-    let code = code.parse::<u8>().map_or(Code::Unknown, Code::from_u8);
+    if fields.next().is_some() {
+        return Err(Status::internal("duplicate grpc-status"));
+    }
+    let value = field.value.as_str();
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(Status::internal("malformed grpc-status"));
+    }
+    let code = value.parse::<u8>().map_or(Code::Unknown, Code::from_u8);
     if code == Code::Ok {
         return Ok(());
     }
@@ -904,18 +941,4 @@ fn trailers_status(headers: &[HeaderField]) -> Result<(), Status> {
         .map(decode_message)
         .unwrap_or_default();
     Err(Status::new(code, message))
-}
-
-fn header<'a>(headers: &'a [HeaderField], name: &str) -> Option<&'a str> {
-    headers
-        .iter()
-        .find(|h| h.name == name)
-        .map(|h| h.value.as_str())
-}
-
-fn field(name: &str, value: &str) -> HeaderField {
-    HeaderField {
-        name: name.into(),
-        value: value.into(),
-    }
 }

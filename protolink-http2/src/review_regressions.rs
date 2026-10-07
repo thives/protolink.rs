@@ -1,59 +1,6 @@
 use super::*;
 use alloc::string::ToString;
 
-fn wire_frame(kind: FrameType, id: StreamId, flags: u8, payload: &[u8]) -> Vec<u8> {
-    let mut out = vec![0; 9 + payload.len()];
-    encode_frame(
-        &FrameHeader {
-            length: payload.len() as u32,
-            frame_type: kind,
-            flags: Flags(flags),
-            stream_id: id,
-        },
-        payload,
-        &mut out,
-        u32::MAX,
-    )
-    .unwrap();
-    out
-}
-
-fn wire_block(conn: &mut Connection, id: StreamId, block: &[u8], end: bool) {
-    conn.recv(&wire_frame(
-        FrameType::Headers,
-        id,
-        Flags::END_HEADERS | if end { Flags::END_STREAM } else { 0 },
-        block,
-    ))
-    .unwrap();
-}
-
-fn wire_headers(
-    conn: &mut Connection,
-    encoder: &mut Encoder,
-    id: StreamId,
-    headers: &[HeaderField],
-    end: bool,
-) {
-    wire_block(conn, id, &encoder.encode(headers), end);
-}
-
-fn assert_protocol_reset(conn: &mut Connection, id: StreamId) {
-    assert_eq!(
-        events(conn),
-        vec![Event::Reset {
-            stream_id: id,
-            error_code: ErrorCode::ProtocolError
-        }]
-    );
-    assert!(!conn.is_closed());
-    assert!(
-        !frames(&conn.take_output())
-            .iter()
-            .any(|f| f.0 == FrameType::GoAway as u8)
-    );
-}
-
 fn raw_string(bytes: &[u8], huffman: bool) -> Vec<u8> {
     let bytes = if huffman {
         zerodds_hpack::huffman::encode(bytes)
@@ -106,7 +53,7 @@ fn non_utf8_hpack_names_and_values_are_stream_local_after_full_table_update() {
                 &block[split..],
             ))
             .unwrap();
-            assert_protocol_reset(&mut s, 1);
+            assert_reset(&mut s, 1, ErrorCode::ProtocolError);
             // Index 62 is the entry that followed the rejected field.
             wire_block(&mut s, 3, &[0x83, 0x86, 0x84, 0xbe], true);
             assert!(matches!(&events(&mut s)[0], Event::Headers { headers, .. }
@@ -114,7 +61,7 @@ fn non_utf8_hpack_names_and_values_are_stream_local_after_full_table_update() {
             // Referencing the rejected entry still decodes successfully at the
             // HPACK layer and rejects only HTTP stream 5, not the connection.
             wire_block(&mut s, 5, &[0x83, 0x86, 0x84, 0xbf], true);
-            assert_protocol_reset(&mut s, 5);
+            assert_reset(&mut s, 5, ErrorCode::ProtocolError);
             wire_block(&mut s, 7, &[0x83, 0x86, 0x84, 0xbe], true);
             assert!(matches!(
                 &events(&mut s)[0],
@@ -132,12 +79,12 @@ fn non_utf8_indexed_names_are_reused_as_octets_and_not_compression_errors() {
     let mut block = vec![0x83, 0x86, 0x84];
     block.extend(raw_literal(&[0xff], b"value", false));
     wire_block(&mut s, 1, &block, true);
-    assert_protocol_reset(&mut s, 1);
+    assert_reset(&mut s, 1, ErrorCode::ProtocolError);
     let mut block = vec![0x83, 0x86, 0x84, 0x7e]; // Incremental literal, indexed name 62.
     block.extend(raw_string(b"new value", false));
     block.extend(raw_literal(b"x-valid", b"after-invalid-name", false));
     wire_block(&mut s, 3, &block, true);
-    assert_protocol_reset(&mut s, 3);
+    assert_reset(&mut s, 3, ErrorCode::ProtocolError);
     wire_block(&mut s, 5, &[0x83, 0x86, 0x84, 0xbe], true);
     assert!(matches!(&events(&mut s)[0], Event::Headers { headers, .. }
         if headers.last() == Some(&hf("x-valid", "after-invalid-name"))));
@@ -209,7 +156,7 @@ fn http_https_paths_reject_relative_targets_and_fragments_inbound_and_outbound()
                     }
                 ));
             } else {
-                assert_protocol_reset(&mut s, 1);
+                assert_reset(&mut s, 1, ErrorCode::ProtocolError);
             }
         }
     }
@@ -242,6 +189,22 @@ fn initial(request: bool, length: u64) -> Vec<HeaderField> {
     headers
 }
 
+/// A connection that has received the initial headers of a body declaring
+/// `length` bytes (events drained), and the encoder that wrote them.
+fn body_started(request: bool, mode: FlowControl, length: u64) -> (Connection, StreamId, Encoder) {
+    let (mut conn, id) = receiving(request, mode);
+    let mut encoder = Encoder::new();
+    wire_headers(
+        &mut conn,
+        &mut encoder,
+        id,
+        &initial(request, length),
+        false,
+    );
+    events(&mut conn);
+    (conn, id, encoder)
+}
+
 #[test]
 fn content_length_initial_end_stream_checks_requests_and_responses() {
     for request in [false, true] {
@@ -264,7 +227,7 @@ fn content_length_initial_end_stream_checks_requests_and_responses() {
                         }
                     ));
                 } else {
-                    assert_protocol_reset(&mut conn, id);
+                    assert_reset(&mut conn, id, ErrorCode::ProtocolError);
                 }
             }
         }
@@ -285,17 +248,14 @@ fn inbound_body_overruns_and_terminal_underruns_are_stream_local() {
     for request in [false, true] {
         for mode in [FlowControl::Automatic, FlowControl::Manual] {
             for (len, end) in [(4, false), (4, true), (2, true), (0, true)] {
-                let (mut conn, id) = receiving(request, mode);
-                let mut encoder = Encoder::new();
-                wire_headers(&mut conn, &mut encoder, id, &initial(request, 3), false);
-                events(&mut conn);
+                let (mut conn, id, mut encoder) = body_started(request, mode, 3);
                 conn.recv(&data_frame(
                     id,
                     len,
                     if end { Flags::END_STREAM } else { 0 },
                 ))
                 .unwrap();
-                assert_protocol_reset(&mut conn, id);
+                assert_reset(&mut conn, id, ErrorCode::ProtocolError);
                 assert_eq!(conn.conn_recv_window, DEFAULT_WINDOW);
                 // Another valid field section on the same compression context.
                 let next = if request {
@@ -315,10 +275,7 @@ fn body_counts_accumulate_and_trailers_validate_terminal_length() {
     for request in [false, true] {
         for mode in [FlowControl::Automatic, FlowControl::Manual] {
             for (len, trailers, valid) in [(2, true, false), (3, true, true), (3, false, true)] {
-                let (mut conn, id) = receiving(request, mode);
-                let mut encoder = Encoder::new();
-                wire_headers(&mut conn, &mut encoder, id, &initial(request, 3), false);
-                events(&mut conn);
+                let (mut conn, id, mut encoder) = body_started(request, mode, 3);
                 conn.recv(&data_frame(id, 1, 0)).unwrap();
                 assert_eq!(data_len(&events(&mut conn), id), 1);
                 conn.recv(&data_frame(
@@ -343,22 +300,14 @@ fn body_counts_accumulate_and_trailers_validate_terminal_length() {
                         }
                     )));
                 } else {
-                    assert_protocol_reset(&mut conn, id);
+                    assert_reset(&mut conn, id, ErrorCode::ProtocolError);
                 }
             }
-            let (mut conn, id) = receiving(request, mode);
-            wire_headers(
-                &mut conn,
-                &mut Encoder::new(),
-                id,
-                &initial(request, 3),
-                false,
-            );
-            events(&mut conn);
+            let (mut conn, id, _) = body_started(request, mode, 3);
             conn.recv(&data_frame(id, 2, 0)).unwrap();
             assert_eq!(data_len(&events(&mut conn), id), 2);
             conn.recv(&data_frame(id, 2, 0)).unwrap();
-            assert_protocol_reset(&mut conn, id);
+            assert_reset(&mut conn, id, ErrorCode::ProtocolError);
             assert_eq!(conn.conn_recv_window, DEFAULT_WINDOW);
         }
     }
@@ -368,15 +317,7 @@ fn body_counts_accumulate_and_trailers_validate_terminal_length() {
 fn content_length_counts_body_without_padding() {
     for request in [false, true] {
         for mode in [FlowControl::Automatic, FlowControl::Manual] {
-            let (mut conn, id) = receiving(request, mode);
-            wire_headers(
-                &mut conn,
-                &mut Encoder::new(),
-                id,
-                &initial(request, 3),
-                false,
-            );
-            events(&mut conn);
+            let (mut conn, id, _) = body_started(request, mode, 3);
             let mut frame = data_frame(id, 6, Flags::PADDED | Flags::END_STREAM);
             frame[9] = 2; // One length byte, three body bytes, two padding bytes.
             conn.recv(&frame).unwrap();
@@ -519,7 +460,7 @@ fn head_and_304_lengths_describe_metadata_not_a_response_body() {
         ));
         assert!(!s.has_output());
         c.recv(&data_frame(id, 1, 0)).unwrap();
-        assert_protocol_reset(&mut c, id);
+        assert_reset(&mut c, id, ErrorCode::ProtocolError);
     }
 }
 
@@ -608,7 +549,7 @@ fn informational_and_204_statuses_reject_content_length_and_204_has_no_body() {
             Err(Error::InvalidHeaders(_))
         ));
         wire_headers(&mut c, &mut Encoder::new(), id, &headers, false);
-        assert_protocol_reset(&mut c, id);
+        assert_reset(&mut c, id, ErrorCode::ProtocolError);
     }
     let mut c = Connection::client(Config::default());
     let mut s = Connection::server(Config::default());

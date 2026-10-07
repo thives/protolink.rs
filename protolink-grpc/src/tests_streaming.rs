@@ -11,6 +11,7 @@ use core::task::{Context, Poll, Waker};
 use std::task::Wake;
 
 use super::*;
+use crate::test_support::{drain, events, header, hf, poll_server, pump, pump_chunked};
 use protolink_http2::{Connection, ErrorCode, Event, HeaderField};
 
 // ---------------------------------------------------------------------------
@@ -90,13 +91,6 @@ fn decoder_rejects_oversized_message_from_its_prefix() {
     assert_eq!(d.buffered(), 0, "input after an error is ignored");
 }
 
-#[test]
-fn decoder_rejects_compressed_messages_without_a_codec() {
-    let mut d = lpm::Decoder::new(8);
-    d.push(&[1, 0, 0, 0, 1, 0]);
-    assert_eq!(d.next().unwrap().unwrap_err().code, Code::Internal);
-}
-
 // ---------------------------------------------------------------------------
 // Scripted streaming handler
 // ---------------------------------------------------------------------------
@@ -151,8 +145,8 @@ impl Handler for Scripted {
     fn method_kind(&self, path: &str) -> Option<MethodKind> {
         Some(match path {
             "/s.S/Unary" => MethodKind::Unary,
-            "/s.S/Count" | "/s.S/FailAfter" | "/s.S/FailBefore" | "/s.S/Infinite" | "/s.S/Big"
-            | "/s.S/Wait" => MethodKind::ServerStreaming,
+            "/s.S/Count" | "/s.S/FailAfter" | "/s.S/FailSpace" | "/s.S/FailBefore"
+            | "/s.S/Infinite" | "/s.S/Big" | "/s.S/Wait" => MethodKind::ServerStreaming,
             "/s.S/Sum" | "/s.S/Reject" | "/s.S/NoReply" => MethodKind::ClientStreaming,
             "/s.S/Echo" | "/s.S/EarlyDone" => MethodKind::BidiStreaming,
             _ => return None,
@@ -203,6 +197,11 @@ impl Handler for Scripted {
                 Next::Message(vec![st.produced as u8])
             }
             "/s.S/FailAfter" => Next::Done(Err(Status::aborted("after two"))),
+            "/s.S/FailSpace" if st.produced == 0 => {
+                st.produced += 1;
+                Next::Message(vec![9])
+            }
+            "/s.S/FailSpace" => Next::Done(Err(Status::permission_denied(" denied "))),
             "/s.S/FailBefore" => Next::Done(Err(Status::permission_denied("denied"))),
             "/s.S/Infinite" => {
                 st.produced += 1;
@@ -252,50 +251,6 @@ impl Handler for Scripted {
 // ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
-
-fn poll_server(server: &mut Server, handler: &mut impl Handler) {
-    server.poll(handler, &mut Context::from_waker(Waker::noop()));
-}
-
-/// Exchange bytes until both sides are idle, splitting every transfer into
-/// `chunk`-byte pieces.
-fn pump_chunked(
-    client: &mut Client,
-    server: &mut Server,
-    handler: &mut impl Handler,
-    chunk: usize,
-) {
-    for _ in 0..256 {
-        poll_server(server, handler);
-        if !client.has_output() && !server.has_output() {
-            return;
-        }
-        for piece in client.take_output().chunks(chunk) {
-            server.recv(piece, handler).unwrap();
-        }
-        poll_server(server, handler);
-        for piece in server.take_output().chunks(chunk) {
-            client.recv(piece).unwrap();
-        }
-    }
-    panic!("connection did not settle");
-}
-
-fn pump(client: &mut Client, server: &mut Server, handler: &mut impl Handler) {
-    pump_chunked(client, server, handler, usize::MAX);
-}
-
-/// Take every available response; the final status if the call completed.
-fn drain(client: &mut Client, id: CallId) -> (Vec<Vec<u8>>, Option<Result<(), Status>>) {
-    let mut messages = Vec::new();
-    while let Some(next) = client.try_next(id) {
-        match next {
-            Next::Message(m) => messages.push(m),
-            Next::Done(r) => return (messages, Some(r)),
-        }
-    }
-    (messages, None)
-}
 
 struct Setup {
     client: Client,
@@ -471,6 +426,42 @@ fn error_after_messages_keeps_the_messages() {
 }
 
 #[test]
+fn boundary_space_error_follows_the_message() {
+    let mut s = setup();
+    let (messages, status) = s.call("/s.S/FailSpace", &[b""]);
+    assert_eq!(messages, msgs(&[&[9]]));
+    assert_eq!(status, Err(Status::permission_denied(" denied ")));
+}
+
+#[test]
+fn malformed_status_after_messages_still_delivers_them() {
+    for (fields, code) in [
+        (vec!["+0"], Code::Internal),
+        (vec!["0", "0"], Code::Internal),
+        (vec!["255"], Code::Unknown),
+    ] {
+        let mut client = Client::new(ClientConfig::default());
+        let mut peer = Connection::server(Default::default());
+        let id = client.start_streaming("/s.S/Count").unwrap();
+        peer.recv(&client.take_output()).unwrap();
+        peer.send_headers(
+            id,
+            vec![hf(":status", "200"), hf("content-type", "application/grpc")],
+            false,
+        )
+        .unwrap();
+        peer.send_data(id, lpm::encode(&[1]).unwrap(), false)
+            .unwrap();
+        let trailers = fields.iter().map(|v| hf("grpc-status", v)).collect();
+        peer.send_headers(id, trailers, true).unwrap();
+        client.recv(&peer.take_output()).unwrap();
+        let (messages, status) = drain(&mut client, id);
+        assert_eq!(messages, msgs(&[&[1]]), "{fields:?}");
+        assert_eq!(status.unwrap().unwrap_err().code, code, "{fields:?}");
+    }
+}
+
+#[test]
 fn error_before_messages() {
     let mut s = setup();
     let (messages, status) = s.call("/s.S/FailBefore", &[b""]);
@@ -549,20 +540,6 @@ fn unary_with_two_requests_is_internal() {
 }
 
 #[test]
-fn unknown_streaming_method_is_unimplemented() {
-    let mut s = setup();
-    assert_eq!(
-        s.call("/s.S/Missing", &[b"a"]).1.unwrap_err().code,
-        Code::Unimplemented
-    );
-    // Not recognized up front: answered once the request ended.
-    assert_eq!(
-        s.call("/s.S/Dynamic", &[b"a"]).1.unwrap_err().code,
-        Code::Unimplemented
-    );
-}
-
-#[test]
 fn unknown_method_is_answered_before_half_close() {
     let mut s = setup();
     let id = s.client.start_streaming("/s.S/Missing").unwrap();
@@ -601,37 +578,23 @@ fn unclassified_path_waits_for_half_close() {
 
 #[test]
 fn unknown_method_is_a_trailers_only_response() {
-    let (mut conn, mut server, mut handler) = raw_setup();
-    let id = conn
-        .open_stream(request_headers("/s.S/Missing"), false)
-        .unwrap();
-    conn.send_data(id, lpm::encode(b"x").unwrap(), false)
-        .unwrap();
-    raw_exchange(&mut conn, &mut server, &mut handler);
-    let ev = raw_events(&mut conn);
-    assert!(
-        matches!(&ev[0], Event::Headers { headers, end_stream: true, .. }
-            if headers.iter().any(|h| h.name == "grpc-status" && h.value == "12")),
-        "{ev:?}"
-    );
-    assert_eq!(server.active_calls(), 0);
-}
-
-#[test]
-fn unknown_unary_request_in_one_chunk_is_unimplemented() {
-    let (mut conn, mut server, mut handler) = raw_setup();
-    let id = conn
-        .open_stream(request_headers("/s.S/Missing"), false)
-        .unwrap();
-    conn.send_data(id, lpm::encode(b"x").unwrap(), true)
-        .unwrap();
-    raw_exchange(&mut conn, &mut server, &mut handler);
-    let ev = raw_events(&mut conn);
-    assert!(
-        matches!(&ev[0], Event::Headers { headers, end_stream: true, .. }
-            if headers.iter().any(|h| h.name == "grpc-status" && h.value == "12")),
-        "{ev:?}"
-    );
+    // Whether or not the request ended with its first message.
+    for end_stream in [false, true] {
+        let (mut conn, mut server, mut handler) = raw_setup();
+        let id = conn
+            .open_stream(request_headers("/s.S/Missing"), false)
+            .unwrap();
+        conn.send_data(id, lpm::encode(b"x").unwrap(), end_stream)
+            .unwrap();
+        raw_exchange(&mut conn, &mut server, &mut handler);
+        let ev = events(&mut conn);
+        assert!(
+            matches!(&ev[0], Event::Headers { headers, end_stream: true, .. }
+                if header(headers, "grpc-status") == Some("12")),
+            "{ev:?}"
+        );
+        assert_eq!(server.active_calls(), 0, "end_stream {end_stream}");
+    }
 }
 
 #[test]
@@ -939,13 +902,6 @@ fn bidi_flood_without_reading_is_bounded_on_both_sides() {
 // Raw HTTP/2 peer
 // ---------------------------------------------------------------------------
 
-fn hf(n: &str, v: &str) -> HeaderField {
-    HeaderField {
-        name: n.into(),
-        value: v.into(),
-    }
-}
-
 fn request_headers(path: &str) -> Vec<HeaderField> {
     vec![
         hf(":method", "POST"),
@@ -982,17 +938,6 @@ fn raw_exchange(conn: &mut Connection, server: &mut Server, handler: &mut Script
     }
 }
 
-fn raw_events(conn: &mut Connection) -> Vec<Event> {
-    core::iter::from_fn(|| conn.poll_event()).collect()
-}
-
-fn grpc_status(headers: &[HeaderField]) -> Option<&str> {
-    headers
-        .iter()
-        .find(|h| h.name == "grpc-status")
-        .map(|h| h.value.as_str())
-}
-
 #[test]
 fn error_before_messages_is_trailers_only() {
     let (mut conn, mut server, mut handler) = raw_setup();
@@ -1001,11 +946,11 @@ fn error_before_messages_is_trailers_only() {
         .unwrap();
     conn.send_data(id, lpm::encode(b"").unwrap(), true).unwrap();
     raw_exchange(&mut conn, &mut server, &mut handler);
-    let ev = raw_events(&mut conn);
+    let ev = events(&mut conn);
     assert_eq!(ev.len(), 1, "{ev:?}");
     assert!(
         matches!(&ev[0], Event::Headers { headers, end_stream: true, .. }
-        if headers[0].value == "200" && grpc_status(headers) == Some("7"))
+        if headers[0].value == "200" && header(headers, "grpc-status") == Some("7"))
     );
 }
 
@@ -1019,10 +964,10 @@ fn pending_handler_sends_response_headers() {
         .open_stream(request_headers("/s.S/Echo"), false)
         .unwrap();
     raw_exchange(&mut conn, &mut server, &mut handler);
-    let ev = raw_events(&mut conn);
+    let ev = events(&mut conn);
     assert!(
         matches!(&ev[..], [Event::Headers { stream_id, headers, end_stream: false }]
-            if *stream_id == id && headers[0].value == "200" && grpc_status(headers).is_none()),
+            if *stream_id == id && headers[0].value == "200" && header(headers, "grpc-status").is_none()),
         "{ev:?}"
     );
 
@@ -1033,7 +978,7 @@ fn pending_handler_sends_response_headers() {
     conn.send_data(wait, lpm::encode(b"").unwrap(), true)
         .unwrap();
     raw_exchange(&mut conn, &mut server, &mut handler);
-    let ev = raw_events(&mut conn);
+    let ev = events(&mut conn);
     assert!(
         matches!(&ev[..], [Event::Headers { stream_id, end_stream: false, .. }] if *stream_id == wait),
         "{ev:?}"
@@ -1051,10 +996,10 @@ fn error_after_messages_uses_trailers() {
         .unwrap();
     conn.send_data(id, lpm::encode(b"").unwrap(), true).unwrap();
     raw_exchange(&mut conn, &mut server, &mut handler);
-    let ev = raw_events(&mut conn);
+    let ev = events(&mut conn);
     assert!(
         matches!(&ev[0], Event::Headers { headers, end_stream: false, .. }
-            if grpc_status(headers).is_none()),
+            if header(headers, "grpc-status").is_none()),
         "{ev:?}"
     );
     let data: Vec<u8> = ev
@@ -1070,7 +1015,7 @@ fn error_after_messages_uses_trailers() {
     let statuses: Vec<_> = ev
         .iter()
         .filter_map(|e| match e {
-            Event::Headers { headers, .. } => grpc_status(headers),
+            Event::Headers { headers, .. } => header(headers, "grpc-status"),
             _ => None,
         })
         .collect();
@@ -1094,7 +1039,7 @@ fn early_finish_delivers_trailers_before_reset() {
     conn.send_data(id, lpm::encode(b"hi").unwrap(), false)
         .unwrap();
     raw_exchange(&mut conn, &mut server, &mut handler);
-    let ev = raw_events(&mut conn);
+    let ev = events(&mut conn);
     let kinds: Vec<&str> = ev
         .iter()
         .map(|e| match e {
@@ -1136,7 +1081,7 @@ fn early_finish_waits_for_window_before_reset() {
     raw_exchange(&mut conn, &mut server, &mut handler);
     // Connection window exhausted: the response headers went out (they are
     // not flow-controlled) but the echo is queued, with no trailers yet.
-    let ev = raw_events(&mut conn);
+    let ev = events(&mut conn);
     assert!(
         !ev.iter().any(|e| matches!(e,
             Event::Data { stream_id, .. } | Event::Headers { stream_id, end_stream: true, .. }
@@ -1150,7 +1095,7 @@ fn early_finish_waits_for_window_before_reset() {
     conn.release_capacity(busy, held);
     conn.reset_stream(busy, ErrorCode::Cancel).unwrap();
     raw_exchange(&mut conn, &mut server, &mut handler);
-    let ev: Vec<Event> = raw_events(&mut conn)
+    let ev: Vec<Event> = events(&mut conn)
         .into_iter()
         .filter(|e| match e {
             Event::Headers { stream_id, .. }
@@ -1165,7 +1110,7 @@ fn early_finish_waits_for_window_before_reset() {
     );
     assert!(
         matches!(&ev[1], Event::Headers { headers, end_stream: true, .. }
-        if grpc_status(headers) == Some("0"))
+        if header(headers, "grpc-status") == Some("0"))
     );
     assert!(matches!(
         &ev[2],

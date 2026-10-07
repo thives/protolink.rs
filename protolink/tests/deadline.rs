@@ -2,7 +2,7 @@
 //! when every task is idle, so the timings are exact and the tests are fast.
 #![cfg(feature = "tokio")]
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
@@ -34,7 +34,6 @@ async fn with_timeout<F: Future>(f: F) -> F::Output {
 #[derive(Default)]
 struct Peer {
     queues: BTreeMap<CallId, VecDeque<Vec<u8>>>,
-    bursts: BTreeSet<CallId>,
     cancelled: Arc<AtomicUsize>,
 }
 
@@ -81,7 +80,6 @@ impl Handler for Peer {
                 .entry(ctx.id)
                 .or_insert_with(|| VecDeque::from([b"one".to_vec(), b"two".to_vec()]));
             if let Some(message) = queue.pop_front() {
-                self.bursts.insert(ctx.id);
                 return Poll::Ready(Next::Message(message));
             }
         }
@@ -300,21 +298,7 @@ async fn an_earlier_deadline_on_another_call_wakes_the_pending_reader() {
 async fn client_expiry_resets_the_stream() {
     // A server without a clock never expires the call itself, so only the
     // client's reset can end it.
-    let (a, b) = tokio::io::duplex(16 * 1024);
-    let cancelled = Arc::new(AtomicUsize::new(0));
-    let mut handler = Peer {
-        cancelled: cancelled.clone(),
-        ..Peer::default()
-    };
-    tokio::spawn(async move {
-        let _ = protolink::serve(
-            protolink::tokio::compat(a),
-            &mut handler,
-            ServerConfig::default(),
-        )
-        .await;
-    });
-    let mut client = protolink::tokio::client(b, ClientConfig::default());
+    let (mut client, cancelled) = connect();
     with_timeout(async {
         {
             let mut call = client

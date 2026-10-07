@@ -172,9 +172,13 @@ impl InvalidResponseMetadata {
         } else {
             ctx.trailing_metadata_mut()
         };
-        // Printable ASCII is valid gRPC metadata, but HTTP/2 rejects boundary
-        // whitespace. Exercise that outbound validation failure, not insertion.
-        metadata.insert("x-test", self.value).unwrap();
+        // Public insertion refuses boundary whitespace, so bypass it to reach
+        // the defensive outbound HTTP/2 validation.
+        assert_eq!(
+            metadata.insert("x-test", self.value),
+            Err(crate::InvalidMetadata::Value)
+        );
+        metadata.insert_unchecked_for_test("x-test", self.value);
     }
 }
 
@@ -293,57 +297,62 @@ fn invalid_terminal_metadata_resets_immediately_even_with_zero_window_or_open_re
 fn invalid_response_metadata_completes_the_client_with_error_and_other_streams_succeed() {
     use crate::{Client, ClientConfig, Code};
 
+    // `reply` only matters for unary calls: the early streaming call always
+    // fails from `poll_response`.
+    let cases = [
+        ("unary success", false, true),
+        ("unary handler error", false, false),
+        ("early streaming error", true, false),
+    ];
     for initial in [true, false] {
         for value in [" value", "value "] {
-            for reply in [false, true] {
-                for early in [false, true] {
-                    let mut handler = InvalidResponseMetadata {
-                        initial,
-                        value,
-                        reply,
-                    };
-                    let mut client = Client::new(ClientConfig::default());
-                    let mut server = Server::new(ServerConfig::default());
-                    let bad = if early {
-                        // Keep the request open to check that rejected terminal
-                        // headers never fall through to a deferred NO_ERROR reset.
-                        client.start_streaming("/test/EarlyInvalid").unwrap()
-                    } else {
-                        client.start_unary("/test/Invalid", b"request").unwrap()
-                    };
-                    let good = client.start_unary("/test/Valid", b"valid").unwrap();
-                    for _ in 0..8 {
-                        server.recv(&client.take_output(), &mut handler).unwrap();
-                        server.poll(&mut handler, &mut Context::from_waker(Waker::noop()));
-                        client.recv(&server.take_output()).unwrap();
-                    }
-                    let status = if early {
-                        match client.try_next(bad) {
-                            Some(Next::Done(Err(status))) => status,
-                            other => panic!(
-                                "invalid metadata must terminate streaming client: {other:?}"
-                            ),
-                        }
-                    } else {
-                        client
-                            .take_response(bad)
-                            .expect("invalid metadata must terminate unary client")
-                            .unwrap_err()
-                    };
-                    assert_eq!(status.code, Code::Internal);
-                    assert_eq!(
-                        client.take_response(good).unwrap().unwrap().message,
-                        b"valid"
-                    );
-                    assert_eq!(server.active_calls(), 0);
-                    assert!(server.draining.is_empty());
-                    assert_eq!(server.conn.stream_count(), 0);
-                    assert_eq!(server.next_deadline(), None);
-                    assert!(
-                        !server.is_closed(),
-                        "metadata rejection must not fail the connection"
-                    );
+            for (name, early, reply) in cases {
+                let mut handler = InvalidResponseMetadata {
+                    initial,
+                    value,
+                    reply,
+                };
+                let mut client = Client::new(ClientConfig::default());
+                let mut server = Server::new(ServerConfig::default());
+                let bad = if early {
+                    // Keep the request open to check that rejected terminal
+                    // headers never fall through to a deferred NO_ERROR reset.
+                    client.start_streaming("/test/EarlyInvalid").unwrap()
+                } else {
+                    client.start_unary("/test/Invalid", b"request").unwrap()
+                };
+                let good = client.start_unary("/test/Valid", b"valid").unwrap();
+                for _ in 0..8 {
+                    server.recv(&client.take_output(), &mut handler).unwrap();
+                    server.poll(&mut handler, &mut Context::from_waker(Waker::noop()));
+                    client.recv(&server.take_output()).unwrap();
                 }
+                let status = if early {
+                    match client.try_next(bad) {
+                        Some(Next::Done(Err(status))) => status,
+                        other => {
+                            panic!("invalid metadata must terminate streaming client: {other:?}")
+                        }
+                    }
+                } else {
+                    client
+                        .take_response(bad)
+                        .expect("invalid metadata must terminate unary client")
+                        .unwrap_err()
+                };
+                assert_eq!(status.code, Code::Internal, "{name}");
+                assert_eq!(
+                    client.take_response(good).unwrap().unwrap().message,
+                    b"valid"
+                );
+                assert_eq!(server.active_calls(), 0);
+                assert!(server.draining.is_empty());
+                assert_eq!(server.conn.stream_count(), 0);
+                assert_eq!(server.next_deadline(), None);
+                assert!(
+                    !server.is_closed(),
+                    "metadata rejection must not fail the connection"
+                );
             }
         }
     }
