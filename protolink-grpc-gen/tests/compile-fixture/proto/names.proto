@@ -47,3 +47,21 @@ service __rt {
   rpc Fan(Msg) returns (stream Msg);
   rpc Collect(stream Msg) returns (Msg);
 }
+service str {
+  rpc Unary(Msg) returns (Msg);
+  rpc Stream(stream Msg) returns (stream Msg);
+  rpc Fan(Msg) returns (stream Msg);
+  rpc Collect(stream Msg) returns (Msg);
+}
+service bool {
+  rpc Unary(Msg) returns (Msg);
+  rpc Stream(stream Msg) returns (stream Msg);
+  rpc Fan(Msg) returns (stream Msg);
+  rpc Collect(stream Msg) returns (Msg);
+}
+service u8 {
+  rpc Unary(Msg) returns (Msg);
+  rpc Stream(stream Msg) returns (stream Msg);
+  rpc Fan(Msg) returns (stream Msg);
+  rpc Collect(stream Msg) returns (Msg);
+}

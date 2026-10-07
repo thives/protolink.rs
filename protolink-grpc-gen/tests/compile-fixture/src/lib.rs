@@ -176,7 +176,10 @@ pub fn name_servers() {
         status::Status => StatusServer,
         context::Context => ContextServer,
         poll::Poll => PollServer,
-        vec::Vec => VecServer
+        vec::Vec => VecServer,
+        str::str => strServer,
+        bool::bool => boolServer,
+        u8::u8 => u8Server
     );
 }
 

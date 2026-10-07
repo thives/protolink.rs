@@ -525,12 +525,15 @@ impl Generator {
         let _ = writeln!(w, "    use {rt} as __rt;");
         let _ = writeln!(w);
         let _ = writeln!(w, "    /// Fully-qualified service name.");
-        let _ = writeln!(w, "    pub const SERVICE_NAME: &str = \"{full}\";");
+        let _ = writeln!(
+            w,
+            "    pub const SERVICE_NAME: &::core::primitive::str = \"{full}\";"
+        );
         for m in &methods {
             let _ = writeln!(w, "    /// Path of `{}`.", m.name);
             let _ = writeln!(
                 w,
-                "    pub const {}: &str = \"/{full}/{}\";",
+                "    pub const {}: &::core::primitive::str = \"/{full}/{}\";",
                 m.konst, m.name
             );
         }
@@ -538,7 +541,7 @@ impl Generator {
         let _ = writeln!(w, "    /// All method paths.");
         let _ = writeln!(
             w,
-            "    pub const METHODS: &[&str] = &[{}];",
+            "    pub const METHODS: &[&::core::primitive::str] = &[{}];",
             list.join(", ")
         );
 
@@ -706,7 +709,7 @@ impl Generator {
         // Unary dispatch.
         let _ = writeln!(
             w,
-            "        fn call(&mut self, ctx: &mut __rt::CallContext<'_>, request: &[u8]) -> ::core::option::Option<::core::result::Result<__rt::__private::Vec<u8>, __rt::Status>> {{\n            \
+            "        fn call(&mut self, ctx: &mut __rt::CallContext<'_>, request: &[::core::primitive::u8]) -> ::core::option::Option<::core::result::Result<__rt::__private::Vec<::core::primitive::u8>, __rt::Status>> {{\n            \
              match ctx.path {{"
         );
         for m in methods {
@@ -732,7 +735,7 @@ impl Generator {
         // Method kinds.
         let _ = writeln!(
             w,
-            "        fn method_kind(&self, path: &str) -> ::core::option::Option<__rt::MethodKind> {{\n            \
+            "        fn method_kind(&self, path: &::core::primitive::str) -> ::core::option::Option<__rt::MethodKind> {{\n            \
              match path {{"
         );
         for m in methods {
@@ -748,7 +751,7 @@ impl Generator {
         // Paths this service does not serve at all.
         let _ = writeln!(
             w,
-            "\n        fn is_unknown_method(&self, path: &str) -> bool {{\n            \
+            "\n        fn is_unknown_method(&self, path: &::core::primitive::str) -> ::core::primitive::bool {{\n            \
              self.method_kind(path).is_none()\n        }}"
         );
 
@@ -756,7 +759,7 @@ impl Generator {
             let streams = || methods.iter().filter(|m| m.kind != Kind::Unary);
             let _ = writeln!(
                 w,
-                "\n        fn on_message(&mut self, ctx: &mut __rt::CallContext<'_>, message: &[u8]) -> ::core::result::Result<(), __rt::Status> {{\n            \
+                "\n        fn on_message(&mut self, ctx: &mut __rt::CallContext<'_>, message: &[::core::primitive::u8]) -> ::core::result::Result<(), __rt::Status> {{\n            \
                  match ctx.path {{"
             );
             for m in streams() {
@@ -790,7 +793,7 @@ impl Generator {
 
             let _ = writeln!(
                 w,
-                "\n        fn poll_response(&mut self, ctx: &mut __rt::CallContext<'_>, cx: &mut __rt::__private::Context<'_>) -> __rt::__private::Poll<__rt::Next<__rt::__private::Vec<u8>>> {{\n            \
+                "\n        fn poll_response(&mut self, ctx: &mut __rt::CallContext<'_>, cx: &mut __rt::__private::Context<'_>) -> __rt::__private::Poll<__rt::Next<__rt::__private::Vec<::core::primitive::u8>>> {{\n            \
                  match ctx.path {{"
             );
             for m in streams() {
@@ -1266,10 +1269,48 @@ service Service {
     }
 
     #[test]
+    fn primitive_named_services_use_qualified_types() {
+        for name in ["str", "bool", "u8"] {
+            let file = parse(&format!(
+                "package p; message M {{}} service {name} {{
+                    rpc Unary(M) returns (M);
+                    rpc Stream(stream M) returns (stream M);
+                    rpc Fan(M) returns (stream M);
+                    rpc Collect(stream M) returns (M);
+                }}"
+            ));
+            let src = Generator::new().generate(&[file]).unwrap();
+            for expected in [
+                format!("pub trait {name} {{"),
+                format!("pub struct {name}Server<S>(pub S);"),
+                format!("pub const SERVICE_NAME: &::core::primitive::str = \"p.{name}\";"),
+                format!("pub const METHOD_UNARY: &::core::primitive::str = \"/p.{name}/Unary\";"),
+            ] {
+                assert!(src.contains(&expected), "missing `{expected}`:\n{src}");
+            }
+            for expected in [
+                "pub const METHODS: &[&::core::primitive::str] = &[METHOD_UNARY, METHOD_STREAM, METHOD_FAN, METHOD_COLLECT];",
+                "fn call(&mut self, ctx: &mut __rt::CallContext<'_>, request: &[::core::primitive::u8]) -> ::core::option::Option<::core::result::Result<__rt::__private::Vec<::core::primitive::u8>, __rt::Status>>",
+                "fn method_kind(&self, path: &::core::primitive::str)",
+                "fn is_unknown_method(&self, path: &::core::primitive::str) -> ::core::primitive::bool",
+                "fn on_message(&mut self, ctx: &mut __rt::CallContext<'_>, message: &[::core::primitive::u8])",
+                "fn poll_response(&mut self, ctx: &mut __rt::CallContext<'_>, cx: &mut __rt::__private::Context<'_>) -> __rt::__private::Poll<__rt::Next<__rt::__private::Vec<::core::primitive::u8>>>",
+            ] {
+                assert!(src.contains(expected), "missing `{expected}`:\n{src}");
+            }
+            for unqualified in ["&str", "&[u8]", "Vec<u8>", "-> bool"] {
+                assert!(!src.contains(unqualified), "found `{unqualified}`:\n{src}");
+            }
+        }
+    }
+
+    #[test]
     fn generates_service() {
         let src = generate(&Generator::new());
-        assert!(src.contains("pub const METHOD_COMMAND: &str = \"/a.b.Service/Command\";"));
-        assert!(src.contains("pub const METHODS: &[&str] = &[METHOD_COMMAND, METHOD_NESTED, METHOD_EVENT_SUBSCRIBE, METHOD_UPLOAD, METHOD_CHAT];"));
+        assert!(src.contains(
+            "pub const METHOD_COMMAND: &::core::primitive::str = \"/a.b.Service/Command\";"
+        ));
+        assert!(src.contains("pub const METHODS: &[&::core::primitive::str] = &[METHOD_COMMAND, METHOD_NESTED, METHOD_EVENT_SUBSCRIBE, METHOD_UPLOAD, METHOD_CHAT];"));
         // The call context, with the deadline, reaches the service method.
         assert!(src.contains(
             "__rt::codec::unary(request, |req| <S as self::Service>::command(&mut self.0, ctx, req))"
@@ -1303,7 +1344,7 @@ service Service {
             "METHOD_UPLOAD => __rt::codec::poll_single(<S as self::Service>::poll_upload(&mut self.0, ctx, cx)),",
             "METHOD_CHAT => __rt::codec::poll_stream(<S as self::Service>::poll_chat(&mut self.0, ctx, cx)),",
             "METHOD_UPLOAD => <S as self::Service>::cancel_upload(&mut self.0, ctx),",
-            "fn is_unknown_method(&self, path: &str) -> bool {\n            self.method_kind(path).is_none()",
+            "fn is_unknown_method(&self, path: &::core::primitive::str) -> ::core::primitive::bool {\n            self.method_kind(path).is_none()",
         ] {
             assert!(src.contains(line), "missing `{line}`");
         }
