@@ -145,6 +145,10 @@ jobs:
             cargo check --release --target=${{matrix.target}} --no-default-features -p protolink -p protolink-grpc -p protolink-http2
             cargo check --release --target=${{matrix.target}} --no-default-features --features async,blocking -p protolink -p protolink-grpc -p protolink-http2
             cargo check --release --target=${{matrix.target}} --no-default-features --features miniz-oxide -p protolink-grpc
+            # prost needs pointer-width atomics (via `bytes`): not available on thumbv6m.
+            cargo check --release --target=${{matrix.target}} --no-default-features --features prost -p protolink-grpc
+            cargo check --release --target=${{matrix.target}} --no-default-features --features micropb,prost -p protolink-grpc
+            cargo check --release --target=${{matrix.target}} --no-default-features --features prost,async,blocking -p protolink
 
   no-cas:
     name: no_std Cortex-M0 (${{ matrix.features }})
@@ -164,7 +168,7 @@ jobs:
       # Only libraries: dev-dependencies must not unify in std/Tokio features.
       # portable-atomic-critical-section currently also enables async itself.
       - run: cargo check --release --target thumbv6m-none-eabi --lib --no-default-features --features "${{ matrix.features }}" -p protolink
-      # Separate invocations keep protolink's default micropb dependency from
+      # Separate invocations keep protolink's default micropb feature from
       # masking the sans-IO crates' codec-free feature combinations.
       - name: Check isolated sans-IO codec combinations
         if: matrix.features == 'portable-atomic-critical-section'
@@ -246,7 +250,7 @@ jobs:
         with:
           components: rustfmt
       - uses: taiki-e/install-action@just
-      # The root workspace and the two standalone fixture workspaces.
+      # The root workspace and the standalone fixture workspaces.
       - run: just fmt
 
   msrv:
