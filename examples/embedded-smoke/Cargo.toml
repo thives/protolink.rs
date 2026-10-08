@@ -16,7 +16,7 @@ blocking = ["protolink/blocking"]
 compression = ["protolink/miniz-oxide"]
 
 [dependencies]
-protolink = { path = "../../protolink", default-features = false, features = ["portable-atomic-critical-section"] }
+protolink = { path = "../../protolink", default-features = false, features = ["micropb", "portable-atomic-critical-section"] }
 micropb = { version = "0.6", default-features = false, features = ["alloc", "encode", "decode"] }
 embedded-io = { version = "0.7", default-features = false }
 embedded-io-async = { version = "0.7", default-features = false, optional = true }

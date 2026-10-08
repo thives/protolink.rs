@@ -1,7 +1,9 @@
 use std::{env, path::PathBuf, process::Command};
 
-fn check(features: Option<&str>) {
-    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/compile-fixture");
+fn check(fixture_dir: &str, features: Option<&str>) {
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join(fixture_dir);
     let mut cargo = Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
     cargo
         .arg("check")
@@ -48,6 +50,41 @@ fn generated_bindings_compile_in_no_std_consumer() {
         Some("blocking-client,unsuffixed-packages"),
         Some("server,async-client,blocking-client,unsuffixed-packages"),
     ] {
-        check(features);
+        check("compile-fixture", features);
     }
+}
+
+#[test]
+fn prost_generated_bindings_compile_in_no_std_consumer() {
+    for features in [
+        Some(""),
+        Some("server"),
+        Some("async-client"),
+        Some("blocking-client"),
+        Some("server,async-client,blocking-client"),
+    ] {
+        check("compile-fixture-prost", features);
+    }
+}
+
+/// A prost-only consumer must not build micropb, in the runtime or the
+/// generator.
+#[test]
+fn prost_only_consumer_does_not_depend_on_micropb() {
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/compile-fixture-prost");
+    let output = Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
+        .args(["tree", "--locked", "--prefix", "none", "--edges", "all"])
+        .arg("--manifest-path")
+        .arg(fixture.join("Cargo.toml"))
+        .env_remove("CARGO_BUILD_TARGET")
+        .output()
+        .expect("run cargo tree");
+    let tree = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(tree.contains("prost"), "{tree}");
+    assert!(!tree.contains("micropb"), "{tree}");
 }

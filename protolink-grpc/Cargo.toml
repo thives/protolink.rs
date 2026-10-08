@@ -5,7 +5,7 @@ authors = [
   "Thomas Ivesdal-Tronstad <>",
 ]
 license = "MIT OR Apache-2.0"
-description = "Sans-IO, no_std + alloc gRPC server/client core (unary and streaming) with micropb codec support."
+description = "Sans-IO, no_std + alloc gRPC server/client core (unary and streaming) with micropb and prost codec support."
 repository = "https://github.com/thives/protolink.rs"
 keywords = ["grpc", "embedded", "no_std", "protobuf", "micropb"]
 edition = "2024"
@@ -14,14 +14,17 @@ rust-version = "1.88"
 [dependencies]
 protolink-http2 = { version = "0", path = "../protolink-http2" }
 micropb = { version = "0.6", default-features = false, features = ["alloc", "encode", "decode"], optional = true }
+prost = { version = "0.14", default-features = false, optional = true }
 miniz_oxide = { version = "0.9", default-features = false, features = ["with-alloc"], optional = true }
 
 [dev-dependencies]
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+prost = { version = "0.14", features = ["derive"] }
 
 [features]
 default = ["micropb"]
 micropb = ["dep:micropb"]
+prost = ["dep:prost"]
 # Stock DEFLATE backend (`compression::MinizOxide`, `compression::GZIP`).
 miniz-oxide = ["dep:miniz_oxide"]
 std = ["protolink-http2/std"]

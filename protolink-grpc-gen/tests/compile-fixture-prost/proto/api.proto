@@ -1,0 +1,42 @@
+syntax = "proto3";
+package fixture.api;
+
+import "common.proto";
+import "google/protobuf/timestamp.proto";
+import "other.proto";
+
+message Request {
+  message Inner {
+    int32 value = 1;
+  }
+  Inner inner = 1;
+  Common common = 2;
+  google.protobuf.Timestamp at = 3;
+  map<string, int32> counts = 4;
+  string type = 5;
+  fixture.other.Remote remote = 6;
+  optional int32 maybe = 7;
+  oneof choice {
+    string a = 8;
+    bytes b = 9;
+  }
+}
+
+message Reply {
+  Request.Inner inner = 1;
+}
+
+service Echo {
+  rpc Unary(Request) returns (Reply);
+  rpc Nested(Request.Inner) returns (Reply);
+  rpc Remote(fixture.other.Remote) returns (google.protobuf.Timestamp);
+  rpc Fan(Request) returns (stream Reply);
+  rpc Collect(stream Request) returns (Reply);
+  rpc Chat(stream Request) returns (stream Reply);
+}
+
+// Keyword and Self-like names stay legal.
+service Match {
+  rpc Type(Request) returns (Reply);
+  rpc Async(Common) returns (Common);
+}

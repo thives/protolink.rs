@@ -7,8 +7,8 @@
 //! - [`Client`]: issues unary and streaming calls and maps responses and
 //!   trailers to messages and [`Status`]es.
 //! - [`lpm`]: incremental length-prefixed message framing.
-//! - [`codec`]: micropb encode/decode helpers and typed streaming call
-//!   wrappers (feature `micropb`, default).
+//! - [`codec`]: message codec abstraction (micropb and prost backends) and typed streaming call
+//!   wrappers. The backends are the `micropb` (default) and `prost` features.
 //! - [`UnaryTransport`] / [`BlockingUnaryTransport`] and
 //!   [`StreamingTransport`] / [`BlockingStreamingTransport`]: the interfaces
 //!   generated clients call into; implemented by protolink's I/O drivers.
@@ -75,7 +75,6 @@ extern crate alloc;
 extern crate std;
 
 mod client;
-#[cfg(feature = "micropb")]
 pub mod codec;
 pub mod compression;
 mod fields;
@@ -346,6 +345,8 @@ impl<T: BlockingStreamingTransport + ?Sized> BlockingStreamingTransport for &mut
 mod test_support;
 #[cfg(test)]
 mod tests;
+#[cfg(all(test, feature = "micropb", feature = "prost"))]
+mod tests_codec;
 #[cfg(test)]
 mod tests_compression;
 #[cfg(test)]

@@ -1,8 +1,9 @@
 //! # protolink-grpc-gen
 //!
 //! Generates gRPC service bindings for [protolink] from `.proto` service
-//! definitions. Message types are produced by [`micropb-gen`]; this crate
-//! produces the service glue that `tonic-build` would normally provide:
+//! definitions. Message types are produced by [`micropb-gen`] or, with the
+//! `prost` feature, by [`prost-build`]; this crate produces the service glue
+//! that `tonic-build` would normally provide:
 //!
 //! - method path constants,
 //! - a service trait with methods for every RPC (unary, server-streaming,
@@ -66,18 +67,44 @@
 //! }
 //! ```
 //!
+//! ## Prost
+//!
+//! With the `prost` feature, [`Generator::compile_protos_with_prost`] hands the
+//! parsed descriptors to a `prost_build::Config` and generates the messages and
+//! the bindings together (no `protoc` needed). prost resolves the type names, and
+//! the bindings of service `Name` land in module `name_grpc` of the package
+//! module. See the crate README for placement, `extern_path`, and the
+//! collision policy. Use [`Generator::prost_service_generator`] to register the
+//! bindings on a `prost_build::Config` you configure yourself. Enable the
+//! `prost` feature of `protolink-grpc` (or `protolink`) in the consumer.
+//!
+//! ```ignore
+//! let mut config = prost_build::Config::new();
+//! protolink_grpc_gen::Generator::new()
+//!     .compile_protos_with_prost(&["proto/service.proto"], &mut config)
+//!     .unwrap();
+//! ```
+//!
+//! ## Micropb type names
+//!
 //! Type names are resolved exactly like micropb-gen does (`package_` modules,
 //! `Message_` modules for nested types). Keep [`Generator::suffixed_package_names`]
 //! and [`Generator::extern_type_path`] in sync with your micropb-gen settings.
 //!
 //! [protolink]: https://github.com/thives/protolink.rs
 //! [`micropb-gen`]: https://docs.rs/micropb-gen
+//! [`prost-build`]: https://docs.rs/prost-build
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+
+#[cfg(feature = "prost")]
+mod prost_frontend;
+#[cfg(feature = "prost")]
+pub use prost_frontend::{ErrorLog, ProstServiceGenerator};
 
 use protobuf::Message as _;
 use protobuf::descriptor::{
@@ -232,6 +259,14 @@ impl Generator {
         protos: &[impl AsRef<Path>],
         out_file: impl AsRef<Path>,
     ) -> Result<(), Error> {
+        let parsed = self.parse_protos(protos)?;
+        fs::write(out_file, self.generate(&parsed.inputs.file)?)?;
+        Ok(())
+    }
+
+    /// Parse `protos`, normalizing the descriptors for consumers. The set of
+    /// the input files is written to the configured descriptor set path.
+    fn parse_protos(&self, protos: &[impl AsRef<Path>]) -> Result<Parsed, Error> {
         let mut parser = protobuf_parse::Parser::new();
         if self.use_protoc {
             parser.protoc();
@@ -247,22 +282,38 @@ impl Generator {
             parser.includes(&self.includes);
         }
         parser.inputs(protos);
-        let mut set = parser
-            .file_descriptor_set()
+        let mut parsed = parser
+            .parse_and_typecheck()
             .map_err(|e| Error::Parse(format!("{e:#}")))?;
-        for file in &mut set.file {
+        for file in &mut parsed.file_descriptors {
             for msg in &mut file.message_type {
                 normalize_synthetic_oneofs(msg);
             }
         }
+        let inputs: HashSet<String> = parsed
+            .relative_paths
+            .iter()
+            .map(|path| path.to_string())
+            .collect();
+        let mut input_set = FileDescriptorSet::new();
+        input_set.file = parsed
+            .file_descriptors
+            .iter()
+            .filter(|fd| inputs.contains(fd.name()))
+            .cloned()
+            .collect();
         if let Some(path) = &self.fdset_path {
-            let bytes = set
+            let bytes = input_set
                 .write_to_bytes()
                 .map_err(|e| Error::Parse(e.to_string()))?;
             fs::write(path, bytes)?;
         }
-        fs::write(out_file, self.generate(&set.file)?)?;
-        Ok(())
+        let mut all = FileDescriptorSet::new();
+        all.file = parsed.file_descriptors;
+        Ok(Parsed {
+            inputs: input_set,
+            all,
+        })
     }
 
     /// Generate bindings from an encoded `FileDescriptorSet` (e.g. written by
@@ -277,6 +328,77 @@ impl Generator {
             FileDescriptorSet::parse_from_bytes(&bytes).map_err(|e| Error::Parse(e.to_string()))?;
         fs::write(out_file, self.generate(&set.file)?)?;
         Ok(())
+    }
+
+    /// Service generator for `prost-build` that emits bindings for the `Prost`
+    /// codec, configured like this generator (`server`, `client`,
+    /// `blocking_client`, `runtime_path`). The micropb-specific settings
+    /// (`messages_path`, `suffixed_package_names`, `extern_type_path`) do not
+    /// apply: prost names the message types.
+    ///
+    /// Use it directly if you configure `prost_build::Config` yourself.
+    #[cfg(feature = "prost")]
+    pub fn prost_service_generator(&self) -> ProstServiceGenerator {
+        ProstServiceGenerator::with_emitter(Emitter {
+            codec: Codec::Prost,
+            ..self.emitter()
+        })
+    }
+
+    /// Parse `protos` and run `config` on the descriptors to generate both the
+    /// prost messages and the gRPC bindings, which end up in the package
+    /// modules prost writes. Needs no `protoc`, unless
+    /// [`use_protoc`](Self::use_protoc) is set.
+    ///
+    /// The service generator of `config` is replaced.
+    #[cfg(feature = "prost")]
+    pub fn compile_protos_with_prost(
+        &self,
+        protos: &[impl AsRef<Path>],
+        config: &mut prost_build::Config,
+    ) -> Result<(), Error> {
+        let parsed = self.parse_protos(protos)?;
+        self.compile_set_with_prost(&parsed.all, config)
+    }
+
+    /// [`compile_protos_with_prost`](Self::compile_protos_with_prost) for an
+    /// encoded `FileDescriptorSet`, which must include the imported files
+    /// (`protoc --include_imports`).
+    #[cfg(feature = "prost")]
+    pub fn compile_fdset_file_with_prost(
+        &self,
+        fdset: impl AsRef<Path>,
+        config: &mut prost_build::Config,
+    ) -> Result<(), Error> {
+        let bytes = fs::read(fdset)?;
+        let set =
+            FileDescriptorSet::parse_from_bytes(&bytes).map_err(|e| Error::Parse(e.to_string()))?;
+        self.compile_set_with_prost(&set, config)
+    }
+
+    #[cfg(feature = "prost")]
+    fn compile_set_with_prost(
+        &self,
+        set: &FileDescriptorSet,
+        config: &mut prost_build::Config,
+    ) -> Result<(), Error> {
+        use prost::Message as _;
+
+        let bytes = set
+            .write_to_bytes()
+            .map_err(|e| Error::Parse(e.to_string()))?;
+        let fds = prost_types::FileDescriptorSet::decode(bytes.as_slice())
+            .map_err(|e| Error::Parse(e.to_string()))?;
+        let service_generator = self.prost_service_generator();
+        let errors = service_generator.error_log();
+        config.service_generator(Box::new(service_generator));
+        config.compile_fds(fds)?;
+        let errors = errors.take();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::Parse(errors.join("\n")))
+        }
     }
 
     /// Generate the Rust source for all services in `files`.
@@ -345,9 +467,11 @@ impl Generator {
             }
         }
 
+        let emitter = self.emitter();
         let mut out = String::from("// @generated by protolink-grpc-gen. DO NOT EDIT.\n");
         for (package, svc, module) in chosen {
-            self.gen_service(&mut out, package, svc, &module)?;
+            let service = self.resolve_service(package, svc, &module)?;
+            emitter.gen_service(&mut out, &service)?;
         }
         Ok(out)
     }
@@ -434,36 +558,104 @@ impl Generator {
         Ok(path)
     }
 
-    fn gen_service(
+    /// Resolve `svc` into the backend-independent service model, naming the
+    /// message types the way micropb-gen does.
+    fn resolve_service(
         &self,
-        out: &mut String,
         package: &str,
         svc: &ServiceDescriptorProto,
         module: &str,
-    ) -> Result<(), Error> {
-        let full = service_name(package, svc);
-        let name = rust_ident(svc.name());
-        let rt = &self.runtime_path;
-
+    ) -> Result<Service, Error> {
         let methods = svc
             .method
             .iter()
             .map(|m| {
-                let s = snake(m.name());
-                Ok(M {
-                    name: m.name().to_owned(),
-                    kind: Kind::of(m),
-                    konst: format!("METHOD_{}", s.to_uppercase()),
-                    func: rust_ident(&s),
-                    with_options: format!("{s}_with_options"),
-                    poll: format!("poll_{s}"),
-                    end: format!("end_{s}"),
-                    cancel: format!("cancel_{s}"),
-                    req: self.type_path(m.input_type())?,
-                    resp: self.type_path(m.output_type())?,
-                })
+                Ok(M::new(
+                    m.name(),
+                    Kind::of(m),
+                    self.type_path(m.input_type())?,
+                    self.type_path(m.output_type())?,
+                ))
             })
             .collect::<Result<Vec<_>, Error>>()?;
+        Ok(Service {
+            full: service_name(package, svc),
+            name: rust_ident(svc.name()),
+            module: module.to_owned(),
+            methods,
+        })
+    }
+
+    fn emitter(&self) -> Emitter {
+        Emitter {
+            runtime_path: self.runtime_path.clone(),
+            server: self.server,
+            client: self.client,
+            blocking_client: self.blocking_client,
+            codec: Codec::Micropb,
+        }
+    }
+}
+
+/// Result of parsing `.proto` files.
+struct Parsed {
+    /// The files that were asked for.
+    inputs: FileDescriptorSet,
+    /// The input files and everything they import, dependencies first.
+    #[cfg_attr(not(feature = "prost"), allow(dead_code))]
+    all: FileDescriptorSet,
+}
+
+/// The message codec backend a service is generated for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Codec {
+    Micropb,
+    #[cfg_attr(not(feature = "prost"), allow(dead_code))]
+    Prost,
+}
+
+impl Codec {
+    /// Type name in `protolink_grpc::codec`.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Micropb => "Micropb",
+            Self::Prost => "Prost",
+        }
+    }
+}
+
+/// A service resolved to Rust names, independent of the message generator
+/// that produced its request and response types.
+struct Service {
+    /// Fully-qualified protobuf service name; used on the wire.
+    full: String,
+    /// Rust name of the service trait.
+    name: String,
+    /// Rust name of the module the bindings are emitted into.
+    module: String,
+    methods: Vec<M>,
+}
+
+/// Emission settings shared by every frontend.
+#[derive(Debug, Clone)]
+struct Emitter {
+    runtime_path: String,
+    server: bool,
+    client: bool,
+    blocking_client: bool,
+    codec: Codec,
+}
+
+impl Emitter {
+    fn gen_service(&self, out: &mut String, svc: &Service) -> Result<(), Error> {
+        let Service {
+            full,
+            name,
+            module,
+            methods,
+        } = svc;
+        let rt = &self.runtime_path;
+        let codec = format!("__rt::codec::{}", self.codec.name());
 
         let check_names = |names: Vec<(&str, String)>, namespace: &str| -> Result<(), Error> {
             let mut seen = BTreeMap::new();
@@ -493,7 +685,7 @@ impl Generator {
             )?;
         }
         if self.client || self.blocking_client {
-            for m in &methods {
+            for m in methods {
                 for f in [&m.func, &m.with_options] {
                     if matches!(ident_key(f), "new" | "into_inner" | "transport_mut") {
                         return Err(Error::Parse(format!(
@@ -529,7 +721,7 @@ impl Generator {
             w,
             "    pub const SERVICE_NAME: &::core::primitive::str = \"{full}\";"
         );
-        for m in &methods {
+        for m in methods {
             let _ = writeln!(w, "    /// Path of `{}`.", m.name);
             let _ = writeln!(
                 w,
@@ -546,35 +738,20 @@ impl Generator {
         );
 
         if self.server {
-            self.gen_server(w, &full, &name, &methods, streaming);
+            self.gen_server(w, full, name, methods, streaming);
         }
         if self.client {
-            gen_client(
-                w,
-                &full,
-                &name,
-                &methods,
-                ClientFlavor::ASYNC,
-                unary,
-                streaming,
-            );
+            gen_client(w, svc, &codec, ClientFlavor::ASYNC, unary, streaming);
         }
         if self.blocking_client {
-            gen_client(
-                w,
-                &full,
-                &name,
-                &methods,
-                ClientFlavor::BLOCKING,
-                unary,
-                streaming,
-            );
+            gen_client(w, svc, &codec, ClientFlavor::BLOCKING, unary, streaming);
         }
         let _ = writeln!(w, "}}");
         Ok(())
     }
 
     fn gen_server(&self, w: &mut String, full: &str, name: &str, methods: &[M], streaming: bool) {
+        let codec = format!("__rt::codec::{}", self.codec.name());
         let _ = writeln!(w, "\n    /// Server-side implementation of `{full}`.");
         if streaming {
             let _ = writeln!(
@@ -716,7 +893,7 @@ impl Generator {
             if m.kind == Kind::Unary {
                 let _ = writeln!(
                     w,
-                    "                {} => Some(__rt::codec::unary(request, |req| <S as self::{name}>::{}(&mut self.0, ctx, req))),",
+                    "                {} => Some(__rt::codec::unary::<{codec}, _, _>(request, |req| <S as self::{name}>::{}(&mut self.0, ctx, req))),",
                     m.konst, m.func
                 );
             } else {
@@ -765,7 +942,7 @@ impl Generator {
             for m in streams() {
                 let _ = writeln!(
                     w,
-                    "                {} => __rt::codec::message(message, |req| <S as self::{name}>::{}(&mut self.0, ctx, req)),",
+                    "                {} => __rt::codec::message::<{codec}, _>(message, |req| <S as self::{name}>::{}(&mut self.0, ctx, req)),",
                     m.konst, m.func
                 );
             }
@@ -804,7 +981,7 @@ impl Generator {
                 };
                 let _ = writeln!(
                     w,
-                    "                {} => __rt::codec::{helper}(<S as self::{name}>::{}(&mut self.0, ctx, cx)),",
+                    "                {} => __rt::codec::{helper}::<{codec}, _>(<S as self::{name}>::{}(&mut self.0, ctx, cx)),",
                     m.konst, m.poll
                 );
             }
@@ -846,6 +1023,22 @@ struct M {
 }
 
 impl M {
+    fn new(name: &str, kind: Kind, req: String, resp: String) -> Self {
+        let s = snake(name);
+        Self {
+            name: name.to_owned(),
+            kind,
+            konst: format!("METHOD_{}", s.to_uppercase()),
+            func: rust_ident(&s),
+            with_options: format!("{s}_with_options"),
+            poll: format!("poll_{s}"),
+            end: format!("end_{s}"),
+            cancel: format!("cancel_{s}"),
+            req,
+            resp,
+        }
+    }
+
     /// Names of the trait methods generated for this RPC.
     fn trait_fns(&self) -> Vec<String> {
         match self.kind {
@@ -928,13 +1121,18 @@ impl ClientFlavor {
 
 fn gen_client(
     w: &mut String,
-    full: &str,
-    name: &str,
-    methods: &[M],
+    svc: &Service,
+    codec: &str,
     f: ClientFlavor,
     unary: bool,
     streaming: bool,
 ) {
+    let Service {
+        full,
+        name,
+        methods,
+        ..
+    } = svc;
     let ClientFlavor {
         ty,
         doc,
@@ -983,9 +1181,9 @@ fn gen_client(
                  /// Call `{n}` with per-call `options`, for example a timeout or request\n        \
                  /// metadata. The response carries the metadata that came with it.\n        \
                  pub {asyncness}fn {with}(&mut self, request: &{req}, options: __rt::CallOptions) -> ::core::result::Result<__rt::Response<{resp}>, __rt::Status> {{\n            \
-                 let request = __rt::codec::encode(request)?;\n            \
+                 let request = __rt::codec::encode::<{codec}, _>(request)?;\n            \
                  let reply = __rt::{unary_bound}::unary(&mut self.transport, {konst}, &request, options){dot_await}?;\n            \
-                 let message = __rt::codec::decode_response(&reply.message)?;\n            \
+                 let message = __rt::codec::decode_response::<{codec}, _>(&reply.message)?;\n            \
                  Ok(__rt::Response {{ message, headers: reply.headers, trailers: reply.trailers }})\n        }}",
                 n = m.name,
                 func = m.func,
@@ -1012,11 +1210,11 @@ fn gen_client(
                         w,
                         "        /// Call `{n}` (server streaming): send `request`, then read the\n        \
                          /// responses from the returned stream.\n        \
-                         pub {asyncness}fn {func}(&self, request: &{req}) -> ::core::result::Result<__rt::codec::{p}ServerStreaming<{call}, {resp}>, __rt::Status> {{\n            \
+                         pub {asyncness}fn {func}(&self, request: &{req}) -> ::core::result::Result<__rt::codec::{p}ServerStreaming<{call}, {resp}, {codec}>, __rt::Status> {{\n            \
                          self.{with}(request, __rt::CallOptions::default()){dot_await}\n        }}\n\n        \
                          /// Call `{n}` with per-call `options`, for example a timeout.\n        \
-                         pub {asyncness}fn {with}(&self, request: &{req}, options: __rt::CallOptions) -> ::core::result::Result<__rt::codec::{p}ServerStreaming<{call}, {resp}>, __rt::Status> {{\n            \
-                         let request = __rt::codec::encode(request)?;\n            \
+                         pub {asyncness}fn {with}(&self, request: &{req}, options: __rt::CallOptions) -> ::core::result::Result<__rt::codec::{p}ServerStreaming<{call}, {resp}, {codec}>, __rt::Status> {{\n            \
+                         let request = __rt::codec::encode::<{codec}, _>(request)?;\n            \
                          let mut call = {start};\n            \
                          __rt::{call_trait}::send(&mut call, &request){dot_await}?;\n            \
                          __rt::{call_trait}::close_send(&mut call){dot_await}?;\n            \
@@ -1041,10 +1239,10 @@ fn gen_client(
                     let _ = writeln!(
                         w,
                         "        /// Call `{n}` {doc}\n        \
-                         pub {asyncness}fn {func}(&self) -> ::core::result::Result<__rt::codec::{p}{wrapper}<{call}, {req}, {resp}>, __rt::Status> {{\n            \
+                         pub {asyncness}fn {func}(&self) -> ::core::result::Result<__rt::codec::{p}{wrapper}<{call}, {req}, {resp}, {codec}>, __rt::Status> {{\n            \
                          self.{with}(__rt::CallOptions::default()){dot_await}\n        }}\n\n        \
                          /// Call `{n}` with per-call `options`, for example a timeout.\n        \
-                         pub {asyncness}fn {with}(&self, options: __rt::CallOptions) -> ::core::result::Result<__rt::codec::{p}{wrapper}<{call}, {req}, {resp}>, __rt::Status> {{\n            \
+                         pub {asyncness}fn {with}(&self, options: __rt::CallOptions) -> ::core::result::Result<__rt::codec::{p}{wrapper}<{call}, {req}, {resp}, {codec}>, __rt::Status> {{\n            \
                          Ok(__rt::codec::{p}{wrapper}::new({start}))\n        }}"
                     );
                 }
@@ -1313,7 +1511,7 @@ service Service {
         assert!(src.contains("pub const METHODS: &[&::core::primitive::str] = &[METHOD_COMMAND, METHOD_NESTED, METHOD_EVENT_SUBSCRIBE, METHOD_UPLOAD, METHOD_CHAT];"));
         // The call context, with the deadline, reaches the service method.
         assert!(src.contains(
-            "__rt::codec::unary(request, |req| <S as self::Service>::command(&mut self.0, ctx, req))"
+            "__rt::codec::unary::<__rt::codec::Micropb, _, _>(request, |req| <S as self::Service>::command(&mut self.0, ctx, req))"
         ));
     }
 
@@ -1338,11 +1536,11 @@ service Service {
             "METHOD_UPLOAD => Some(__rt::MethodKind::ClientStreaming),",
             "METHOD_CHAT => Some(__rt::MethodKind::BidiStreaming),",
             "METHOD_EVENT_SUBSCRIBE => Some(Err(__rt::Status::unimplemented(\"`EventSubscribe` is a streaming method\"))),",
-            "METHOD_UPLOAD => __rt::codec::message(message, |req| <S as self::Service>::upload(&mut self.0, ctx, req)),",
+            "METHOD_UPLOAD => __rt::codec::message::<__rt::codec::Micropb, _>(message, |req| <S as self::Service>::upload(&mut self.0, ctx, req)),",
             "METHOD_CHAT => <S as self::Service>::end_chat(&mut self.0, ctx),",
-            "METHOD_EVENT_SUBSCRIBE => __rt::codec::poll_stream(<S as self::Service>::poll_event_subscribe(&mut self.0, ctx, cx)),",
-            "METHOD_UPLOAD => __rt::codec::poll_single(<S as self::Service>::poll_upload(&mut self.0, ctx, cx)),",
-            "METHOD_CHAT => __rt::codec::poll_stream(<S as self::Service>::poll_chat(&mut self.0, ctx, cx)),",
+            "METHOD_EVENT_SUBSCRIBE => __rt::codec::poll_stream::<__rt::codec::Micropb, _>(<S as self::Service>::poll_event_subscribe(&mut self.0, ctx, cx)),",
+            "METHOD_UPLOAD => __rt::codec::poll_single::<__rt::codec::Micropb, _>(<S as self::Service>::poll_upload(&mut self.0, ctx, cx)),",
+            "METHOD_CHAT => __rt::codec::poll_stream::<__rt::codec::Micropb, _>(<S as self::Service>::poll_chat(&mut self.0, ctx, cx)),",
             "METHOD_UPLOAD => <S as self::Service>::cancel_upload(&mut self.0, ctx),",
             "fn is_unknown_method(&self, path: &::core::primitive::str) -> ::core::primitive::bool {\n            self.method_kind(path).is_none()",
         ] {

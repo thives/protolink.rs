@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! application  ── implements generated `<Service>` trait / calls `<Service>Client`
-//! codegen      ── protolink-grpc-gen (service glue) + micropb-gen (messages)
+//! codegen      ── protolink-grpc-gen (service glue) + micropb-gen or prost-build (messages)
 //! gRPC         ── protolink-grpc   (re-exported as `protolink::grpc`)
 //! HTTP/2       ── protolink-http2  (on zerodds-http2 + zerodds-hpack)
 //! drivers      ── this crate: async / blocking / tokio I/O loops

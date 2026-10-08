@@ -18,13 +18,13 @@ It is async first, `no_std + alloc`, with options for embedded-io, blocking I/O,
 | Crate | Path | Purpose |
 |---|---|---|
 | `protolink` | `.` | I/O drivers (async, blocking, tokio) and the COBS + ARQ link stack |
-| `protolink-grpc` | `grpc/` | Sans-IO gRPC server/client (unary and streaming), status mapping, micropb codec |
+| `protolink-grpc` | `grpc/` | Sans-IO gRPC server/client (unary and streaming), status mapping, micropb and prost codecs (features) |
 | `protolink-http2` | `http2/` | Sans-IO HTTP/2 connection, built on `zerodds-http2` + `zerodds-hpack` |
-| `protolink-grpc-gen` | `grpc-gen/` | Code generator: service traits, servers and clients for micropb messages |
+| `protolink-grpc-gen` | `grpc-gen/` | Code generator: service traits, servers and clients for micropb or prost messages |
 
 ```text
 application  ── implements generated <Service> trait / calls <Service>Client
-codegen      ── protolink-grpc-gen (service glue) + micropb-gen (messages)
+codegen      ── protolink-grpc-gen (service glue) + micropb-gen or prost-build (messages)
 gRPC         ── protolink-grpc
 HTTP/2       ── protolink-http2
 drivers      ── protolink (async / blocking / tokio)
@@ -49,7 +49,10 @@ micropb_gen::Generator::new()
     .unwrap();
 ```
 
-Include both outputs in the same module, then implement the generated trait:
+Include both outputs in the same module, then implement the generated trait.
+Messages can instead come from [prost](https://docs.rs/prost) (features
+`prost` on `protolink` and `protolink-grpc-gen`, `Generator::compile_protos_with_prost`;
+see the `protolink-grpc-gen` README); the `micropb` feature stays the default.
 
 ```rust
 pub mod proto {

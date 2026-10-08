@@ -1,0 +1,9 @@
+syntax = "proto3";
+package fixture.api;
+
+import "common.proto";
+
+// A second file in the same package: one shared module scope.
+service Second {
+  rpc Ping(Common) returns (Common);
+}

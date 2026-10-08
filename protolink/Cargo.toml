@@ -12,7 +12,7 @@ edition = "2024"
 rust-version = "1.88"
 
 [dependencies]
-protolink-grpc = { version = "0", path = "../protolink-grpc" }
+protolink-grpc = { version = "0", path = "../protolink-grpc", default-features = false }
 embedded-io-async = { version = "0.7", optional = true }
 embedded-io = { version = "0.7", optional = true }
 cobs-io-async = { version = "0.0.4", default-features = false, optional = true }
@@ -33,6 +33,10 @@ bytes = "1"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [features]
+default = ["micropb"]
+# Message codec backends of the generated gRPC bindings.
+micropb = ["protolink-grpc/micropb"]
+prost = ["protolink-grpc/prost"]
 async = [
     "dep:embedded-io-async",
     "dep:cobs-io-async",

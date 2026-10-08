@@ -6,11 +6,12 @@ no_std := "-p protolink -p protolink-grpc -p protolink-http2"
 clippy:
   cargo clippy --workspace --all-features --all-targets -- -D warnings
 
-# The root workspace and the two standalone fixture workspaces
+# The root workspace and the standalone fixture workspaces
 fmt:
   cargo fmt --all -- --check
   cargo fmt --manifest-path examples/embedded-smoke/Cargo.toml --all -- --check
   cargo fmt --manifest-path protolink-grpc-gen/tests/compile-fixture/Cargo.toml --all -- --check
+  cargo fmt --manifest-path protolink-grpc-gen/tests/compile-fixture-prost/Cargo.toml --all -- --check
 
 check:
   cargo check --workspace --all-features
@@ -18,6 +19,9 @@ check:
 embedded:
   cargo build --target thumbv7em-none-eabihf --no-default-features {{no_std}}
   cargo build --target thumbv7em-none-eabihf --no-default-features --features async,blocking {{no_std}}
+  # prost needs pointer-width atomics (via `bytes`), so not thumbv6m
+  cargo build --target thumbv7em-none-eabihf --no-default-features --features prost -p protolink-grpc
+  cargo build --target thumbv7em-none-eabihf --no-default-features --features prost,async,blocking -p protolink
 
 # Every feature on its own, and the combinations that interact (needs cargo-hack)
 features:

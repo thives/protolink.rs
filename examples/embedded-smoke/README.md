@@ -55,7 +55,7 @@ runtime matrix checks `portable-atomic-critical-section` (which implies `async`)
 with all combinations of `blocking` and `miniz-oxide`, using only `--lib` (not tests,
 examples, or `--all-targets`, which could pull in std dev-dependencies). Separate
 sans-I/O checks cover no codec, micropb, miniz-oxide, and both codecs without
-`protolink`'s default micropb dependency unifying their features.
+`protolink`'s `micropb` feature unifying their features.
 
 Build the **linked binary**, not just metadata:
 
