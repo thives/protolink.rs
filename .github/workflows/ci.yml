@@ -40,67 +40,8 @@ jobs:
         run: |
           go install github.com/fullstorydev/grpcurl/cmd/grpcurl@v1.9.3
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
-      - name: Build example server
-        run: cargo build -p embedded-device-example --bin embedded-device-server
       - name: Exercise RPCs with grpcurl
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          addr=127.0.0.1:50051
-          proto=examples/embedded-device/proto
-          service=protolink.examples.embedded.device.Service
-
-          ./target/debug/embedded-device-server "$addr" >server.log 2>&1 &
-          server_pid=$!
-          trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true' EXIT
-
-          ready=false
-          for _ in $(seq 1 30); do
-            if grpcurl -plaintext -import-path "$proto" -proto device.proto \
-              -d '{"correlationId":7,"getStatus":{}}' "$addr" "$service/Command" \
-              >/tmp/unary.json 2>/dev/null &&
-              jq -e '.correlationId == 7 and has("status")' /tmp/unary.json >/dev/null; then
-              ready=true
-              break
-            fi
-            sleep 1
-          done
-          if [[ "$ready" != true ]]; then
-            cat server.log
-            exit 1
-          fi
-
-          printf '%s\n' \
-            '{"correlationId":1,"setOutput":{"channel":0,"enabled":true}}' \
-            '{"correlationId":2,"setOutput":{"channel":1,"enabled":true}}' \
-            '{"correlationId":3,"setOutput":{"channel":9,"enabled":true}}' |
-            grpcurl -plaintext -import-path "$proto" -proto device.proto -d @ \
-              "$addr" "$service/CommandBatch" |
-            jq -e '.accepted == 2 and .rejected == 1' >/dev/null
-
-          printf '%s\n' \
-            '{"correlationId":11,"getStatus":{}}' \
-            '{"correlationId":12,"restart":{}}' |
-            grpcurl -plaintext -import-path "$proto" -proto device.proto -d @ \
-              "$addr" "$service/CommandStream" |
-            jq -s -e 'length == 2 and .[0].correlationId == 11 and .[1].correlationId == 12' \
-              >/dev/null
-
-          grpcurl -plaintext -import-path "$proto" -proto device.proto \
-            -d '{}' "$addr" "$service/EventSubscribe" >/tmp/events.json
-          test ! -s /tmp/events.json
-
-          # Deadlines: grpcurl sends `-max-time` as `grpc-timeout`. A stream
-          # that stays open (stdin is held for 3 s) ends with DeadlineExceeded
-          # after 1 s, and the server keeps serving afterwards.
-          deadline_out=$( (printf '%s\n' '{"correlationId":21,"getStatus":{}}'; sleep 3) |
-            grpcurl -plaintext -max-time 1 -import-path "$proto" -proto device.proto -d @ \
-              "$addr" "$service/CommandStream" 2>&1 || true)
-          grep -q 'DeadlineExceeded' <<<"$deadline_out" || { echo "$deadline_out"; exit 1; }
-          grpcurl -plaintext -import-path "$proto" -proto device.proto \
-            -d '{"correlationId":8,"getStatus":{}}' "$addr" "$service/Command" |
-            jq -e '.correlationId == 8' >/dev/null
+        run: bash scripts/grpcurl-interop.sh
 
   stress:
     name: Stress concurrent calls

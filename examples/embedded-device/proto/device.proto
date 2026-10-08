@@ -57,12 +57,12 @@ message BatchSummary {
 
 service Service {
   // Execute one command.
-  rpc Command(Command) returns (Reply);
+  rpc Command(.protolink.examples.embedded.device.Command) returns (Reply);
   // Replay the device's event log, then end the stream.
-  rpc EventSubscribe(EventSubscribe) returns (stream Event);
+  rpc EventSubscribe(.protolink.examples.embedded.device.EventSubscribe) returns (stream Event);
   // Execute a batch of commands and report how many were accepted.
-  rpc CommandBatch(stream Command) returns (BatchSummary);
+  rpc CommandBatch(stream .protolink.examples.embedded.device.Command) returns (BatchSummary);
   // Execute commands as they arrive and reply to each, in order. A rejected
   // command ends the stream with its error.
-  rpc CommandStream(stream Command) returns (stream Reply);
+  rpc CommandStream(stream .protolink.examples.embedded.device.Command) returns (stream Reply);
 }

@@ -67,3 +67,7 @@ coverage-html:
 # Run the example gRPC server on 127.0.0.1:50051 (test with grpcurl)
 example-server:
   cargo run -p embedded-device-example --bin embedded-device-server
+
+# Run the CI grpcurl interoperability checks locally (requires grpcurl and jq)
+grpcurl:
+  bash scripts/grpcurl-interop.sh
