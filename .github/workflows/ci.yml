@@ -135,7 +135,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: thumbv6m-none-eabi
+          targets: "thumbv6m-none-eabi, thumbv7em-none-eabihf"
       # Nested standalone workspace: host generators can use std, target code
       # cannot inherit the root workspace's example/dev-dependency features.
       - name: Check all generated RPC shapes
@@ -147,6 +147,8 @@ jobs:
         if: matrix.features == 'async,blocking'
         env:
           PROTOLINK_GRPC_GEN_TEST_TARGET: thumbv6m-none-eabi
+          # Prost's bytes dependency needs pointer-width atomics.
+          PROTOLINK_GRPC_GEN_TEST_PROST_TARGET: thumbv7em-none-eabihf
         run: cargo test -p protolink-grpc-gen --test compilation
 
   features:

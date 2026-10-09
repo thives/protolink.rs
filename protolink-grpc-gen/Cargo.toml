@@ -1,13 +1,13 @@
 [package]
 name = "protolink-grpc-gen"
-version = "0.0.2"
+version = "0.0.3"
 authors = [
   "Thomas Ivesdal-Tronstad <>",
 ]
 license = "MIT OR Apache-2.0"
 description = "Generates protolink gRPC service traits, servers and clients for micropb or prost messages."
 repository = "https://github.com/thives/protolink.rs"
-keywords = ["grpc", "protobuf", "micropb", "prost", "codegen", "embedded"]
+keywords = ["grpc", "protobuf", "codegen", "embedded"]
 edition = "2024"
 rust-version = "1.88"
 

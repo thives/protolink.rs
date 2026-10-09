@@ -7,7 +7,7 @@ authors = [
 license = "MIT OR Apache-2.0"
 description = "Sans-IO, no_std + alloc gRPC server/client core (unary and streaming) with micropb and prost codec support."
 repository = "https://github.com/thives/protolink.rs"
-keywords = ["grpc", "embedded", "no_std", "protobuf", "micropb"]
+keywords = ["grpc", "embedded", "no_std", "protobuf"]
 edition = "2024"
 rust-version = "1.88"
 

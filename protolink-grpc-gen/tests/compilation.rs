@@ -1,6 +1,10 @@
 use std::{env, path::PathBuf, process::Command};
 
 fn check(fixture_dir: &str, features: Option<&str>) {
+    check_with_target(fixture_dir, features, "PROTOLINK_GRPC_GEN_TEST_TARGET");
+}
+
+fn check_with_target(fixture_dir: &str, features: Option<&str>, target_env: &str) {
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join(fixture_dir);
@@ -20,7 +24,9 @@ fn check(fixture_dir: &str, features: Option<&str>) {
             .arg("--features")
             .arg(features);
     }
-    if let Some(target) = env::var_os("PROTOLINK_GRPC_GEN_TEST_TARGET") {
+    if let Some(target) =
+        env::var_os(target_env).or_else(|| env::var_os("PROTOLINK_GRPC_GEN_TEST_TARGET"))
+    {
         cargo.arg("--target").arg(target);
     }
     let output = cargo
@@ -63,7 +69,14 @@ fn prost_generated_bindings_compile_in_no_std_consumer() {
         Some("blocking-client"),
         Some("server,async-client,blocking-client"),
     ] {
-        check("compile-fixture-prost", features);
+        // Prost's `bytes` dependency requires pointer-width atomics. Allow a
+        // separate target so CI can check this fixture on thumbv7em while the
+        // general fixture exercises thumbv6m.
+        check_with_target(
+            "compile-fixture-prost",
+            features,
+            "PROTOLINK_GRPC_GEN_TEST_PROST_TARGET",
+        );
     }
 }
 
