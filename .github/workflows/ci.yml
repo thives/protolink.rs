@@ -168,6 +168,9 @@ jobs:
   semver:
     name: Public API vs last release (informational)
     runs-on: ubuntu-latest
+    # Disabled at the 0.0.x stage: no meaningful baseline to compare against
+    # yet. Re-enable by removing `if: false` once a real release tag exists.
+    if: false
     # Report only: the crates are 0.0.x, where any change may be breaking. The
     # output tells reviewers which public items changed. Move the baseline to
     # the newest release tag after each release.
