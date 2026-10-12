@@ -54,12 +54,12 @@
 //! ```no_run
 //! use embedded_io_async::{Read, Write};
 //! use protolink::link::pump::{DefaultPumpState, run};
-//! use protolink::link::{Timer, reliable_with_timer};
+//! use protolink::link::{Timer, reliable};
 //!
 //! # async fn demo<R: Read, W: Write, T: Timer>(uart_rx: R, uart_tx: W, timer: T) {
 //! let mut state = DefaultPumpState::new();
 //! let (handle, mut rx, mut tx) = state.split(uart_rx, uart_tx);
-//! let mut link = reliable_with_timer(handle, timer);
+//! let mut link = reliable(handle).with_retransmission_timer(timer).build();
 //!
 //! // Poll `run(&mut rx, &mut tx)` next to the code that uses `link`, e.g.
 //! //     select(run(&mut rx, &mut tx), application(&mut link)).await;
@@ -400,7 +400,7 @@ impl<const RX: usize, const TX: usize, const CHUNK: usize> Default for PumpState
 ///
 /// Implements `embedded_io_async::{Read, Write}` with operations that are
 /// cancel-safe: they only move bytes to or from the ring buffers. Give it to
-/// [`reliable_with_timer`](super::reliable_with_timer) or
+/// [`reliable`](super::reliable) or
 /// [`CobsFramed::new`](super::CobsFramed::new).
 pub struct PumpHandle<'a, const RX: usize, const TX: usize> {
     rx: RingRx<'a, u8, RX>,

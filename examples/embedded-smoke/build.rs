@@ -8,11 +8,11 @@ fn main() {
 
     // Use the same host-only, pure-Rust parse as embedded-device: no protoc.
     let fdset = out.join("smoke.fdset");
-    let mut grpc = protolink_grpc_gen::Generator::new();
-    grpc.file_descriptor_set_path(&fdset)
-        .client(std::env::var_os("CARGO_FEATURE_ASYNC").is_some())
-        .blocking_client(std::env::var_os("CARGO_FEATURE_BLOCKING").is_some());
-    grpc.compile_protos(&[proto], out.join("smoke_grpc.rs"))
+    protolink_grpc_gen::Generator::micropb()
+        .with_file_descriptor_set_path(&fdset)
+        .with_client(std::env::var_os("CARGO_FEATURE_ASYNC").is_some())
+        .with_blocking_client(std::env::var_os("CARGO_FEATURE_BLOCKING").is_some())
+        .compile_protos(&[proto], out.join("smoke_grpc.rs"))
         .unwrap();
     let mut messages = micropb_gen::Generator::new();
     messages.use_container_alloc();

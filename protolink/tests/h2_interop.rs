@@ -6,7 +6,6 @@ use std::time::Duration;
 use bytes::Bytes;
 use http::{HeaderMap, Request, Response};
 use protolink::grpc::{Code, FnHandler, Status};
-use protolink::{ClientConfig, ServerConfig};
 
 fn lpm(payload: &[u8]) -> Bytes {
     let mut v = vec![0];
@@ -84,7 +83,9 @@ async fn h2_client_against_protolink_server() {
     let (a, b) = tokio::io::duplex(16 * 1024);
     tokio::spawn(async move {
         let mut h = FnHandler(handler);
-        protolink::tokio::serve(a, &mut h, ServerConfig::default())
+        protolink::tokio::server(a)
+            .build()
+            .serve(&mut h)
             .await
             .unwrap();
     });
@@ -160,7 +161,7 @@ async fn protolink_client_against_h2_server() {
         }
     });
     with_timeout(async {
-        let mut client = protolink::tokio::client(b, ClientConfig::default());
+        let mut client = protolink::tokio::client(b).build();
         assert_eq!(
             client.unary("/echo.Echo/Echo", b"abc").await.unwrap(),
             b"abc"
@@ -183,10 +184,7 @@ mod streaming {
 
     use bytes::Bytes;
     use http::{HeaderMap, Request, Response};
-    use protolink::grpc::{
-        CallContext, CallId, Code, FnHandler, Handler, MethodKind, Next, Status,
-    };
-    use protolink::{ClientConfig, ServerConfig};
+    use protolink::grpc::{CallContext, CallId, Code, Handler, MethodKind, Next, Route, Status};
 
     use super::{handler, lpm, with_timeout};
 
@@ -231,17 +229,19 @@ mod streaming {
     }
 
     impl Handler for Streams {
-        fn call(&mut self, _: &mut CallContext<'_>, _: &[u8]) -> Option<Result<Vec<u8>, Status>> {
-            None
+        fn route(&self, path: &str) -> Option<Route> {
+            let kind = match path {
+                "/echo.Echo/Repeat" | "/echo.Echo/Wait" => MethodKind::ServerStreaming,
+                "/echo.Echo/Concat" => MethodKind::ClientStreaming,
+                "/echo.Echo/Chat" => MethodKind::BidiStreaming,
+                // Every other path is a unary echo method.
+                _ => MethodKind::Unary,
+            };
+            Some(Route::new(kind, 0))
         }
 
-        fn method_kind(&self, path: &str) -> Option<MethodKind> {
-            match path {
-                "/echo.Echo/Repeat" | "/echo.Echo/Wait" => Some(MethodKind::ServerStreaming),
-                "/echo.Echo/Concat" => Some(MethodKind::ClientStreaming),
-                "/echo.Echo/Chat" => Some(MethodKind::BidiStreaming),
-                _ => None,
-            }
+        fn call(&mut self, ctx: &mut CallContext<'_>, req: &[u8]) -> Result<Vec<u8>, Status> {
+            handler(ctx.path, req).unwrap_or_else(|| Err(Status::unimplemented("unknown method")))
         }
 
         fn on_message(&mut self, ctx: &mut CallContext<'_>, msg: &[u8]) -> Result<(), Status> {
@@ -331,7 +331,7 @@ mod streaming {
             .unwrap()
     }
 
-    /// Serve `Streams` (plus the unary echo handler) on a duplex; returns the
+    /// Serve `Streams` (which includes the unary echo methods) on a duplex; returns the
     /// h2 client sender, the handler state and the server task.
     async fn start_server() -> (
         h2::client::SendRequest<Bytes>,
@@ -342,8 +342,10 @@ mod streaming {
         let streams = Streams::default();
         let server_streams = streams.clone();
         let server = tokio::spawn(async move {
-            let mut h = (FnHandler(handler), server_streams);
-            protolink::tokio::serve(a, &mut h, ServerConfig::default())
+            let mut h = server_streams;
+            protolink::tokio::server(a)
+                .build()
+                .serve(&mut h)
                 .await
                 .unwrap();
         });
@@ -679,7 +681,7 @@ mod streaming {
         let (a, b) = tokio::io::duplex(16 * 1024);
         spawn_h2_server(a);
         with_timeout(async {
-            let client = protolink::tokio::client(b, ClientConfig::default());
+            let client = protolink::tokio::client(b).build();
 
             // Bidi: replies arrive byte by byte, before the half-close.
             let mut call = client.streaming("/echo.Echo/Chat").unwrap();
@@ -769,8 +771,8 @@ mod deadlines {
 
     use bytes::Bytes;
     use http::{HeaderMap, Response};
-    use protolink::grpc::{CallContext, Code, Handler, MethodKind, Next, Status};
-    use protolink::{CallOptions, ClientConfig, ServerConfig};
+    use protolink::CallOptions;
+    use protolink::grpc::{CallContext, Code, Handler, MethodKind, Next, Route, Status};
 
     use super::{h2_call_with, handler, lpm, with_timeout};
 
@@ -780,16 +782,17 @@ mod deadlines {
     struct QuietEcho;
 
     impl Handler for QuietEcho {
-        fn call(
-            &mut self,
-            ctx: &mut CallContext<'_>,
-            req: &[u8],
-        ) -> Option<Result<Vec<u8>, Status>> {
-            handler(ctx.path, req)
+        fn route(&self, path: &str) -> Option<Route> {
+            let kind = if path == QUIET {
+                MethodKind::ServerStreaming
+            } else {
+                MethodKind::Unary
+            };
+            Some(Route::new(kind, 0))
         }
 
-        fn method_kind(&self, path: &str) -> Option<MethodKind> {
-            (path == QUIET).then_some(MethodKind::ServerStreaming)
+        fn call(&mut self, ctx: &mut CallContext<'_>, req: &[u8]) -> Result<Vec<u8>, Status> {
+            handler(ctx.path, req).unwrap_or_else(|| Err(Status::unimplemented("unknown method")))
         }
 
         fn on_message(&mut self, _: &mut CallContext<'_>, _: &[u8]) -> Result<(), Status> {
@@ -809,7 +812,10 @@ mod deadlines {
     async fn h2_client() -> h2::client::SendRequest<Bytes> {
         let (a, b) = tokio::io::duplex(16 * 1024);
         tokio::spawn(async move {
-            let _ = protolink::tokio::serve(a, &mut QuietEcho, ServerConfig::default()).await;
+            let _ = protolink::tokio::server(a)
+                .build()
+                .serve(&mut QuietEcho)
+                .await;
         });
         let (sender, conn) = h2::client::handshake(b).await.unwrap();
         tokio::spawn(async move {
@@ -929,7 +935,7 @@ mod deadlines {
             }
         });
         with_timeout(async {
-            let mut client = protolink::tokio::client(b, ClientConfig::default());
+            let mut client = protolink::tokio::client(b).build();
             let err = client
                 .unary_with(
                     "/echo.Echo/Hang",

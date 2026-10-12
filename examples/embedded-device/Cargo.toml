@@ -17,5 +17,8 @@ micropb-gen = "0.6"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "io-util", "net", "time", "test-util"] }
+embedded-io = "0.7"
 embedded-io-async = "0.7"
+embedded-hal-async = "1"
+protolink-adaptors = { path = "../../protolink-adaptors" }
 embedded-io-adapters = { version = "0.7", features = ["tokio-1", "std"] }

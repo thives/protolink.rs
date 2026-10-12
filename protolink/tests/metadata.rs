@@ -6,9 +6,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use http::{HeaderMap, Request, Response};
-use protolink::{
-    CallContext, CallOptions, ClientConfig, Code, Handler, Metadata, ServerConfig, Status,
-};
+use protolink::{CallContext, CallOptions, Code, Handler, Metadata, MethodKind, Route, Status};
 
 fn lpm(payload: &[u8]) -> Bytes {
     let mut v = vec![0];
@@ -29,11 +27,11 @@ async fn with_timeout<F: Future>(f: F) -> F::Output {
 struct Reflect;
 
 impl Handler for Reflect {
-    fn call(
-        &mut self,
-        ctx: &mut CallContext<'_>,
-        request: &[u8],
-    ) -> Option<Result<Vec<u8>, Status>> {
+    fn route(&self, _: &str) -> Option<Route> {
+        Some(Route::new(MethodKind::Unary, 0))
+    }
+
+    fn call(&mut self, ctx: &mut CallContext<'_>, request: &[u8]) -> Result<Vec<u8>, Status> {
         let text = ctx.metadata().get("x-in").map(str::to_owned);
         let bin = ctx.metadata().get_bin("x-bin-bin").map(<[u8]>::to_vec);
         let headers = ctx.initial_metadata_mut().unwrap();
@@ -46,7 +44,7 @@ impl Handler for Reflect {
         ctx.trailing_metadata_mut()
             .insert("x-trail", "done")
             .unwrap();
-        Some(Ok(request.to_vec()))
+        Ok(request.to_vec())
     }
 }
 
@@ -98,7 +96,9 @@ async fn h2_client_metadata_reaches_the_handler_and_comes_back() {
     let (a, b) = tokio::io::duplex(16 * 1024);
     tokio::spawn(async move {
         let mut handler = Reflect;
-        protolink::tokio::serve(a, &mut handler, ServerConfig::default())
+        protolink::tokio::server(a)
+            .build()
+            .serve(&mut handler)
             .await
             .unwrap();
     });
@@ -192,7 +192,7 @@ async fn protolink_client_metadata_against_an_h2_server() {
         }
     });
     with_timeout(async {
-        let mut client = protolink::tokio::client(b, ClientConfig::default());
+        let mut client = protolink::tokio::client(b).build();
         let options = || {
             let mut md = Metadata::new();
             md.insert("x-req", "r").unwrap();

@@ -35,7 +35,56 @@ impl proto::r#type::Type for Service {
 
 #[cfg(feature = "server")]
 pub fn server() -> impl Handler {
-    proto::r#type::TypeServer::new(Service)
+    proto::r#type::TypeDispatch::new(Service)
+}
+
+/// Owned and borrowed implementations, independent objects in a registry, and
+/// one object behind two services.
+#[cfg(feature = "server")]
+pub fn composed(
+    service: &mut Service,
+    lifecycle: &mut Lifecycle,
+) -> Result<(), protolink_grpc::RouteConflict> {
+    use protolink_grpc::{Dispatcher, MultiDispatch, Registry};
+    fn dispatcher(_: impl Dispatcher) {}
+
+    let mut borrowed = proto::r#type::TypeDispatch::new(&mut *service);
+    let _: &mut &mut Service = borrowed.get_mut();
+    let _: &&mut Service = borrowed.get_ref();
+    dispatcher(borrowed);
+    let owned = proto::r#type::TypeDispatch::new(Service);
+    let _: Service = owned.into_inner();
+
+    dispatcher(
+        Registry::builder()
+            .with_service(proto::r#type::TypeDispatch::new(&mut *service))
+            .with_service(lifecycle::lifecycle::LifecycleDispatch::new(
+                &mut *lifecycle,
+            ))
+            .build()?,
+    );
+
+    struct Both;
+    impl proto::r#type::Type for Both {
+        fn r#type(&mut self, _: &mut CallContext<'_>, request: Request) -> Result<Reply, Status> {
+            Ok(Reply {
+                value: request.value,
+            })
+        }
+    }
+    impl lifecycle::lifecycle::Lifecycle for Both {
+        fn new(&mut self, _: &mut CallContext<'_>, request: Message) -> Result<Message, Status> {
+            Ok(request)
+        }
+    }
+    let mut both = Both;
+    dispatcher(
+        MultiDispatch::builder(&mut both)
+            .with_service(proto::r#type::TypeMethods)
+            .with_service(lifecycle::lifecycle::LifecycleMethods)
+            .build()?,
+    );
+    Ok(())
 }
 
 // Referencing these identifiers makes the consumer verify escaping, not just
@@ -51,13 +100,13 @@ pub fn keyword_servers() {
     impl proto::r#async::r#async for Empty {}
     impl proto::r#gen::r#gen for Empty {}
     fn handler(_: impl Handler) {}
-    handler(proto::r#match::r#matchServer::new(Empty));
-    handler(proto::self_::Self_Server::new(Empty));
-    handler(proto::crate_::crate_Server::new(Empty));
-    handler(proto::__::__Server::new(Empty));
-    handler(proto::extern_::extern_Server::new(Empty));
-    handler(proto::r#async::r#asyncServer::new(Empty));
-    handler(proto::r#gen::r#genServer::new(Empty));
+    handler(proto::r#match::r#matchDispatch::new(Empty));
+    handler(proto::self_::Self_Dispatch::new(Empty));
+    handler(proto::crate_::crate_Dispatch::new(Empty));
+    handler(proto::__::__Dispatch::new(Empty));
+    handler(proto::extern_::extern_Dispatch::new(Empty));
+    handler(proto::r#async::r#asyncDispatch::new(Empty));
+    handler(proto::r#gen::r#genDispatch::new(Empty));
 }
 
 pub const QUALIFIED_SERVICE_NAMES: [&str; 2] = [
@@ -123,7 +172,7 @@ impl lifecycle::lifecycle::Lifecycle for Lifecycle {
 }
 
 pub fn lifecycle_server() -> impl Handler {
-    lifecycle::lifecycle::LifecycleServer::new(Lifecycle)
+    lifecycle::lifecycle::LifecycleDispatch::new(Lifecycle)
 }
 
 #[allow(non_snake_case, non_camel_case_types, unused, unused_parens)]
@@ -172,14 +221,14 @@ pub fn name_servers() {
     struct Impl;
     fn handler(_: impl Handler) {}
     implement!(
-        s::S => SServer,
-        status::Status => StatusServer,
-        context::Context => ContextServer,
-        poll::Poll => PollServer,
-        vec::Vec => VecServer,
-        str::str => strServer,
-        bool::bool => boolServer,
-        u8::u8 => u8Server
+        s::S => SDispatch,
+        status::Status => StatusDispatch,
+        context::Context => ContextDispatch,
+        poll::Poll => PollDispatch,
+        vec::Vec => VecDispatch,
+        str::str => strDispatch,
+        bool::bool => boolDispatch,
+        u8::u8 => u8Dispatch
     );
 }
 
@@ -227,8 +276,8 @@ pub fn collision_servers() {
         }
     }
     fn handler(_: impl Handler) {}
-    handler(collide::foo__grpc::Foo_Server::new(Impl));
-    handler(collide::foo::FooServer::new(Impl));
+    handler(collide::foo__grpc::Foo_Dispatch::new(Impl));
+    handler(collide::foo::FooDispatch::new(Impl));
 }
 
 #[cfg(all(feature = "server", feature = "unsuffixed-packages"))]
@@ -246,8 +295,8 @@ pub fn collision_servers() {
         }
     }
     fn handler(_: impl Handler) {}
-    handler(collide::foo_grpc::FooServer::new(Impl));
-    handler(collide::foo_::Foo_Server::new(Impl));
+    handler(collide::foo_grpc::FooDispatch::new(Impl));
+    handler(collide::foo_::Foo_Dispatch::new(Impl));
 }
 
 // Relative paths beginning with `crate` resolve from the inclusion point.
@@ -268,5 +317,5 @@ pub fn relative_server() -> impl Handler {
             Ok(request)
         }
     }
-    relative::foo::FooServer::new(Impl)
+    relative::foo::FooDispatch::new(Impl)
 }

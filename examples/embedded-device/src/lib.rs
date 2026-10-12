@@ -11,6 +11,28 @@
 //! in its response headers and reports `x-device-uptime-ms` in its trailers,
 //! and `EventSubscribe` announces how many events it replays in
 //! `x-events-replayed`.
+//!
+//! [`Device`] implements a second generated service, `Diagnostics`, so one
+//! application object serves both through a [`MultiDispatch`](protolink::MultiDispatch):
+//!
+//! ```no_run
+//! use embedded_device_example::{Device, DiagnosticsMethods, ServiceMethods};
+//!
+//! # async fn demo(stream: tokio::net::TcpStream) -> Result<(), Box<dyn std::error::Error>> {
+//! let mut device = Device::default();
+//! let mut services = protolink::MultiDispatch::builder(&mut device)
+//!     .with_service(ServiceMethods)
+//!     .with_service(DiagnosticsMethods)
+//!     .build()?;
+//! protolink::tokio::server(stream).build().serve(&mut services).await?;
+//! # Ok(()) }
+//! ```
+
+/// The public API contract, `docs/API.md`, compiled as doctests against the
+/// bindings of this example.
+#[cfg(doctest)]
+#[doc = include_str!("../../../docs/API.md")]
+pub struct ApiGuide;
 
 pub mod proto {
     #![allow(
@@ -25,18 +47,22 @@ pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/device_grpc.rs"));
 }
 
+pub use proto::diagnostics::{
+    Diagnostics, DiagnosticsBlockingClient, DiagnosticsClient, DiagnosticsDispatch,
+    DiagnosticsMethods, METHOD_GET_COUNTERS,
+};
 pub use proto::protolink_::examples_::embedded_::device_ as device;
 pub use proto::service::{
     METHOD_COMMAND, METHOD_COMMAND_BATCH, METHOD_COMMAND_STREAM, METHOD_EVENT_SUBSCRIBE, Service,
-    ServiceBlockingClient, ServiceClient, ServiceServer,
+    ServiceBlockingClient, ServiceClient, ServiceDispatch, ServiceMethods,
 };
 
 use std::collections::{BTreeMap, VecDeque};
 use std::task::{Context, Poll};
 
 use device::{
-    BatchSummary, Command, Command_, DeviceStatus, Event, EventSubscribe, OutputState, Reply,
-    Reply_, RestartAck,
+    BatchSummary, Command, Command_, Counters, DeviceStatus, Event, EventSubscribe, GetCounters,
+    OutputState, Reply, Reply_, RestartAck,
 };
 use protolink::{CallContext, CallId, Next, Status};
 
@@ -45,7 +71,8 @@ pub const EVENT_OUTPUT_CHANGED: u32 = 1;
 /// Event code recorded when a restart is accepted.
 pub const EVENT_RESTART: u32 = 2;
 
-/// Example application implementing the generated `Service` trait.
+/// Example application implementing the generated `Service` and `Diagnostics`
+/// traits.
 #[derive(Debug, Default)]
 pub struct Device {
     /// Device uptime in milliseconds.
@@ -60,6 +87,10 @@ pub struct Device {
     pub restarts: u32,
     /// Event log (`EVENT_*` codes), replayed by `EventSubscribe`.
     pub events: Vec<u32>,
+    /// Commands executed successfully.
+    pub executed: u32,
+    /// Commands rejected.
+    pub rejected: u32,
     /// State of in-flight streaming calls.
     pub calls: CallState,
 }
@@ -87,8 +118,17 @@ struct CommandStream {
 }
 
 impl Device {
-    /// Execute one command.
+    /// Execute one command, counting it as executed or rejected.
     pub fn execute(&mut self, request: Command) -> Result<Reply, Status> {
+        let result = self.run(request);
+        match result {
+            Ok(_) => self.executed += 1,
+            Err(_) => self.rejected += 1,
+        }
+        result
+    }
+
+    fn run(&mut self, request: Command) -> Result<Reply, Status> {
         let reply = match request.command {
             Some(Command_::Command::GetStatus(_)) => Reply_::Reply::Status(DeviceStatus {
                 uptime_ms: self.uptime_ms,
@@ -265,5 +305,19 @@ impl Service for Device {
     fn cancel_command_stream(&mut self, ctx: &mut CallContext<'_>) {
         let call = ctx.id;
         self.calls.streams.remove(&call);
+    }
+}
+
+impl Diagnostics for Device {
+    fn get_counters(
+        &mut self,
+        _ctx: &mut CallContext<'_>,
+        _request: GetCounters,
+    ) -> Result<Counters, Status> {
+        Ok(Counters {
+            executed: self.executed,
+            rejected: self.rejected,
+            events: self.events.len() as u32,
+        })
     }
 }

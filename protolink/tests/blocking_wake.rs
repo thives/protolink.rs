@@ -1,4 +1,4 @@
-//! `blocking::serve_wakeable` polls a `Pending` handler again as soon as it is
+//! A blocking server built `with_wakeable_reads` polls a `Pending` handler again as soon as it is
 //! woken, without peer traffic and without a transport read timeout.
 //!
 //! The server runs on its own thread over `ChannelIo`, a transport whose reads
@@ -17,10 +17,10 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use embedded_io::{ErrorKind, ErrorType, Read, Write};
-use protolink::blocking::{WakeHandle, WakeableRead, serve, serve_wakeable};
+use protolink::blocking::{WakeHandle, WakeableRead};
 use protolink::grpc::Client;
 use protolink::{
-    CallContext, CallId, ClientConfig, Error, Handler, MethodKind, Next, ServerConfig, Status,
+    CallContext, CallId, ClientConfig, Error, Handler, MethodKind, Next, Route, Status,
 };
 
 const WATCH: &str = "/t.T/Watch";
@@ -155,12 +155,8 @@ impl Shared {
 struct Watch(Arc<Shared>);
 
 impl Handler for Watch {
-    fn call(&mut self, _: &mut CallContext<'_>, _: &[u8]) -> Option<Result<Vec<u8>, Status>> {
-        None
-    }
-
-    fn method_kind(&self, path: &str) -> Option<MethodKind> {
-        (path == WATCH).then_some(MethodKind::ServerStreaming)
+    fn route(&self, path: &str) -> Option<Route> {
+        (path == WATCH).then_some(Route::new(MethodKind::ServerStreaming, 0))
     }
 
     fn on_message(&mut self, _: &mut CallContext<'_>, _: &[u8]) -> Result<(), Status> {
@@ -199,12 +195,8 @@ struct SelfWake {
 }
 
 impl Handler for SelfWake {
-    fn call(&mut self, _: &mut CallContext<'_>, _: &[u8]) -> Option<Result<Vec<u8>, Status>> {
-        None
-    }
-
-    fn method_kind(&self, path: &str) -> Option<MethodKind> {
-        (path == WATCH).then_some(MethodKind::ServerStreaming)
+    fn route(&self, path: &str) -> Option<Route> {
+        (path == WATCH).then_some(Route::new(MethodKind::ServerStreaming, 0))
     }
 
     fn on_message(&mut self, _: &mut CallContext<'_>, _: &[u8]) -> Result<(), Status> {
@@ -324,7 +316,13 @@ fn spawn_wakeable<H: Handler + Send + 'static>(
     io: ChannelIo,
     mut handler: H,
 ) -> JoinHandle<ServerResult> {
-    thread::spawn(move || serve_wakeable(io, &mut handler, ServerConfig::default()))
+    thread::spawn(move || {
+        protolink::blocking::server(io)
+            .without_deadlines()
+            .with_wakeable_reads()
+            .build()
+            .serve(&mut handler)
+    })
 }
 
 fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
@@ -505,7 +503,10 @@ fn plain_serve_still_progresses_on_read_timeouts() {
         let served = served.clone();
         thread::spawn(move || {
             let mut handler = Watch(shared);
-            let result = serve(io, &mut handler, ServerConfig::default());
+            let result = protolink::blocking::server(io)
+                .without_deadlines()
+                .build()
+                .serve(&mut handler);
             served.store(true, SeqCst);
             result
         })

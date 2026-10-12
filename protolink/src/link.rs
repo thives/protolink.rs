@@ -4,10 +4,11 @@
 //! HTTP/2 bytes ─► ARQ (retransmission, ordering, CRC) ─► COBS (frame delimiting) ─► raw link
 //! ```
 //!
-//! [`reliable_with_timer`] builds the full stack; the result is a
-//! [`ReliableLink`], which implements `embedded_io_async::{Read, Write}` and can
-//! be handed to [`serve`](crate::serve) or [`Client`](crate::Client). Both ends
-//! of the link must use the same stack, and the same `arq-io-async` wire format.
+//! [`reliable`] builds the full stack; the result is a [`ReliableLink`], which
+//! implements `embedded_io_async::{Read, Write}` and can be handed to
+//! [`server`](crate::server) or [`client`](crate::client). Both ends of the
+//! link must use the same stack, and the same `arq-io-async` wire format.
+//! Reliability is always applied explicitly: no driver or adaptor adds it.
 //!
 //! ARQ (`arq-io-async`) is a poll-based state machine over a *framed* lower
 //! [`Transport`]. protolink supplies the glue on both sides: [`CobsTransport`]
@@ -22,11 +23,12 @@
 //! time source. It is supplied through the [`Timer`] trait:
 //!
 //! - On `no_std` targets, implement [`Timer`] on top of the platform timer
-//!   (for example `embassy-time`) and call [`reliable_with_timer`]. Each link
-//!   needs its own timer.
-//! - With the `std` feature, [`reliable`] is available as a shortcut that uses
-//!   [`StdTimer`], which works with any executor (including Tokio). `StdTimer`
-//!   is owned by protolink: one reusable helper thread per timer.
+//!   (for example `embassy-time`) and pass it to
+//!   [`with_retransmission_timer`](ReliableBuilder::with_retransmission_timer).
+//!   Each link needs its own timer.
+//! - With the `std` feature, [`build`](ReliableBuilder::build) without a timer
+//!   uses [`StdTimer`], which works with any executor (including Tokio).
+//!   `StdTimer` is owned by protolink: one reusable helper thread per timer.
 //!
 //! # Requirements on the raw stream
 //!
@@ -82,7 +84,7 @@
 //!
 //! # Memory
 //!
-//! [`CobsFramed`] is about 1.1 KiB. The full [`reliable_with_timer`] stack is
+//! [`CobsFramed`] is about 1.1 KiB. The full [`reliable`] stack is
 //! about 10.5 KiB (measured on x86-64), dominated by the ARQ window buffers.
 //! Prefer constructing it in place (a `static` or an executor task) over moving
 //! it through small stacks.
@@ -451,7 +453,7 @@ impl<E: embedded_io_async::Error> embedded_io_async::Error for ReliableError<E> 
 type Engine<S, Tmr> =
     Arq<ARQ_WINDOW, ARQ_ACK_LEN, CobsTransport<S>, ::crc::Crc<u16>, BchAckCodec, Tmr>;
 
-/// The reliable link stack built by [`reliable_with_timer`]: ARQ over COBS
+/// The reliable link stack built by [`reliable`]: ARQ over COBS
 /// over `S`, retransmitting with the timer `Tmr`.
 ///
 /// Implements `embedded_io_async::{Read, Write}`, with [`ReliableError`] as
@@ -462,7 +464,8 @@ pub struct ReliableLink<S: Read + Write, Tmr> {
     arq: Engine<S, Tmr>,
 }
 
-/// The reliable link stack built by [`reliable`], using [`StdTimer`].
+/// The reliable link stack built by [`reliable`] with the default
+/// [`StdTimer`].
 #[cfg(feature = "std")]
 pub type StdReliableLink<S> = ReliableLink<S, StdTimer>;
 
@@ -498,33 +501,82 @@ impl<S: Read + Write, Tmr: Timer> Write for ReliableLink<S, Tmr> {
     }
 }
 
-/// Build the reliable link stack (ARQ over COBS) on a raw byte stream, using
-/// `timer` to schedule retransmissions. Receive validation uses complete COBS
-/// boundaries, so even corrupt ARQ length/type fields are discarded safely.
+/// Start building the reliable link stack (ARQ over COBS) on a raw byte stream.
 ///
-/// Uses an ARQ window of [`ARQ_WINDOW`] frames with the default CRC-16 and
-/// error-correcting ACK codec, and ARQ's default retransmission policy: 250 ms
-/// doubling to 4 s, and [`Timeout`](ArqError::Timeout) after 16 rounds without
-/// acknowledgement progress. Needs about 10.5 KiB of RAM (see the
-/// [module docs](self)). This is the constructor for `no_std` targets; see the
-/// module docs for the timer requirements.
-pub fn reliable_with_timer<S, Tmr>(raw: S, timer: Tmr) -> ReliableLink<S, Tmr>
-where
-    S: Read + Write,
-    Tmr: Timer,
-{
-    ReliableLink {
-        arq: ArqLayer::<ARQ_WINDOW>::new().build(CobsTransport::new(raw), timer),
+/// ```no_run
+/// # fn demo<S, T>(raw: S, arq_timer: T)
+/// # where S: embedded_io_async::Read + embedded_io_async::Write, T: protolink::link::Timer {
+/// let io = protolink::link::reliable(raw)
+///     .with_retransmission_timer(arq_timer)
+///     .build();
+/// // Hand `io` to `protolink::server` or `protolink::client`.
+/// # let _ = io;
+/// # }
+/// ```
+///
+/// The link uses an ARQ window of [`ARQ_WINDOW`] frames with the default
+/// CRC-16 and error-correcting ACK codec, and ARQ's default retransmission
+/// policy: 250 ms doubling to 4 s, and [`Timeout`](ArqError::Timeout) after 16
+/// rounds without acknowledgement progress. Receive validation uses complete
+/// COBS boundaries, so even corrupt ARQ length/type fields are discarded
+/// safely. It needs about 10.5 KiB of RAM (see the [module docs](self)).
+///
+/// The retransmission timer must be chosen with
+/// [`with_retransmission_timer`](ReliableBuilder::with_retransmission_timer).
+/// With the `std` feature, `build` without one uses a [`StdTimer`].
+/// Building performs no I/O.
+pub fn reliable<S: Read + Write>(raw: S) -> ReliableBuilder<S> {
+    ReliableBuilder {
+        raw,
+        timer: UnspecifiedTimer,
     }
 }
 
-/// Build the reliable link stack on a raw byte stream, using a [`StdTimer`].
+/// Retransmission timer of a [`ReliableBuilder`] that has not chosen one.
 ///
-/// Shortcut for [`reliable_with_timer`]; requires the `std` feature.
+/// Without `std` there is no default, so `build` is unavailable:
+///
+#[cfg_attr(not(feature = "std"), doc = "```compile_fail")]
+#[cfg_attr(feature = "std", doc = "```ignore")]
+/// # fn demo<S: embedded_io_async::Read + embedded_io_async::Write>(raw: S) {
+/// let io = protolink::link::reliable(raw).build();
+/// # }
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UnspecifiedTimer;
+
+/// Factory of a [`ReliableLink`], created by [`reliable`].
+#[derive(Debug)]
+pub struct ReliableBuilder<S, Tmr = UnspecifiedTimer> {
+    raw: S,
+    timer: Tmr,
+}
+
+impl<S, Tmr> ReliableBuilder<S, Tmr> {
+    /// Schedule ARQ retransmissions with `timer`. Each link needs its own
+    /// timer. This is unrelated to the RPC deadline timer.
+    pub fn with_retransmission_timer<T: Timer>(self, timer: T) -> ReliableBuilder<S, T> {
+        ReliableBuilder {
+            raw: self.raw,
+            timer,
+        }
+    }
+}
+
+impl<S: Read + Write, Tmr: Timer> ReliableBuilder<S, Tmr> {
+    /// Construct the link. Performs no I/O.
+    pub fn build(self) -> ReliableLink<S, Tmr> {
+        ReliableLink {
+            arq: ArqLayer::<ARQ_WINDOW>::new().build(CobsTransport::new(self.raw), self.timer),
+        }
+    }
+}
+
 #[cfg(feature = "std")]
-pub fn reliable<S>(raw: S) -> StdReliableLink<S>
-where
-    S: Read + Write,
-{
-    reliable_with_timer(raw, StdTimer::new())
+impl<S: Read + Write> ReliableBuilder<S, UnspecifiedTimer> {
+    /// Construct the link with a [`StdTimer`] as its retransmission timer.
+    /// Performs no I/O.
+    pub fn build(self) -> StdReliableLink<S> {
+        self.with_retransmission_timer(StdTimer::new()).build()
+    }
 }

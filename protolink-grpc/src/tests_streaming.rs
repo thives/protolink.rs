@@ -129,28 +129,24 @@ struct Scripted {
 }
 
 impl Handler for Scripted {
-    fn call(
-        &mut self,
-        ctx: &mut CallContext<'_>,
-        request: &[u8],
-    ) -> Option<Result<Vec<u8>, Status>> {
-        let path = ctx.path;
-        (path == "/s.S/Unary").then(|| Ok(request.to_vec()))
-    }
-
-    fn is_unknown_method(&self, path: &str) -> bool {
-        path == "/s.S/Missing"
-    }
-
-    fn method_kind(&self, path: &str) -> Option<MethodKind> {
-        Some(match path {
-            "/s.S/Unary" => MethodKind::Unary,
+    fn route(&self, path: &str) -> Option<Route> {
+        let kind = match path {
+            "/s.S/Missing" => return None,
             "/s.S/Count" | "/s.S/FailAfter" | "/s.S/FailSpace" | "/s.S/FailBefore"
             | "/s.S/Infinite" | "/s.S/Big" | "/s.S/Wait" => MethodKind::ServerStreaming,
             "/s.S/Sum" | "/s.S/Reject" | "/s.S/NoReply" => MethodKind::ClientStreaming,
             "/s.S/Echo" | "/s.S/EarlyDone" => MethodKind::BidiStreaming,
-            _ => return None,
-        })
+            // Served dynamically, so unknown only once the request is known.
+            _ => MethodKind::Unary,
+        };
+        Some(Route::new(kind, 0))
+    }
+
+    fn call(&mut self, ctx: &mut CallContext<'_>, request: &[u8]) -> Result<Vec<u8>, Status> {
+        match ctx.path {
+            "/s.S/Unary" => Ok(request.to_vec()),
+            path => Err(crate::handler::unimplemented(path)),
+        }
     }
 
     fn on_message(&mut self, ctx: &mut CallContext<'_>, message: &[u8]) -> Result<(), Status> {

@@ -24,9 +24,10 @@ The drivers turn this into traits in `protolink`:
 |---|---|---|
 | `Clock` | `now() -> Duration` | blocking drivers |
 | `Timer: Clock` | `sleep_until(deadline) -> impl Future<Output = ()>` | async drivers |
-| `NoTimer` | `now()` is always zero, `sleep_until` never completes | the default; no enforcement |
-| `tokio::TokioTimer` | tokio's clock (follows `tokio::time::pause`) | `protolink::tokio::{client, serve}` |
+| `NoTimer` | `now()` is always zero, `sleep_until` never completes | `without_deadlines()`; no enforcement |
+| `tokio::TokioTimer` | tokio's clock (follows `tokio::time::pause`) | `protolink::tokio::{server, client}` |
 | `blocking::ReadTimeout` | `set_read_timeout(Option<Duration>)` | blocking drivers, to bound a read |
+| `blocking::WakeableReadTimeout` | `read_or_wake_timeout(buf, Option<Duration>)` | wakeable blocking servers with a clock |
 | `blocking::OutputTimeout` | write and flush timeout hooks | opt-in blocking whole-call I/O bounds |
 
 `protolink::Timer` is unrelated to `protolink::link::Timer` (`arq_io_async::Timer`, the ARQ
@@ -38,7 +39,7 @@ retransmission timer). A target usually implements both on top of its platform t
   arrive. Both are relative budgets, so the clocks of the peers don't have to agree.
 - **Header.** The client sends `grpc-timeout` right after `:authority`, in the finest unit that fits in
   8 digits (`n`, `u`, `m`, `S`, `M`, `H`), rounded up so the budget is never shortened. Budgets beyond
-  `99999999H` are clamped. A client without a clock (`NoTimer`) still sends the header, so the server
+  `99999999H` are clamped. A client built `without_deadlines()` still sends the header, so the server
   enforces the deadline.
 - **Options.** `CallOptions::timeout` per call, `ClientConfig::default_timeout` for every call that
   doesn't set one. Generated clients have `<method>_with_options(.., options)` next to each method.
@@ -62,16 +63,19 @@ retransmission timer). A target usually implements both on top of its platform t
 
 ## Drivers
 
+Every factory makes the deadline policy explicit; outside tokio, `build` is unavailable until one is
+chosen, and each blocking capability requires the matching transport trait.
+
 | Driver | Enforce with | Notes |
 |---|---|---|
 | sans-IO | call `tick(now)` and wake at `next_deadline()` | server drivers call `output_flushed()` only after successful flush |
-| async client | `Client::with_timer(io, config, timer)` | `Client::new` has no timer |
-| async server | `serve_with_timer(io, handler, config, timer)` | `serve` has no timer |
-| tokio | `protolink::tokio::{client, serve}` | use a `TokioTimer` |
-| blocking client, read-bounded | `blocking::Client::with_clock(io, config, clock)` | `io: ReadTimeout`; output can stall indefinitely |
-| blocking server, read-bounded | `blocking::serve_with_clock`, `serve_wakeable_with_clock` | read timeout hook; output can stall indefinitely |
-| blocking client, I/O-bounded | `blocking::Client::with_io_timeouts(io, config, clock)` | `io: ReadTimeout + OutputTimeout` |
-| blocking server, I/O-bounded | `blocking::serve_with_io_timeouts(io, handler, config, clock)` | `io: ReadTimeout + OutputTimeout` |
+| async client | `protolink::client(io).with_deadline_timer(timer)` | or `.without_deadlines()` |
+| async server | `protolink::server(io).with_deadline_timer(timer)` | or `.without_deadlines()` |
+| tokio | `protolink::tokio::{server, client}` | a `TokioTimer` is supplied |
+| blocking client, read-bounded | `blocking::client(io).with_deadline_clock(clock)` | `io: ReadTimeout`; output can stall indefinitely |
+| blocking server, read-bounded | `blocking::server(io).with_deadline_clock(clock)` | `io: ReadTimeout`, or `WakeableReadTimeout` with `.with_wakeable_reads()`; output can stall indefinitely |
+| blocking client, I/O-bounded | `... .with_deadline_clock(clock).with_output_timeouts()` | `io: ReadTimeout + OutputTimeout` |
+| blocking server, I/O-bounded | `... .with_deadline_clock(clock).with_output_timeouts()` | `io: ReadTimeout + OutputTimeout` |
 
 The async drivers race transport reads, writes **and flushes** against
 `timer.sleep_until(next_deadline())`. When a read timer wins, the read is dropped and the loop ticks.
@@ -106,12 +110,13 @@ transport/protocol failures and reject new calls without replaying queued output
   behind `link::pump`.
 - **Deadlines are only noticed while the driver is running.** An async `Client` expires calls while one of
   its operations is polled. The reset of an expired call is written by the next operation on the client.
-- **Blocking reads need a timeout hook.** Without `ReadTimeout` (or `read_or_wake_timeout`) a blocking
-  driver only notices a deadline when a read returns. `std` sockets report timeouts as `WouldBlock`,
+- **Blocking reads need a timeout hook.** A deadline clock requires `ReadTimeout` (or
+  `WakeableReadTimeout` for wakeable reads), so a blocking driver can never claim deadline
+  enforcement through a read that ignores the timeout. `std` sockets report timeouts as `WouldBlock`,
   which `embedded_io` maps to `ErrorKind::Other`: map it to `TimedOut` in the adapter.
-- **Blocking output requires separate capabilities.** `with_clock`, `serve_with_clock`, and
-  `serve_wakeable_with_clock` only bound reads. Writes and flushes can postpone expiry indefinitely,
-  notably an ARQ flush waiting for acknowledgments. Use the I/O-bounded variants and implement both
+- **Blocking output requires separate capabilities.** `with_deadline_clock` alone only bounds
+  reads. Writes and flushes can postpone expiry indefinitely,
+  notably an ARQ flush waiting for acknowledgments. Add `with_output_timeouts()` and implement both
   `OutputTimeout` hooks for a whole-call I/O bound. A transport that cannot bound flush must not claim
   this capability. Synchronous handler execution and scheduler starvation remain outside the bound.
 - **No propagation.** A server doesn't forward `ctx.deadline` automatically; the handler decides.
@@ -122,7 +127,7 @@ transport/protocol failures and reject new calls without replaying queued output
 |---|---|
 | `timeout` parse/format | `protolink-grpc/src/timeout.rs` |
 | Sans-IO client, server, handler context | `protolink-grpc/src/tests_deadline.rs` |
-| Async drivers, paused tokio clock | `protolink/tests/deadline.rs` |
+| Async drivers, paused tokio clock | `protolink/tests/deadline.rs`, `protolink/tests/factories.rs` |
 | Blocking drivers | `protolink/tests/blocking_deadline.rs`, `blocking_driver_regressions.rs` |
 | Cancellation, terminal failures, waiter lifecycle, output races (`std` and `no_std`) | `protolink/src/asynch.rs` unit tests |
 | Timer boundaries and Tokio task abortion | `protolink/tests/deadline.rs` |

@@ -7,6 +7,7 @@ use core::task::{Poll, Waker};
 
 use embedded_io_async::{Read, Write};
 
+use crate::builder::{DeadlinesUnspecified, client_config_methods, server_config_methods};
 use crate::grpc::{
     self, CallId, CallOptions, ClientConfig, Handler, Metadata, Next, Response, ServerConfig,
     Status, StreamingCall, StreamingTransport, UnaryTransport,
@@ -15,67 +16,147 @@ use crate::shared::Shared;
 use crate::timer::{NoTimer, Timer};
 use crate::{Error, READ_CHUNK};
 
-/// Serve gRPC on one connection until the peer disconnects or the connection
-/// fails.
+/// Start building an async gRPC server on one connection.
 ///
-/// Requests are dispatched to `handler` (e.g. a generated `<Service>Server`, or
-/// a tuple of them). Dropping this future closes its owned transport and
-/// cancels active streaming handlers, including while suspended in I/O.
+/// Configure the factory with `.with_*` methods and choose a deadline policy,
+/// then [`build`](ServerBuilder::build) it and
+/// [`serve`](Server::serve) the application's services:
 ///
-/// Streaming handlers are polled with this future's waker: when one returns
-/// `Poll::Pending` and later wakes the waker, the pending transport `read` is
-/// dropped so the new responses can be written. Serving streaming methods
-/// whose handlers return `Pending` therefore requires a cancel-safe `read`
-/// (as tokio streams, [`CobsFramed`](crate::link::CobsFramed) and the
-/// [`link`](crate::link) stack are); unary-only servers never drop a read.
+/// ```no_run
+/// # async fn demo<IO, T, H>(io: IO, timer: T, services: &mut H)
+/// # where IO: embedded_io_async::Read + embedded_io_async::Write, T: protolink::Timer, H: protolink::Handler {
+/// let server = protolink::server(io)
+///     .with_deadline_timer(timer)
+///     .with_max_message_size(4096)
+///     .build();
+/// server.serve(services).await.ok();
+/// # }
+/// ```
 ///
-/// When the connection ends, every active streaming call is reported to
-/// [`Handler::on_cancel`], including when this future is dropped.
+/// Building performs no I/O. A deadline policy is required: with
+/// [`with_deadline_timer`](ServerBuilder::with_deadline_timer) the server
+/// enforces `grpc-timeout`, with
+/// [`without_deadlines`](ServerBuilder::without_deadlines) it does not.
+/// Without either, there is no `build`:
 ///
-/// `serve` has no clock, so it doesn't enforce `grpc-timeout` deadlines; use
-/// [`serve_with_timer`] for that.
-pub async fn serve<IO, H>(
-    io: IO,
-    handler: &mut H,
-    config: ServerConfig,
-) -> Result<(), Error<IO::Error>>
-where
-    IO: Read + Write,
-    H: Handler + ?Sized,
-{
-    serve_with_timer(io, handler, config, NoTimer).await
+/// ```compile_fail
+/// # async fn demo<IO: embedded_io_async::Read + embedded_io_async::Write, H: protolink::Handler>(io: IO, services: &mut H) {
+/// let server = protolink::server(io).build();
+/// # }
+/// ```
+///
+/// On tokio, [`tokio::server`](crate::tokio::server) supplies the timer.
+pub fn server<IO: Read + Write>(io: IO) -> ServerBuilder<IO> {
+    ServerBuilder {
+        io,
+        config: ServerConfig::default(),
+        timer: DeadlinesUnspecified,
+    }
 }
 
-/// Like [`serve`], and enforces the `grpc-timeout` deadline of each call using
-/// `timer`.
+/// Factory of an async [`Server`], created by [`server`].
 ///
-/// A call's deadline starts when its request headers arrive. When it is
-/// reached the call is ended with `DEADLINE_EXCEEDED` (streaming handlers are
-/// told through [`Handler::on_cancel`]). A unary handler that is running when
-/// its deadline passes can't be preempted; it is [`CallContext`](crate::CallContext)'s
-/// `deadline` that lets it give up early.
-///
-/// Waiting for a deadline drops the pending transport `read` when the timer
-/// fires, exactly like waiting for a streaming handler does, so the transport's
-/// `read` must be cancel-safe (see [`serve`]), also for unary-only servers.
-/// Writes and flushes are raced too; expiry during output closes the connection
-/// with [`Error::OutputDeadline`] rather than reusing indeterminate wire state.
-pub async fn serve_with_timer<IO, H, T>(
-    mut io: IO,
-    handler: &mut H,
+/// `T` is the deadline policy: [`DeadlinesUnspecified`] until one is chosen,
+/// then the [`Timer`] (or [`NoTimer`]) the server will use.
+#[derive(Debug)]
+pub struct ServerBuilder<IO, T = DeadlinesUnspecified> {
+    io: IO,
     config: ServerConfig,
     timer: T,
-) -> Result<(), Error<IO::Error>>
-where
-    IO: Read + Write,
-    H: Handler + ?Sized,
-    T: Timer,
-{
-    let mut serving = Serving {
-        server: grpc::Server::new(config),
-        handler,
-    };
-    serve_connection(&mut io, &mut serving.server, &mut *serving.handler, &timer).await
+}
+
+impl<IO, T> ServerBuilder<IO, T> {
+    /// Enforce each call's `grpc-timeout` with `timer`.
+    ///
+    /// A call's deadline starts when its request headers arrive. When it is
+    /// reached the call ends with `DEADLINE_EXCEEDED` (streaming handlers are
+    /// told through [`Handler::on_cancel`]). A unary handler that is running
+    /// when its deadline passes can't be preempted; it can consult
+    /// [`CallContext::remaining`](crate::CallContext::remaining).
+    ///
+    /// Waiting for a deadline drops the pending transport `read` when the
+    /// timer fires, so the transport's `read` must be cancel-safe, also for
+    /// unary-only servers. Writes and flushes are raced too; expiry during
+    /// output closes the connection with [`Error::OutputDeadline`] rather than
+    /// reusing indeterminate wire state.
+    pub fn with_deadline_timer<U: Timer>(self, timer: U) -> ServerBuilder<IO, U> {
+        ServerBuilder {
+            io: self.io,
+            config: self.config,
+            timer,
+        }
+    }
+
+    /// Do not enforce deadlines locally. Calls still receive their
+    /// `grpc-timeout` in [`CallContext::deadline`](crate::CallContext::deadline),
+    /// on a clock that never advances.
+    pub fn without_deadlines(self) -> ServerBuilder<IO, NoTimer> {
+        self.with_deadline_timer(NoTimer)
+    }
+
+    server_config_methods!();
+}
+
+impl<IO: Read + Write, T: Timer> ServerBuilder<IO, T> {
+    /// Construct the server. Performs no I/O; the HTTP/2 SETTINGS are sent
+    /// once [`serve`](Server::serve) runs.
+    pub fn build(self) -> Server<IO, T> {
+        Server {
+            io: self.io,
+            config: self.config,
+            timer: self.timer,
+        }
+    }
+}
+
+/// An async gRPC server driver for one connection, built by [`server`].
+///
+/// It owns the transport, the configuration and the deadline timer. The
+/// application's services are only joined to it by [`serve`](Self::serve).
+#[derive(Debug)]
+pub struct Server<IO, T = NoTimer> {
+    io: IO,
+    config: ServerConfig,
+    timer: T,
+}
+
+impl<IO: Read + Write, T: Timer> Server<IO, T> {
+    /// Serve gRPC on this connection until the peer disconnects or the
+    /// connection fails.
+    ///
+    /// `services` (a generated `<Service>Dispatch`, a
+    /// [`Registry`](crate::Registry), or any [`Handler`]) is borrowed
+    /// for the whole connection and receives every call on it; call state
+    /// keyed by [`CallId`] is therefore connection-local.
+    ///
+    /// Streaming handlers are polled with this future's waker: when one returns
+    /// `Poll::Pending` and later wakes the waker, the pending transport `read`
+    /// is dropped so the new responses can be written. Serving streaming
+    /// methods whose handlers return `Pending` therefore requires a
+    /// cancel-safe `read` (as tokio streams,
+    /// [`CobsFramed`](crate::link::CobsFramed) and the [`link`](crate::link)
+    /// stack are); unary-only servers without deadlines never drop a read.
+    ///
+    /// When the connection ends, normally or with an error, every active
+    /// streaming call is reported to [`Handler::on_cancel`] before this
+    /// returns. Dropping the future before it completes drops the transport
+    /// and makes the same `on_cancel` calls from the destructor; nothing is
+    /// written to the peer in that case.
+    pub async fn serve<H: Handler + ?Sized>(
+        self,
+        services: &mut H,
+    ) -> Result<(), Error<IO::Error>> {
+        let Self {
+            mut io,
+            config,
+            timer,
+        } = self;
+        let mut serving = Serving {
+            server: grpc::Server::new(config),
+            handler: services,
+        };
+        serve_connection(&mut io, &mut serving.server, &mut *serving.handler, &timer).await
+    }
 }
 
 struct Serving<'a, H: Handler + ?Sized> {
@@ -216,7 +297,7 @@ where
 /// can be used, and started again afterwards. This requires a cancel-safe
 /// `read`, which tokio streams, [`CobsFramed`](crate::link::CobsFramed) and
 /// the [`link`](crate::link) stack are (the same requirement as
-/// [`serve`] with streaming handlers). It only matters when more than one call
+/// [`Server::serve`] with streaming handlers). It only matters when more than one call
 /// is active; a client with one call never drops a read. For transports
 /// without a cancel-safe `read` (for example a one-shot DMA UART), put them
 /// behind [`link::pump`](crate::link::pump) or keep to one call at a time.
@@ -229,10 +310,12 @@ where
 ///
 /// Calls can have a timeout ([`CallOptions`], [`ClientConfig::default_timeout`]),
 /// which is sent to the server as `grpc-timeout`. A client built with
-/// [`with_timer`](Self::with_timer) also enforces it: when the call's time is
-/// up it fails with `DEADLINE_EXCEEDED` and the stream is reset. Messages
-/// that were already received are still delivered first. A client built with
-/// [`new`](Self::new) has no clock and leaves enforcement to the server.
+/// [`with_deadline_timer`](ClientBuilder::with_deadline_timer) also enforces
+/// it: when the call's time is up it fails with `DEADLINE_EXCEEDED` and the
+/// stream is reset. Messages that were already received are still delivered
+/// first. A client built
+/// [`without_deadlines`](ClientBuilder::without_deadlines) has no clock and
+/// leaves enforcement to the server.
 ///
 /// Deadlines are only noticed while one of the client's operations is being
 /// polled. Waiting for a deadline drops the pending read when the timer fires,
@@ -327,19 +410,81 @@ fn retire<IO>(state: &mut State<IO>, status: Status) {
     }
 }
 
-impl<IO: Read + Write> Client<IO> {
-    /// Create a client without a clock; the HTTP/2 preface is sent with the
-    /// first call. Timeouts are sent to the server but not enforced locally;
-    /// see [`with_timer`](Self::with_timer).
-    pub fn new(io: IO, config: ClientConfig) -> Self {
-        Self::with_timer(io, config, NoTimer)
+/// Start building an async gRPC client on one connection.
+///
+/// ```no_run
+/// # fn demo<IO, T>(io: IO, timer: T)
+/// # where IO: embedded_io_async::Read + embedded_io_async::Write, T: protolink::Timer {
+/// use core::time::Duration;
+///
+/// let transport = protolink::client(io)
+///     .with_deadline_timer(timer)
+///     .with_default_timeout(Duration::from_secs(5))
+///     .build();
+/// // Hand `transport` to a generated `<Service>Client::new`.
+/// # let _ = transport;
+/// # }
+/// ```
+///
+/// Building performs no I/O: the HTTP/2 preface is sent with the first call.
+/// As for [`server`], a deadline policy must be chosen before `build`; on
+/// tokio, [`tokio::client`](crate::tokio::client) supplies the timer.
+///
+/// ```compile_fail
+/// # fn demo<IO: embedded_io_async::Read + embedded_io_async::Write>(io: IO) {
+/// let transport = protolink::client(io).build();
+/// # }
+/// ```
+pub fn client<IO: Read + Write>(io: IO) -> ClientBuilder<IO> {
+    ClientBuilder {
+        io,
+        config: ClientConfig::default(),
+        timer: DeadlinesUnspecified,
+    }
+}
+
+/// Factory of an async [`Client`], created by [`client`].
+///
+/// `T` is the deadline policy: [`DeadlinesUnspecified`] until one is chosen,
+/// then the [`Timer`] (or [`NoTimer`]) the client will use.
+#[derive(Debug)]
+pub struct ClientBuilder<IO, T = DeadlinesUnspecified> {
+    io: IO,
+    config: ClientConfig,
+    timer: T,
+}
+
+impl<IO, T> ClientBuilder<IO, T> {
+    /// Enforce call timeouts locally with `timer`, see
+    /// [Deadlines](Client#deadlines). The transport's `read` must then be
+    /// cancel-safe even with a single call.
+    pub fn with_deadline_timer<U: Timer>(self, timer: U) -> ClientBuilder<IO, U> {
+        ClientBuilder {
+            io: self.io,
+            config: self.config,
+            timer,
+        }
+    }
+
+    /// Do not enforce timeouts locally. They are still sent as
+    /// `grpc-timeout`, so a server with a timer enforces them.
+    pub fn without_deadlines(self) -> ClientBuilder<IO, NoTimer> {
+        self.with_deadline_timer(NoTimer)
+    }
+
+    client_config_methods!();
+}
+
+impl<IO: Read + Write, T: Timer> ClientBuilder<IO, T> {
+    /// Construct the client. Performs no I/O: the HTTP/2 preface is sent with
+    /// the first call.
+    pub fn build(self) -> Client<IO, T> {
+        Client::from_parts(self.io, self.config, self.timer)
     }
 }
 
 impl<IO: Read + Write, T: Timer> Client<IO, T> {
-    /// Create a client that enforces call timeouts using `timer`; the HTTP/2
-    /// preface is sent with the first call.
-    pub fn with_timer(io: IO, config: ClientConfig, timer: T) -> Self {
+    fn from_parts(io: IO, config: ClientConfig, timer: T) -> Self {
         Self {
             shared: Shared::new(State {
                 inner: grpc::Client::new(config),
@@ -935,7 +1080,7 @@ mod tests {
     use embedded_io_async::ErrorType;
 
     use super::*;
-    use crate::grpc::{CallContext, MethodKind};
+    use crate::grpc::{CallContext, MethodKind, Route};
 
     const GATE: &str = "/t.T/Gate";
     const OPEN: &str = "/t.T/Open";
@@ -952,12 +1097,8 @@ mod tests {
     }
 
     impl Handler for Script {
-        fn call(&mut self, _: &mut CallContext<'_>, _: &[u8]) -> Option<Result<Vec<u8>, Status>> {
-            None
-        }
-
-        fn method_kind(&self, path: &str) -> Option<MethodKind> {
-            matches!(path, GATE | OPEN | QUIET).then_some(MethodKind::BidiStreaming)
+        fn route(&self, path: &str) -> Option<Route> {
+            matches!(path, GATE | OPEN | QUIET).then_some(Route::new(MethodKind::BidiStreaming, 0))
         }
 
         fn on_message(&mut self, ctx: &mut CallContext<'_>, _: &[u8]) -> Result<(), Status> {
@@ -1127,8 +1268,8 @@ mod tests {
         panic!("future did not complete");
     }
 
-    fn client(peer: &Rc<RefCell<Peer>>) -> Client<Loopback> {
-        Client::new(Loopback(peer.clone()), ClientConfig::default())
+    fn loopback_client(peer: &Rc<RefCell<Peer>>) -> Client<Loopback> {
+        client(Loopback(peer.clone())).without_deadlines().build()
     }
 
     /// Call A waits for a reply that only arrives after call B sent a
@@ -1137,7 +1278,7 @@ mod tests {
     #[test]
     fn concurrent_reader_yields_to_a_writer_on_another_call() {
         let peer = Peer::new();
-        let client = client(&peer);
+        let client = loopback_client(&peer);
         let mut a = client.streaming(GATE).unwrap();
         let mut b = client.streaming(OPEN).unwrap();
         let (wake_a, a_wakes) = Wakes::waker();
@@ -1181,7 +1322,7 @@ mod tests {
     #[test]
     fn concurrent_waiting_call_is_woken_by_data_read_for_it() {
         let peer = Peer::new();
-        let client = client(&peer);
+        let client = loopback_client(&peer);
         let mut quiet = client.streaming(QUIET).unwrap();
         let mut gate = client.streaming(GATE).unwrap();
         let (wake_q, q_wakes) = Wakes::waker();
@@ -1217,7 +1358,7 @@ mod tests {
     #[test]
     fn concurrent_dropping_a_call_makes_the_reader_flush_the_cancel() {
         let peer = Peer::new();
-        let client = client(&peer);
+        let client = loopback_client(&peer);
         let mut quiet = client.streaming(QUIET).unwrap();
         let mut other = client.streaming(QUIET).unwrap();
         let (wake, wakes) = Wakes::waker();
@@ -1239,7 +1380,7 @@ mod tests {
     #[test]
     fn concurrent_abandoned_waiter_does_not_block_the_others() {
         let peer = Peer::new();
-        let client = client(&peer);
+        let client = loopback_client(&peer);
         let mut gate = client.streaming(GATE).unwrap();
         let mut open = client.streaming(OPEN).unwrap();
         let (wake_g, _) = Wakes::waker();
@@ -1266,7 +1407,7 @@ mod tests {
     #[test]
     fn cancelled_acquisitions_release_and_replace_wakers() {
         let peer = Peer::new();
-        let client = client(&peer);
+        let client = loopback_client(&peer);
         let mut quiet = client.streaming(QUIET).unwrap();
         let mut other = client.streaming(QUIET).unwrap();
         let mut reader = pin!(quiet.message());
@@ -1408,7 +1549,7 @@ mod tests {
             Fault::Protocol,
         ] {
             let (io, activity) = fault_io(fault);
-            let mut client = Client::new(io, ClientConfig::default());
+            let mut client = client(io).without_deadlines().build();
             assert_eq!(
                 run(client.unary("/t.T/Echo", b"x")).unwrap_err().code,
                 grpc::Code::Unavailable
@@ -1430,7 +1571,9 @@ mod tests {
         for fault in [Fault::WritePending, Fault::FlushPending, Fault::FlushWaking] {
             let (io, activity) = fault_io(fault);
             let now = Rc::new(core::cell::Cell::new(Duration::ZERO));
-            let client = Client::with_timer(io, ClientConfig::default(), ManualTimer(now.clone()));
+            let client = client(io)
+                .with_deadline_timer(ManualTimer(now.clone()))
+                .build();
             let mut expired = client
                 .streaming_with(QUIET, CallOptions::timeout(Duration::from_millis(100)))
                 .unwrap();
@@ -1468,8 +1611,9 @@ mod tests {
             for later_timeout in [None, Some(Duration::from_secs(10))] {
                 let (io, activity) = fault_io(fault);
                 let now = Rc::new(core::cell::Cell::new(Duration::ZERO));
-                let client =
-                    Client::with_timer(io, ClientConfig::default(), ManualTimer(now.clone()));
+                let client = client(io)
+                    .with_deadline_timer(ManualTimer(now.clone()))
+                    .build();
                 let mut first = client
                     .streaming_with(QUIET, CallOptions::timeout(Duration::from_millis(100)))
                     .unwrap();
@@ -1521,7 +1665,9 @@ mod tests {
         for fault in [Fault::WritePending, Fault::FlushPending] {
             let (io, activity) = fault_io(fault);
             let now = Rc::new(core::cell::Cell::new(Duration::ZERO));
-            let client = Client::with_timer(io, ClientConfig::default(), ManualTimer(now.clone()));
+            let client = client(io)
+                .with_deadline_timer(ManualTimer(now.clone()))
+                .build();
             let mut first = client.streaming(QUIET).unwrap();
             let cancelled = client
                 .streaming_with(QUIET, CallOptions::timeout(Duration::from_millis(100)))
@@ -1551,7 +1697,7 @@ mod tests {
     fn dropping_pending_output_retires_the_client() {
         for fault in [Fault::WritePending, Fault::FlushPending] {
             let (io, activity) = fault_io(fault);
-            let mut client = Client::new(io, ClientConfig::default());
+            let mut client = client(io).without_deadlines().build();
             {
                 let mut call = pin!(client.unary("/t.T/Echo", b"x"));
                 assert!(poll_once(call.as_mut(), Waker::noop()).is_pending());
@@ -1620,11 +1766,12 @@ mod tests {
         for stall in [Fault::Read, Fault::WritePending, Fault::FlushPending] {
             let mut handler = Script::default();
             {
-                let mut server = pin!(serve(
-                    server_io(stall, None),
-                    &mut handler,
-                    ServerConfig::default()
-                ));
+                let mut server = pin!(
+                    server(server_io(stall, None))
+                        .without_deadlines()
+                        .build()
+                        .serve(&mut handler)
+                );
                 assert!(poll_once(server.as_mut(), Waker::noop()).is_pending());
             }
             assert_eq!(handler.cancelled, 1);
@@ -1638,12 +1785,12 @@ mod tests {
             let now = Rc::new(core::cell::Cell::new(Duration::ZERO));
             let mut handler = Script::default();
             {
-                let mut server = pin!(serve_with_timer(
-                    server_io(stall, Some(Duration::from_millis(100))),
-                    &mut handler,
-                    ServerConfig::default(),
-                    ManualTimer(now.clone()),
-                ));
+                let mut server = pin!(
+                    server(server_io(stall, Some(Duration::from_millis(100))))
+                        .with_deadline_timer(ManualTimer(now.clone()))
+                        .build()
+                        .serve(&mut handler)
+                );
                 assert!(poll_once(server.as_mut(), Waker::noop()).is_pending());
                 now.set(Duration::from_millis(100));
                 assert!(matches!(
@@ -1662,13 +1809,18 @@ mod tests {
     }
 
     impl Handler for CompletedHandler {
-        fn call(&mut self, _: &mut CallContext<'_>, req: &[u8]) -> Option<Result<Vec<u8>, Status>> {
+        fn route(&self, _: &str) -> Option<Route> {
+            let kind = if self.unary {
+                MethodKind::Unary
+            } else {
+                MethodKind::ServerStreaming
+            };
+            Some(Route::new(kind, 0))
+        }
+        fn call(&mut self, _: &mut CallContext<'_>, req: &[u8]) -> Result<Vec<u8>, Status> {
             assert!(self.unary);
             self.completed.set(self.completed.get() + 1);
-            Some(Ok(req.to_vec()))
-        }
-        fn method_kind(&self, _: &str) -> Option<MethodKind> {
-            (!self.unary).then_some(MethodKind::ServerStreaming)
+            Ok(req.to_vec())
         }
         fn on_message(&mut self, _: &mut CallContext<'_>, _: &[u8]) -> Result<(), Status> {
             Ok(())
@@ -1765,12 +1917,12 @@ mod tests {
                     cancelled: cancelled.clone(),
                 };
                 {
-                    let mut server = pin!(serve_with_timer(
-                        io,
-                        &mut handler,
-                        ServerConfig::default(),
-                        ManualTimer(now.clone())
-                    ));
+                    let mut server = pin!(
+                        server(io)
+                            .with_deadline_timer(ManualTimer(now.clone()))
+                            .build()
+                            .serve(&mut handler)
+                    );
                     assert!(poll_once(server.as_mut(), Waker::noop()).is_pending());
                     assert_eq!(
                         completed.get(),
@@ -1853,7 +2005,7 @@ mod tests {
             server: grpc::Server::new(ServerConfig::default()),
             now: timer.clone(),
         };
-        let mut client = Client::with_timer(io, ClientConfig::default(), timer);
+        let mut client = client(io).with_deadline_timer(timer).build();
         let status = run(client.unary_with(
             "/t.T/Echo",
             b"x",
@@ -1867,7 +2019,7 @@ mod tests {
     fn retirement_keeps_buffered_messages_before_terminal_status() {
         let peer = Peer::new();
         peer.borrow_mut().script.open = true;
-        let client = client(&peer);
+        let client = loopback_client(&peer);
         let mut call = client.streaming(GATE).unwrap();
         run(call.send(b"x")).unwrap();
         let bytes: Vec<u8> = peer.borrow_mut().rx.drain(..).collect();
@@ -1889,7 +2041,9 @@ mod tests {
         use core::time::Duration;
         let (io, _) = fault_io(Fault::FlushPending);
         let now = Rc::new(core::cell::Cell::new(Duration::ZERO));
-        let client = Client::with_timer(io, ClientConfig::default(), ManualTimer(now.clone()));
+        let client = client(io)
+            .with_deadline_timer(ManualTimer(now.clone()))
+            .build();
         let mut first = client
             .streaming_with(QUIET, CallOptions::timeout(Duration::from_secs(10)))
             .unwrap();
@@ -1918,11 +2072,8 @@ mod tests {
         cancellations: Rc<core::cell::Cell<usize>>,
     }
     impl Handler for ReadyAfterDeadline {
-        fn call(&mut self, _: &mut CallContext<'_>, _: &[u8]) -> Option<Result<Vec<u8>, Status>> {
-            None
-        }
-        fn method_kind(&self, _: &str) -> Option<MethodKind> {
-            Some(MethodKind::BidiStreaming)
+        fn route(&self, _: &str) -> Option<Route> {
+            Some(Route::new(MethodKind::BidiStreaming, 0))
         }
         fn on_message(&mut self, _: &mut CallContext<'_>, _: &[u8]) -> Result<(), Status> {
             Ok(())
@@ -1956,12 +2107,12 @@ mod tests {
             cancellations: cancellations.clone(),
         };
         {
-            let mut server = pin!(serve_with_timer(
-                server_io(Fault::Read, Some(Duration::from_millis(100))),
-                &mut handler,
-                ServerConfig::default(),
-                timer.clone()
-            ));
+            let mut server = pin!(
+                server(server_io(Fault::Read, Some(Duration::from_millis(100))))
+                    .with_deadline_timer(timer.clone())
+                    .build()
+                    .serve(&mut handler)
+            );
             assert!(poll_once(server.as_mut(), Waker::noop()).is_pending());
             timer.0.set(Duration::from_millis(101));
             assert!(poll_once(server.as_mut(), Waker::noop()).is_pending());

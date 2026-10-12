@@ -1,6 +1,8 @@
 [workspace]
 members = [
     "protolink",
+    "protolink-i2c",
+    "protolink-adaptors",
     "protolink-http2",
     "protolink-grpc",
     "protolink-grpc-gen",

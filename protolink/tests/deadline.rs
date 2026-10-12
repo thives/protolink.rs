@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use protolink::grpc::{CallContext, CallId, Code, Handler, MethodKind, Next, Status};
-use protolink::{CallOptions, ClientConfig, ServerConfig};
+use protolink::grpc::{CallContext, CallId, Code, Handler, MethodKind, Next, Route, Status};
+use protolink::{CallOptions, ClientConfig};
 use tokio::time::Instant;
 
 const ECHO: &str = "/t.T/Echo";
@@ -38,20 +38,16 @@ struct Peer {
 }
 
 impl Handler for Peer {
-    fn call(
-        &mut self,
-        ctx: &mut CallContext<'_>,
-        request: &[u8],
-    ) -> Option<Result<Vec<u8>, Status>> {
-        (ctx.path == ECHO).then(|| Ok(request.to_vec()))
+    fn route(&self, path: &str) -> Option<Route> {
+        match path {
+            ECHO => Some(Route::new(MethodKind::Unary, 0)),
+            CHAT | QUIET | BURST => Some(Route::new(MethodKind::BidiStreaming, 1)),
+            _ => None,
+        }
     }
 
-    fn method_kind(&self, path: &str) -> Option<MethodKind> {
-        matches!(path, CHAT | QUIET | BURST).then_some(MethodKind::BidiStreaming)
-    }
-
-    fn is_unknown_method(&self, path: &str) -> bool {
-        !matches!(path, ECHO | CHAT | QUIET | BURST)
+    fn call(&mut self, _: &mut CallContext<'_>, request: &[u8]) -> Result<Vec<u8>, Status> {
+        Ok(request.to_vec())
     }
 
     fn on_message(&mut self, ctx: &mut CallContext<'_>, message: &[u8]) -> Result<(), Status> {
@@ -107,17 +103,13 @@ fn connect() -> (TokioClient, Arc<AtomicUsize>) {
         ..Peer::default()
     };
     tokio::spawn(async move {
-        let _ = protolink::serve(
-            protolink::tokio::compat(a),
-            &mut handler,
-            ServerConfig::default(),
-        )
-        .await;
+        let _ = protolink::server(protolink::tokio::compat(a))
+            .without_deadlines()
+            .build()
+            .serve(&mut handler)
+            .await;
     });
-    (
-        protolink::tokio::client(b, ClientConfig::default()),
-        cancelled,
-    )
+    (protolink::tokio::client(b).build(), cancelled)
 }
 
 async fn wait_for(counter: &AtomicUsize, expected: usize) {
@@ -142,7 +134,7 @@ fn assert_elapsed(start: Instant, at_least: Duration, below: Duration) {
 #[tokio::test(start_paused = true)]
 async fn unary_times_out_without_an_answer() {
     let (_server, b) = tokio::io::duplex(16 * 1024);
-    let mut client = protolink::tokio::client(b, ClientConfig::default());
+    let mut client = protolink::tokio::client(b).build();
     let start = Instant::now();
     let err = with_timeout(client.unary_with(ECHO, b"hi", CallOptions::timeout(ms(250))))
         .await
@@ -158,7 +150,7 @@ async fn default_timeout_applies_to_every_call() {
         default_timeout: Some(ms(100)),
         ..ClientConfig::default()
     };
-    let mut client = protolink::tokio::client(b, config);
+    let mut client = protolink::tokio::client(b).with_config(config).build();
     let start = Instant::now();
     let err = with_timeout(client.unary(ECHO, b"hi")).await.unwrap_err();
     assert_eq!(err.code, Code::DeadlineExceeded);
@@ -175,7 +167,7 @@ async fn default_timeout_applies_to_every_call() {
 #[tokio::test(start_paused = true)]
 async fn zero_timeout_fails_without_sending() {
     let (mut server, b) = tokio::io::duplex(16 * 1024);
-    let mut client = protolink::tokio::client(b, ClientConfig::default());
+    let mut client = protolink::tokio::client(b).build();
     let err = client
         .unary_with(ECHO, b"hi", CallOptions::timeout(Duration::ZERO))
         .await
@@ -326,10 +318,15 @@ async fn server_enforces_the_deadline_for_a_client_without_a_clock() {
         ..Peer::default()
     };
     tokio::spawn(async move {
-        let _ = protolink::tokio::serve(a, &mut handler, ServerConfig::default()).await;
+        let _ = protolink::tokio::server(a)
+            .build()
+            .serve(&mut handler)
+            .await;
     });
     // `Client::new` sends `grpc-timeout` but never expires a call itself.
-    let client = protolink::Client::new(protolink::tokio::compat(b), ClientConfig::default());
+    let client = protolink::client(protolink::tokio::compat(b))
+        .without_deadlines()
+        .build();
     with_timeout(async {
         let start = Instant::now();
         let mut call = client
@@ -353,14 +350,15 @@ async fn server_without_a_timer_does_not_enforce_the_deadline() {
         ..Peer::default()
     };
     tokio::spawn(async move {
-        let _ = protolink::serve(
-            protolink::tokio::compat(a),
-            &mut handler,
-            ServerConfig::default(),
-        )
-        .await;
+        let _ = protolink::server(protolink::tokio::compat(a))
+            .without_deadlines()
+            .build()
+            .serve(&mut handler)
+            .await;
     });
-    let client = protolink::Client::new(protolink::tokio::compat(b), ClientConfig::default());
+    let client = protolink::client(protolink::tokio::compat(b))
+        .without_deadlines()
+        .build();
     let mut call = client
         .streaming_with(QUIET, CallOptions::timeout(ms(100)))
         .unwrap();
@@ -403,11 +401,8 @@ async fn aborting_server_task_cancels_each_active_call_once() {
         cancelled: Arc<AtomicUsize>,
     }
     impl Handler for AbortHandler {
-        fn call(&mut self, _: &mut CallContext<'_>, _: &[u8]) -> Option<Result<Vec<u8>, Status>> {
-            None
-        }
-        fn method_kind(&self, _: &str) -> Option<MethodKind> {
-            Some(MethodKind::BidiStreaming)
+        fn route(&self, _: &str) -> Option<Route> {
+            Some(Route::new(MethodKind::BidiStreaming, 0))
         }
         fn on_message(&mut self, _: &mut CallContext<'_>, _: &[u8]) -> Result<(), Status> {
             self.started.fetch_add(1, SeqCst);
@@ -432,9 +427,12 @@ async fn aborting_server_task_cancels_each_active_call_once() {
         cancelled: cancelled.clone(),
     };
     let server = tokio::spawn(async move {
-        protolink::tokio::serve(a, &mut handler, ServerConfig::default()).await
+        protolink::tokio::server(a)
+            .build()
+            .serve(&mut handler)
+            .await
     });
-    let client = protolink::tokio::client(b, ClientConfig::default());
+    let client = protolink::tokio::client(b).build();
     let mut first = client.streaming(QUIET).unwrap();
     let mut second = client.streaming(QUIET).unwrap();
     first.send(b"one").await.unwrap();

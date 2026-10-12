@@ -92,7 +92,7 @@ A request whose gRPC metadata breaks the rules (malformed `-bin` values, invalid
 metadata limits) is answered with `INVALID_ARGUMENT` and never reaches the handler. Invalid HTTP/2
 field syntax is rejected before gRPC parsing.
 
-Handlers can be tested without a server: `CallContext::new(path, id, deadline, &request_metadata,
+Handlers can be tested without a server: `CallContext::new(path, route, id, deadline, &request_metadata,
 &mut response_metadata)` builds a context, and the `ResponseMetadata` shows what the handler set.
 
 ## Wire format

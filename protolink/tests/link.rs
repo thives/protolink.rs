@@ -17,7 +17,7 @@ use cobs_io_async::sync::{decode_to_slice, encode_from_slice_including_sentinels
 use embedded_io_async::{Error as _, ErrorKind, ErrorType, Read, Write};
 use protolink::link::{
     CobsFramed, CobsTransport, LinkError, MAX_FRAME_PAYLOAD, ReliableError, StdTimer, Timer,
-    reliable, reliable_with_timer,
+    reliable,
 };
 use protolink::tokio::FromTokio;
 
@@ -170,8 +170,10 @@ where
 #[tokio::test]
 async fn reliable_constructors_interoperate() {
     let (a, b) = tokio::io::duplex(4096);
-    let mut x = reliable(FromTokio::new(a));
-    let mut y = reliable_with_timer(FromTokio::new(b), StdTimer::new());
+    let mut x = reliable(FromTokio::new(a)).build();
+    let mut y = reliable(FromTokio::new(b))
+        .with_retransmission_timer(StdTimer::new())
+        .build();
     with_timeout(async {
         transfer(&mut x, &mut y, b"hello over cobs + arq").await;
         transfer(&mut y, &mut x, b"explicit timer").await;
@@ -417,14 +419,18 @@ async fn corruption_round_trip(
         read_pending: true,
         write_pending: true,
     };
-    let mut x = reliable_with_timer(
-        wire(ba.clone(), ab.clone(), dat_damage, tx_stats.clone(), true),
-        VirtualTimer::default(),
-    );
-    let mut y = reliable_with_timer(
-        wire(ab, ba, ack_damage, rx_stats.clone(), false),
-        VirtualTimer::default(),
-    );
+    let mut x = reliable(wire(
+        ba.clone(),
+        ab.clone(),
+        dat_damage,
+        tx_stats.clone(),
+        true,
+    ))
+    .with_retransmission_timer(VirtualTimer::default())
+    .build();
+    let mut y = reliable(wire(ab, ba, ack_damage, rx_stats.clone(), false))
+        .with_retransmission_timer(VirtualTimer::default())
+        .build();
     // ARQ packs writes into one payload, so only full blocks make the frame
     // boundaries (and the three sequence numbers below) independent of timing.
     let expected: Vec<u8> = (0..3 * ARQ_PAYLOAD).map(|i| (i * 37) as u8).collect();
@@ -756,15 +762,14 @@ async fn always_ready_cobs_noise_allows_runtime_and_retransmission_progress() {
         let input = Rc::new(RefCell::new(Pipe::default()));
         let noise = Rc::new(Cell::new(Some(byte)));
         let stats = Rc::new(RefCell::new(ReadyStats::default()));
-        let mut link = reliable_with_timer(
-            ReadyWire {
-                input: input.clone(),
-                noise: noise.clone(),
-                stats: stats.clone(),
-                chunk: usize::MAX,
-            },
-            VirtualTimer::default(),
-        );
+        let mut link = reliable(ReadyWire {
+            input: input.clone(),
+            noise: noise.clone(),
+            stats: stats.clone(),
+            chunk: usize::MAX,
+        })
+        .with_retransmission_timer(VirtualTimer::default())
+        .build();
         let sender = async {
             link.write_all(b"ping").await.unwrap();
             link.flush().await.unwrap();
@@ -1177,7 +1182,9 @@ impl Write for ScriptWire {
 /// The raw bytes a peer link sends for its first, flushed write.
 async fn peer_data_frame(payload: &[u8]) -> Vec<u8> {
     let (wire, script) = ScriptWire::new(Vec::new(), false);
-    let mut peer = reliable_with_timer(wire, VirtualTimer::default());
+    let mut peer = reliable(wire)
+        .with_retransmission_timer(VirtualTimer::default())
+        .build();
     let mut cx = Context::from_waker(Waker::noop());
     peer.write_all(payload).await.unwrap();
     assert!(pin!(peer.flush()).as_mut().poll(&mut cx).is_pending());
@@ -1189,7 +1196,9 @@ async fn peer_data_frame(payload: &[u8]) -> Vec<u8> {
 #[tokio::test(start_paused = true)]
 async fn retry_exhaustion_is_a_terminal_timeout_after_buffered_data_is_delivered() {
     let (wire, _) = ScriptWire::new(peer_data_frame(b"abc").await, false);
-    let mut link = reliable_with_timer(wire, VirtualTimer::default());
+    let mut link = reliable(wire)
+        .with_retransmission_timer(VirtualTimer::default())
+        .build();
     link.write_all(b"ping").await.unwrap();
     // Nobody acknowledges: virtual time runs through every retransmission.
     let err = tokio::time::timeout(Duration::from_secs(600), link.flush())
@@ -1216,7 +1225,9 @@ async fn retry_exhaustion_is_a_terminal_timeout_after_buffered_data_is_delivered
 #[tokio::test(start_paused = true)]
 async fn flush_waits_for_an_owed_ack_to_reach_the_wire() {
     let (wire, script) = ScriptWire::new(peer_data_frame(b"abc").await, false);
-    let mut link = reliable_with_timer(wire, VirtualTimer::default());
+    let mut link = reliable(wire)
+        .with_retransmission_timer(VirtualTimer::default())
+        .build();
     script.blocked.set(true);
     let wakes = Arc::new(CountWake::default());
     let waker = Waker::from(wakes.clone());
@@ -1234,14 +1245,18 @@ async fn flush_waits_for_an_owed_ack_to_reach_the_wire() {
 
     // With nothing owed or outstanding, flush is immediately ready.
     let (idle, _) = ScriptWire::new(Vec::new(), false);
-    let mut idle = reliable_with_timer(idle, VirtualTimer::default());
+    let mut idle = reliable(idle)
+        .with_retransmission_timer(VirtualTimer::default())
+        .build();
     assert!(pin!(idle.flush()).as_mut().poll(&mut cx).is_ready());
 }
 
 #[tokio::test]
 async fn lower_eof_does_not_discard_buffered_data() {
     let (wire, script) = ScriptWire::new(peer_data_frame(b"abc").await, true);
-    let mut link = reliable_with_timer(wire, VirtualTimer::default());
+    let mut link = reliable(wire)
+        .with_retransmission_timer(VirtualTimer::default())
+        .build();
     let mut buf = [0; 8];
     let n = with_timeout(link.read(&mut buf)).await.unwrap();
     assert_eq!(&buf[..n], b"abc");
@@ -1257,8 +1272,8 @@ async fn lower_eof_does_not_discard_buffered_data() {
 #[tokio::test]
 async fn dropped_upper_read_loses_no_data_and_strands_nothing() {
     let (a, b) = tokio::io::duplex(4096);
-    let mut x = reliable(FromTokio::new(a));
-    let mut y = reliable(FromTokio::new(b));
+    let mut x = reliable(FromTokio::new(a)).build();
+    let mut y = reliable(FromTokio::new(b)).build();
     let mut cx = Context::from_waker(Waker::noop());
     let mut buf = [0u8; 8];
     // A pending read that is dropped, as the drivers do when they switch to a

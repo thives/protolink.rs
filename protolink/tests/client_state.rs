@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use protolink::grpc::{CallContext, CallId, Code, Handler, MethodKind, Next, Status};
-use protolink::{CallOptions, ClientConfig, ServerConfig, StreamingTransport};
+use protolink::grpc::{CallContext, CallId, Code, Handler, MethodKind, Next, Route, Status};
+use protolink::{CallOptions, StreamingTransport};
 
 const ECHO: &str = "/t.T/Echo";
 const CHAT: &str = "/t.T/Chat";
@@ -38,21 +38,16 @@ struct Echoes {
 }
 
 impl Handler for Echoes {
-    fn call(
-        &mut self,
-        ctx: &mut CallContext<'_>,
-        request: &[u8],
-    ) -> Option<Result<Vec<u8>, Status>> {
-        let path = ctx.path;
-        (path == ECHO).then(|| Ok(request.to_vec()))
+    fn route(&self, path: &str) -> Option<Route> {
+        match path {
+            ECHO => Some(Route::new(MethodKind::Unary, 0)),
+            CHAT | GATE | OPEN => Some(Route::new(MethodKind::BidiStreaming, 1)),
+            _ => None,
+        }
     }
 
-    fn method_kind(&self, path: &str) -> Option<MethodKind> {
-        matches!(path, CHAT | GATE | OPEN).then_some(MethodKind::BidiStreaming)
-    }
-
-    fn is_unknown_method(&self, path: &str) -> bool {
-        !matches!(path, ECHO | CHAT | GATE | OPEN)
+    fn call(&mut self, _: &mut CallContext<'_>, request: &[u8]) -> Result<Vec<u8>, Status> {
+        Ok(request.to_vec())
     }
 
     fn on_message(&mut self, ctx: &mut CallContext<'_>, message: &[u8]) -> Result<(), Status> {
@@ -118,12 +113,12 @@ fn connect() -> (
         ..Echoes::default()
     };
     tokio::spawn(async move {
-        let _ = protolink::tokio::serve(a, &mut handler, ServerConfig::default()).await;
+        let _ = protolink::tokio::server(a)
+            .build()
+            .serve(&mut handler)
+            .await;
     });
-    (
-        protolink::tokio::client(b, ClientConfig::default()),
-        cancelled,
-    )
+    (protolink::tokio::client(b).build(), cancelled)
 }
 
 async fn wait_for(counter: &AtomicUsize, expected: usize) {
@@ -295,9 +290,12 @@ async fn concurrent_peer_disconnect_fails_every_call() {
     let (a, b) = tokio::io::duplex(16 * 1024);
     let server = tokio::spawn(async move {
         let mut handler = Echoes::default();
-        let _ = protolink::tokio::serve(a, &mut handler, ServerConfig::default()).await;
+        let _ = protolink::tokio::server(a)
+            .build()
+            .serve(&mut handler)
+            .await;
     });
-    let client = protolink::tokio::client(b, ClientConfig::default());
+    let client = protolink::tokio::client(b).build();
     with_timeout(async {
         let mut first = client.streaming(GATE).unwrap();
         let mut second = client.streaming(GATE).unwrap();
@@ -390,8 +388,7 @@ mod blocking {
     use core::convert::Infallible;
 
     use embedded_io::{ErrorType, Read, Write};
-    use protolink::blocking::Client;
-    use protolink::{BlockingStreamingTransport, CallOptions, ClientConfig};
+    use protolink::{BlockingStreamingTransport, CallOptions};
 
     /// A transport that is never used: starting a call does no I/O.
     #[derive(Debug)]
@@ -419,8 +416,10 @@ mod blocking {
 
     #[test]
     fn concurrent_calls_start_on_one_client() {
-        let client = Client::new(Idle, ClientConfig::default());
-        // The HTTP/2 preface is queued as soon as the client exists.
+        let client = protolink::blocking::client(Idle)
+            .without_deadlines()
+            .build();
+        // The HTTP/2 preface is queued in memory as soon as the client exists.
         assert!(client.with_inner(|c| c.has_output()));
         let first = client.streaming("/t.T/Chat").unwrap();
         let second =

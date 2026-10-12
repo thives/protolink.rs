@@ -1,5 +1,12 @@
 # gRPC Streaming Support: Gap Analysis and Implementation Record
 
+> [!NOTE]
+> This is the design record of the streaming implementation. Since then, construction and routing
+> changed: drivers are built by factories (`protolink::server(io)...build().serve(&mut services)`),
+> `Handler::route` replaced `method_kind`/`is_unknown_method` as the single routing authority,
+> generated `<Service>Server` became `<Service>Dispatch`, and `Registry`/`MultiDispatch` replaced
+> tuple handlers. See [API.md](API.md) for the current API and a migration table.
+
 ## Scope
 
 This document treats “full gRPC streaming” as supporting all three streaming RPC shapes in addition to unary RPCs:
@@ -218,7 +225,7 @@ The private `inbound.rs` wraps the decoder with manual flow control. Credit is w
 - **Unary calls and streaming calls don't overlap.** Unary calls take `&mut self`, so they can't run while a `Call` exists.
 - **The drivers don't read while a transport write is blocked.** On a transport that buffers less than the data in flight, a bidi call that sends many requests without reading responses can block both peers in `write`. This affects tiny pipes or UART buffers without a reader task. HTTP/2 flow control bounds memory but not transport-level write blocking. The workaround is to interleave `message` with `send`, or give the transport enough buffering. This is documented on `Call`, and the e2e COBS test uses a 4 KiB pipe for this reason.
 - **Unclassified paths are answered at `END_STREAM`.** A handler that can't enumerate its paths (`FnHandler`, or hand-written handlers serving paths through `call`) keeps the default `Handler::is_unknown_method`, which returns `false`. The server then treats an unrecognized path as unary and sends `UNIMPLEMENTED` once the client half-closes, so a client streaming to such a path learns about it only when it finishes sending. Generated `*Server` wrappers know all their paths and answer unknown ones as soon as the request headers arrive; a tuple of handlers does so only if every member does.
-- **Deadlines need a cancel-safe `read` too.** With a timer, a driver drops its pending `read` when a deadline is reached, so `serve_with_timer` and clients built with `with_timer` have the same requirement as streaming handlers, even for unary-only servers. See [DEADLINES.md](DEADLINES.md).
+- **Deadlines need a cancel-safe `read` too.** With a timer, a driver drops its pending `read` when a deadline is reached, so servers and clients built `with_deadline_timer` (and the tokio factories) have the same requirement as streaming handlers, even for unary-only servers. See [DEADLINES.md](DEADLINES.md).
 - **Blocking `serve` and `Pending` handlers.** With plain `serve`, Pending streams progress only when a read returns or times out. A transport that implements `WakeableRead` and is served with `serve_wakeable` doesn't have this limitation (see §6). The crate ships no wakeable adapter for std sockets: one needs an OS mechanism to wait on the socket and a wake source together (a self-pipe or `eventfd` with `poll`, `mio`, ...).
 
 ## Acceptance criteria

@@ -7,11 +7,11 @@ use embedded_device_example::device::{
 };
 use embedded_device_example::{
     Device, EVENT_OUTPUT_CHANGED, EVENT_RESTART, ServiceBlockingClient, ServiceClient,
-    ServiceServer,
+    ServiceDispatch,
 };
 use embedded_io_adapters::tokio_1::FromTokio;
 use protolink::grpc::Code;
-use protolink::{CallOptions, ClientConfig, Metadata, ServerConfig};
+use protolink::{CallOptions, Metadata};
 
 fn get_status(correlation_id: Option<u32>) -> Command {
     let mut command = Command {
@@ -52,20 +52,22 @@ async fn with_timeout<F: Future>(f: F) -> F::Output {
 async fn async_client_and_server_over_duplex() {
     let (a, b) = tokio::io::duplex(1024);
     let server = tokio::spawn(async move {
-        let mut handler = ServiceServer(Device {
+        let mut handler = ServiceDispatch::new(Device {
             uptime_ms: 12_345,
             temperature_milli_c: 23_450,
             supply_millivolts: 3_300,
             ..Device::default()
         });
-        protolink::tokio::serve(a, &mut handler, ServerConfig::default())
+        protolink::tokio::server(a)
+            .build()
+            .serve(&mut handler)
             .await
             .unwrap();
-        handler.0
+        handler.into_inner()
     });
 
     with_timeout(async {
-        let mut client = ServiceClient::new(protolink::tokio::client(b, ClientConfig::default()));
+        let mut client = ServiceClient::new(protolink::tokio::client(b).build());
 
         let reply = client.command(&get_status(Some(7))).await.unwrap();
         assert_eq!(reply.correlation_id(), Some(&7));
@@ -130,15 +132,16 @@ async fn async_over_tcp() {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
-        let mut handler = ServiceServer(Device::default());
-        protolink::tokio::serve(stream, &mut handler, ServerConfig::default())
+        let mut handler = ServiceDispatch::new(Device::default());
+        protolink::tokio::server(stream)
+            .build()
+            .serve(&mut handler)
             .await
             .unwrap();
     });
     with_timeout(async {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let mut client =
-            ServiceClient::new(protolink::tokio::client(stream, ClientConfig::default()));
+        let mut client = ServiceClient::new(protolink::tokio::client(stream).build());
         for i in 0..20 {
             let reply = client.command(&get_status(Some(i))).await.unwrap();
             assert_eq!(reply.correlation_id(), Some(&i));
@@ -152,17 +155,16 @@ async fn grpc_over_cobs_framing() {
     use protolink::link::CobsFramed;
     let (a, b) = tokio::io::duplex(64);
     tokio::spawn(async move {
-        let mut handler = ServiceServer(Device::default());
-        let _ = protolink::serve(
-            CobsFramed::new(FromTokio::new(a)),
-            &mut handler,
-            ServerConfig::default(),
-        )
-        .await;
+        let mut handler = ServiceDispatch::new(Device::default());
+        let _ = protolink::server(CobsFramed::new(FromTokio::new(a)))
+            .without_deadlines()
+            .build()
+            .serve(&mut handler)
+            .await;
     });
     with_timeout(async {
         let io = CobsFramed::new(FromTokio::new(b));
-        let mut client = ServiceClient::new(protolink::Client::new(io, ClientConfig::default()));
+        let mut client = ServiceClient::new(protolink::client(io).without_deadlines().build());
         for i in 0..10 {
             let reply = client.command(&get_status(Some(i))).await.unwrap();
             assert_eq!(reply.correlation_id(), Some(&i));
@@ -175,13 +177,17 @@ async fn grpc_over_cobs_framing() {
 async fn reliable_link_cobs_arq() {
     let (a, b) = tokio::io::duplex(4096);
     tokio::spawn(async move {
-        let link = protolink::link::reliable(FromTokio::new(a));
-        let mut handler = ServiceServer(Device::default());
-        let _ = protolink::serve(link, &mut handler, ServerConfig::default()).await;
+        let link = protolink::link::reliable(FromTokio::new(a)).build();
+        let mut handler = ServiceDispatch::new(Device::default());
+        let _ = protolink::server(link)
+            .without_deadlines()
+            .build()
+            .serve(&mut handler)
+            .await;
     });
     with_timeout(async {
-        let link = protolink::link::reliable(FromTokio::new(b));
-        let mut client = ServiceClient::new(protolink::Client::new(link, ClientConfig::default()));
+        let link = protolink::link::reliable(FromTokio::new(b)).build();
+        let mut client = ServiceClient::new(protolink::client(link).without_deadlines().build());
         for i in 0..5 {
             let reply = client.command(&get_status(Some(100 + i))).await.unwrap();
             assert_eq!(reply.correlation_id(), Some(&(100 + i)));
@@ -194,15 +200,17 @@ async fn reliable_link_cobs_arq() {
 async fn async_streaming_over_duplex() {
     let (a, b) = tokio::io::duplex(1024);
     let server = tokio::spawn(async move {
-        let mut handler = ServiceServer(Device::default());
-        protolink::tokio::serve(a, &mut handler, ServerConfig::default())
+        let mut handler = ServiceDispatch::new(Device::default());
+        protolink::tokio::server(a)
+            .build()
+            .serve(&mut handler)
             .await
             .unwrap();
-        handler.0
+        handler.into_inner()
     });
 
     with_timeout(async {
-        let mut client = ServiceClient::new(protolink::tokio::client(b, ClientConfig::default()));
+        let mut client = ServiceClient::new(protolink::tokio::client(b).build());
 
         // Server streaming, empty: no events yet.
         let mut events = client.event_subscribe(&EventSubscribe {}).await.unwrap();
@@ -330,19 +338,23 @@ fn blocking_streaming_over_tcp() {
     let addr = listener.local_addr().unwrap();
     let server = std::thread::spawn(move || {
         let (stream, _) = listener.accept().unwrap();
-        let mut handler = ServiceServer(Device::default());
-        protolink::blocking::serve(FromStd::new(stream), &mut handler, ServerConfig::default())
+        let mut handler = ServiceDispatch::new(Device::default());
+        protolink::blocking::server(FromStd::new(stream))
+            .without_deadlines()
+            .build()
+            .serve(&mut handler)
             .unwrap();
-        handler.0
+        handler.into_inner()
     });
     let stream = std::net::TcpStream::connect(addr).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
-    let mut client = ServiceBlockingClient::new(protolink::blocking::Client::new(
-        FromStd::new(stream),
-        ClientConfig::default(),
-    ));
+    let mut client = ServiceBlockingClient::new(
+        protolink::blocking::client(FromStd::new(stream))
+            .without_deadlines()
+            .build(),
+    );
 
     // An empty replay is a trailers-only response: all its metadata is
     // trailing.
@@ -433,17 +445,16 @@ async fn streaming_over_cobs_framing() {
     // replies in flight (a 64-byte pipe would deadlock both writers).
     let (a, b) = tokio::io::duplex(4096);
     tokio::spawn(async move {
-        let mut handler = ServiceServer(Device::default());
-        let _ = protolink::serve(
-            CobsFramed::new(FromTokio::new(a)),
-            &mut handler,
-            ServerConfig::default(),
-        )
-        .await;
+        let mut handler = ServiceDispatch::new(Device::default());
+        let _ = protolink::server(CobsFramed::new(FromTokio::new(a)))
+            .without_deadlines()
+            .build()
+            .serve(&mut handler)
+            .await;
     });
     with_timeout(async {
         let io = CobsFramed::new(FromTokio::new(b));
-        let client = ServiceClient::new(protolink::Client::new(io, ClientConfig::default()));
+        let client = ServiceClient::new(protolink::client(io).without_deadlines().build());
         let mut stream = client.command_stream().await.unwrap();
         for i in 0..10 {
             stream.send(&get_status(Some(i))).await.unwrap();
@@ -473,11 +484,14 @@ async fn streaming_over_cobs_framing() {
 async fn deadlines_through_generated_clients() {
     let (a, b) = tokio::io::duplex(1024);
     tokio::spawn(async move {
-        let mut handler = ServiceServer(Device::default());
-        let _ = protolink::tokio::serve(a, &mut handler, ServerConfig::default()).await;
+        let mut handler = ServiceDispatch::new(Device::default());
+        let _ = protolink::tokio::server(a)
+            .build()
+            .serve(&mut handler)
+            .await;
     });
     with_timeout(async {
-        let mut client = ServiceClient::new(protolink::tokio::client(b, ClientConfig::default()));
+        let mut client = ServiceClient::new(protolink::tokio::client(b).build());
         let timeout = |ms| CallOptions::timeout(Duration::from_millis(ms));
 
         // A call that finishes in time is unaffected.
@@ -528,14 +542,18 @@ async fn deadlines_through_generated_clients() {
 async fn server_enforces_the_deadline_for_a_client_without_a_clock() {
     let (a, b) = tokio::io::duplex(1024);
     tokio::spawn(async move {
-        let mut handler = ServiceServer(Device::default());
-        let _ = protolink::tokio::serve(a, &mut handler, ServerConfig::default()).await;
+        let mut handler = ServiceDispatch::new(Device::default());
+        let _ = protolink::tokio::server(a)
+            .build()
+            .serve(&mut handler)
+            .await;
     });
     with_timeout(async {
-        let client = ServiceClient::new(protolink::Client::new(
-            FromTokio::new(b),
-            ClientConfig::default(),
-        ));
+        let client = ServiceClient::new(
+            protolink::client(FromTokio::new(b))
+                .without_deadlines()
+                .build(),
+        );
         let mut stream = client
             .command_stream_with_options(CallOptions::timeout(Duration::from_millis(200)))
             .await
@@ -556,14 +574,17 @@ async fn server_enforces_the_deadline_for_a_client_without_a_clock() {
 async fn metadata_through_generated_clients() {
     let (a, b) = tokio::io::duplex(1024);
     tokio::spawn(async move {
-        let mut handler = ServiceServer(Device {
+        let mut handler = ServiceDispatch::new(Device {
             uptime_ms: 777,
             ..Device::default()
         });
-        let _ = protolink::tokio::serve(a, &mut handler, ServerConfig::default()).await;
+        let _ = protolink::tokio::server(a)
+            .build()
+            .serve(&mut handler)
+            .await;
     });
     with_timeout(async {
-        let mut client = ServiceClient::new(protolink::tokio::client(b, ClientConfig::default()));
+        let mut client = ServiceClient::new(protolink::tokio::client(b).build());
 
         let mut metadata = Metadata::new();
         metadata.insert("x-request-id", "req-42").unwrap();

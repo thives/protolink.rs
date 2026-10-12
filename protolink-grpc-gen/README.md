@@ -4,6 +4,25 @@
 > [!CAUTION]
 > This crate is not yet production-ready. It has not been widely tested and may contain bugs.
 
+## Generated items
+
+For each service `Name`, in module `name` (micropb) or `name_grpc` (prost):
+
+| Item | Purpose |
+|---|---|
+| `METHOD_*`, `SERVICE_NAME` | Paths |
+| `METHODS` | `MethodDescriptor` table: path, RPC kind and method identifier |
+| `trait Name` | Implemented by the application; also implemented for `&mut S` |
+| `NameDispatch<S>` | Serves one implementation, owned or borrowed (`new`, `get_ref`, `get_mut`, `into_inner`) |
+| `NameMethods` | Stateless method table for `MultiDispatch` (one object, several services) |
+| `NameClient<T>`, `NameBlockingClient<T>` | Typed clients over any transport |
+
+```rust,ignore
+let mut device = Device::default();
+let mut services = DeviceDispatch::new(&mut device);
+server.serve(&mut services).await?;
+```
+
 ## Message backends
 
 The service glue is backend-independent; each generated service names its
@@ -13,8 +32,9 @@ calls and streaming wrapper types. Wire service and method names
 
 | | micropb (default) | prost (`prost` feature) |
 |---|---|---|
-| Messages | `micropb-gen`, from the descriptor set written by `file_descriptor_set_path` | `prost-build`, driven by `Generator::compile_protos_with_prost` |
-| Type names | resolved by this crate, mirroring micropb-gen (`messages_path`, `suffixed_package_names`, `extern_type_path` must match) | resolved by prost; this crate only re-roots the paths |
+| Generator | `Generator::micropb()` | `Generator::prost()` |
+| Messages | `micropb-gen`, from the descriptor set written by `with_file_descriptor_set_path` | `prost-build`, driven by `Generator::prost().compile_protos(.., &mut config)` |
+| Type names | resolved by this crate, mirroring micropb-gen (`with_messages_path`, `with_suffixed_package_names`, `with_extern_type_path` must match) | resolved by prost; this crate only re-roots the paths |
 | Service placement | all services in one output file, planned together | in the package module prost writes, as a `<service>_grpc` submodule |
 | Runtime feature | `protolink-grpc/micropb` (`protolink/micropb`) | `protolink-grpc/prost` (`protolink/prost`) |
 
@@ -29,8 +49,8 @@ for Cortex-M0 (`thumbv6m-*`), where micropb remains the codec.
 let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
 let mut config = prost_build::Config::new();
 config.btree_map(["."]); // no_std consumers: no HashMap
-protolink_grpc_gen::Generator::new()
-    .compile_protos_with_prost(&["proto/service.proto"], &mut config)
+protolink_grpc_gen::Generator::prost()
+    .compile_protos(&["proto/service.proto"], &mut config)
     .unwrap();
 ```
 
@@ -42,34 +62,35 @@ the way you include any prost output:
 
 ```rust,ignore
 pub mod pkg { pub mod sub { include!(concat!(env!("OUT_DIR"), "/pkg.sub.rs")); } }
-// pkg::sub::greeter_grpc::{Greeter, GreeterServer, GreeterClient, GreeterBlockingClient}
+// pkg::sub::greeter_grpc::{Greeter, GreeterDispatch, GreeterMethods, GreeterClient, GreeterBlockingClient}
 ```
 
 Everything you configure on `prost_build::Config` (`extern_path`, `btree_map`,
 type attributes, `include_file`, ...) applies as usual, and request/response
 types follow it: well-known types become `::prost_types::...`, an `extern_path`
 is used as given (absolute paths and non-path types are kept, relative ones are
-re-rooted into the service module). `Generator::compile_fdset_file_with_prost`
+re-rooted into the service module). `Generator::prost().compile_fdset_file(..)`
 takes an existing descriptor set (it must include imports,
 `protoc --include_imports`).
 
 Applications that already configure `prost_build::Config` themselves can use
-`Generator::prost_service_generator()` (or `ProstServiceGenerator::new()`) with
+`Generator::prost().service_generator()` (or `ProstServiceGenerator::new()`) with
 `Config::service_generator` directly. prost's callback cannot return an error,
 so a failure (for example an RPC name collision) is emitted as a `compile_error!`
 in the generated module and recorded in `ProstServiceGenerator::error_log()`;
-`compile_protos_with_prost` turns recorded errors into `Err`.
+`Generator::<Prost>::compile_protos` turns recorded errors into `Err`.
 
 **Collision policy.** A service `Name` always generates the module
 `name_grpc`, so it cannot shadow prost's own `Name` struct or nested-type module
 `name`. Two services of one package (even from different files) that produce the
 same module name are an error; rename one with
-`ProstServiceGenerator::service_module("pkg.Service", "other_name")`. The
+`with_service_module("pkg.Service", "other_name")` (on `Generator::prost()` or
+`ProstServiceGenerator`). The
 callback has no view of the package's messages, so a message that itself
 generates a module such as `name_grpc` (a message called `NameGrpc`) is not
-detected; it fails in rustc, and `service_module` resolves it.
+detected; it fails in rustc, and `with_service_module` resolves it.
 
-A `service_module` override is one Rust module identifier, not a path: Unicode
+A `with_service_module` override is one Rust module identifier, not a path: Unicode
 XID syntax, not `_` alone, with its spelling and case kept. Keywords are
 escaped (`type` becomes `r#type`) and `r#type` is accepted as is; the two share
 one collision namespace. `self`, `super`, `crate`, `Self`, `extern` and `__rt`
@@ -82,8 +103,9 @@ Collision tracking is cleared per package in prost's `finalize_package`, so one
 generator and `Config` can be reused for several compilations while collisions
 between files of one package are still detected; overrides, settings and
 recorded errors are kept.
-The micropb-only settings (`messages_path`, `suffixed_package_names`,
-`extern_type_path`) are ignored for prost.
+The micropb-only settings (`with_messages_path`, `with_suffixed_package_names`,
+`with_extern_type_path`) exist only on `Generator::micropb()`, so they cannot be
+set on a prost generator by mistake.
 
 ## Generated identifiers
 
@@ -103,7 +125,7 @@ When messages are included in the same Rust module as the bindings (the default
 root package module, or for empty packages a top-level message, enum, or
 nested-type module) gets a `_grpc` suffix on its normalized name. With default
 suffixing, `package foo; service Foo_` becomes `foo__grpc`; with
-`suffixed_package_names(false)`, `package foo; service Foo` becomes `foo_grpc`.
+`with_suffixed_package_names(false)`, `package foo; service Foo` becomes `foo_grpc`.
 Names that do not collide are unchanged. If the fallback also collides with a
 message module or another service, generation fails and names the conflicting
 items. A `messages_path` naming a different module never triggers the rename.
@@ -117,7 +139,7 @@ equal to `crate`) are absolute; others, like `crate_messages`, are relative.
 RPC collisions are checked in the generated Rust namespaces. Clients reserve
 `new`, `into_inner`, and `transport_mut`, so RPCs named `New`, `IntoInner`, or
 `TransportMut` are rejected when either client flavor is enabled. They remain
-valid with `.client(false).blocking_client(false)` for server-only generation.
+valid with `.with_client(false).with_blocking_client(false)` for server-only generation.
 Server lifecycle methods and client `_with_options` methods are reserved only
 when the corresponding bindings are enabled.
 

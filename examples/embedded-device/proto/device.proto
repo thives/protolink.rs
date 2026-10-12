@@ -66,3 +66,20 @@ service Service {
   // command ends the stream with its error.
   rpc CommandStream(stream .protolink.examples.embedded.device.Command) returns (stream Reply);
 }
+
+message GetCounters {}
+
+message Counters {
+  // Commands executed successfully.
+  uint32 executed = 1;
+  // Commands rejected, for example for an output channel out of range.
+  uint32 rejected = 2;
+  // Entries in the event log.
+  uint32 events = 3;
+}
+
+// Device health, typically implemented by the same object as `Service`.
+service Diagnostics {
+  // Report the command and event counters.
+  rpc GetCounters(.protolink.examples.embedded.device.GetCounters) returns (Counters);
+}

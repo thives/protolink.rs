@@ -7,9 +7,9 @@ fn main() {
 
     // One pure-Rust parse feeds both generators; no protoc required.
     let fdset = out.join("device.fdset");
-    let mut grpc = protolink_grpc_gen::Generator::new();
-    grpc.file_descriptor_set_path(&fdset);
-    grpc.compile_protos(&[proto], out.join("device_grpc.rs"))
+    protolink_grpc_gen::Generator::micropb()
+        .with_file_descriptor_set_path(&fdset)
+        .compile_protos(&[proto], out.join("device_grpc.rs"))
         .unwrap();
 
     let mut messages = micropb_gen::Generator::new();

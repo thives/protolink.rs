@@ -90,6 +90,8 @@ jobs:
             cargo check --release --target=${{matrix.target}} --no-default-features --features prost -p protolink-grpc
             cargo check --release --target=${{matrix.target}} --no-default-features --features micropb,prost -p protolink-grpc
             cargo check --release --target=${{matrix.target}} --no-default-features --features prost,async,blocking -p protolink
+            cargo check --release --target=${{matrix.target}} --no-default-features -p protolink-i2c
+            cargo check --release --target=${{matrix.target}} -p protolink-adaptors
 
   no-cas:
     name: no_std Cortex-M0 (${{ matrix.features }})
@@ -109,6 +111,11 @@ jobs:
       # Only libraries: dev-dependencies must not unify in std/Tokio features.
       # portable-atomic-critical-section currently also enables async itself.
       - run: cargo check --release --target thumbv6m-none-eabi --lib --no-default-features --features "${{ matrix.features }}" -p protolink
+      - name: Check the bus adaptors
+        if: matrix.features == 'portable-atomic-critical-section'
+        run: |
+          cargo check --release --target thumbv6m-none-eabi --lib --no-default-features -p protolink-i2c
+          cargo check --release --target thumbv6m-none-eabi --lib --features portable-atomic-critical-section -p protolink-adaptors
       # Separate invocations keep protolink's default micropb feature from
       # masking the sans-IO crates' codec-free feature combinations.
       - name: Check isolated sans-IO codec combinations
@@ -161,7 +168,7 @@ jobs:
       # Dev-dependencies are excluded so that the `tokio` dev-dependency's
       # features can't hide a broken combination.
       - run: |
-            cargo hack check --each-feature --no-dev-deps -p protolink -p protolink-grpc -p protolink-http2 -p protolink-grpc-gen
+            cargo hack check --each-feature --no-dev-deps -p protolink -p protolink-grpc -p protolink-http2 -p protolink-grpc-gen -p protolink-i2c -p protolink-adaptors
             cargo check --no-default-features --features async,std -p protolink
             cargo check --no-default-features --features blocking,std -p protolink
             cargo check --no-default-features --features async,blocking -p protolink

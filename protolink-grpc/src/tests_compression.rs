@@ -69,7 +69,9 @@ static ACCEPT_RLE: [&dyn Codec; 1] = [&RLE];
 
 /// Accept and send `rle`; compress everything from 8 bytes.
 fn rle() -> Compression {
-    Compression::new(&ACCEPT_RLE).send(&RLE).min_size(8)
+    Compression::new(&ACCEPT_RLE)
+        .with_send(&RLE)
+        .with_min_size(8)
 }
 
 /// DEFLATE backend using stored (uncompressed) blocks only.
@@ -305,7 +307,7 @@ fn accept_header_lists_codecs_then_identity() {
         Some("rle,gzip,identity")
     );
     // Sending alone advertises nothing: we cannot decode anything.
-    assert_eq!(Compression::NONE.send(&RLE).accept_header(), None);
+    assert_eq!(Compression::NONE.with_send(&RLE).accept_header(), None);
 }
 
 #[test]
@@ -563,21 +565,16 @@ struct TestHandler {
 }
 
 impl Handler for TestHandler {
-    fn call(
-        &mut self,
-        ctx: &mut CallContext<'_>,
-        request: &[u8],
-    ) -> Option<Result<Vec<u8>, Status>> {
-        let path = ctx.path;
-        (path == "/t.T/Echo").then(|| Ok(request.to_vec()))
-    }
-
-    fn method_kind(&self, path: &str) -> Option<MethodKind> {
+    fn route(&self, path: &str) -> Option<Route> {
         match path {
-            "/t.T/Stream" => Some(MethodKind::BidiStreaming),
-            "/t.T/Echo" => Some(MethodKind::Unary),
+            "/t.T/Stream" => Some(Route::new(MethodKind::BidiStreaming, 1)),
+            "/t.T/Echo" => Some(Route::new(MethodKind::Unary, 0)),
             _ => None,
         }
+    }
+
+    fn call(&mut self, _: &mut CallContext<'_>, request: &[u8]) -> Result<Vec<u8>, Status> {
+        Ok(request.to_vec())
     }
 
     fn on_message(&mut self, ctx: &mut CallContext<'_>, message: &[u8]) -> Result<(), Status> {
@@ -684,7 +681,7 @@ fn compression_is_off_unless_configured() {
 #[test]
 fn server_compresses_only_what_the_client_accepts() {
     // The client compresses requests but did not say it can read responses.
-    let send_only = Compression::NONE.send(&RLE).min_size(8);
+    let send_only = Compression::NONE.with_send(&RLE).with_min_size(8);
     let mut p = pair(send_only, rle());
     let (reply, up, down) = p.unary(&[7; BIG]);
     assert_eq!(reply, Ok(vec![7; BIG]));
@@ -711,7 +708,7 @@ fn server_compresses_only_what_the_client_accepts() {
 
 #[test]
 fn server_without_the_encoding_answers_unimplemented() {
-    for server in [Compression::NONE, Compression::NONE.send(&RLE)] {
+    for server in [Compression::NONE, Compression::NONE.with_send(&RLE)] {
         let mut p = pair(rle(), server);
         let (reply, ..) = p.unary(&[7; BIG]);
         assert_eq!(reply.unwrap_err().code, Code::Unimplemented);

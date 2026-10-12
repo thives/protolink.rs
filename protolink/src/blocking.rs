@@ -1,7 +1,15 @@
 //! Blocking drivers over `embedded_io` (feature `blocking`).
 //!
-//! Same behaviour as the async [`serve`](crate::serve) and
-//! [`Client`](crate::Client), for transports without an executor.
+//! Same behaviour as the async [`server`](crate::server) and
+//! [`client`](crate::client) factories, for transports without an executor:
+//! [`server`] builds a [`Server`] and [`client`] a [`Client`].
+//!
+//! Blocking factories have no default deadline policy: choose
+//! `.with_deadline_clock(clock)` (which needs a transport that can bound its
+//! reads, [`ReadTimeout`]) or `.without_deadlines()`. Further capabilities,
+//! [`with_output_timeouts`](ServerBuilder::with_output_timeouts) and
+//! [`with_wakeable_reads`](ServerBuilder::with_wakeable_reads), are only
+//! available when the transport implements the matching trait.
 
 use alloc::vec::Vec;
 use core::cell::RefCell;
@@ -10,6 +18,7 @@ use core::time::Duration;
 
 use embedded_io::{Error as _, ErrorKind, Read, Write};
 
+use crate::builder::{DeadlinesUnspecified, client_config_methods, server_config_methods};
 use crate::grpc::{
     self, BlockingStreamingCall, BlockingStreamingTransport, BlockingUnaryTransport, CallId,
     CallOptions, ClientConfig, Handler, Metadata, Next, Response, ServerConfig, Status,
@@ -62,127 +71,10 @@ fn remaining(next: Option<Duration>, now: Duration) -> Option<Duration> {
     next.map(|d| d.saturating_sub(now))
 }
 
-/// Serve gRPC on one connection until the peer disconnects or the connection fails.
-///
-/// Streaming handlers are polled with a no-op waker before every read, so a
-/// handler that returns `Poll::Pending` is polled again only once the read
-/// returns. To keep such streams moving without client traffic, give the
-/// transport a read timeout that surfaces as [`ErrorKind::TimedOut`] (or
-/// [`ErrorKind::Interrupted`]): those errors are treated as an idle tick, not
-/// a failure. Note that `std` sockets report timeouts as `WouldBlock` on Unix,
-/// which `embedded_io` maps to [`ErrorKind::Other`]; map it to `TimedOut` in
-/// the transport adapter.
-///
-/// A transport that can wait for input *or* a wake-up avoids the timeout: see
-/// [`WakeableRead`] and [`serve_wakeable`].
-///
-/// When the connection ends, every active streaming call is reported to
-/// [`Handler::on_cancel`].
-///
-/// `serve` has no clock, so it doesn't enforce `grpc-timeout` deadlines; use
-/// [`serve_with_clock`] for that.
-pub fn serve<IO, H>(
-    mut io: IO,
-    handler: &mut H,
-    config: ServerConfig,
-) -> Result<(), Error<IO::Error>>
-where
-    IO: Read + Write,
-    H: Handler + ?Sized,
-{
-    let mut server = grpc::Server::new(config);
-    let mut cx = Context::from_waker(Waker::noop());
-    let result = serve_connection(
-        &mut io,
-        &mut server,
-        handler,
-        &mut cx,
-        &NoTimer,
-        |_, _, _| {},
-        |io, buf, _| io.read(buf).map(Some),
-    );
-    server.cancel_all(handler);
-    result
-}
-
-/// Serve with deadline-aware reads, writes and flushes.
-///
-/// The transport must implement both timeout capabilities honestly, including
-/// flush acknowledgment waits. Any output error closes the connection and
-/// cancels active handlers. Synchronous handler execution cannot be preempted.
-pub fn serve_with_io_timeouts<IO, H, C>(
-    mut io: IO,
-    handler: &mut H,
-    config: ServerConfig,
-    clock: C,
-) -> Result<(), Error<IO::Error>>
-where
-    IO: Read + Write + ReadTimeout + OutputTimeout,
-    H: Handler + ?Sized,
-    C: Clock,
-{
-    let mut server = grpc::Server::new(config);
-    let mut cx = Context::from_waker(Waker::noop());
-    let result = serve_connection(
-        &mut io,
-        &mut server,
-        handler,
-        &mut cx,
-        &clock,
-        set_output_timeout::<IO>,
-        |io, buf, timeout| {
-            io.set_read_timeout(timeout);
-            io.read(buf).map(Some)
-        },
-    );
-    server.cancel_all(handler);
-    result
-}
-
-/// Like [`serve`], and enforces the `grpc-timeout` deadline of each call using
-/// `clock`.
-///
-/// A call's deadline starts when its request headers arrive. When it is
-/// reached the call is ended with `DEADLINE_EXCEEDED` (streaming handlers are
-/// told through [`Handler::on_cancel`]). A unary handler that is running when
-/// its deadline passes can't be preempted.
-///
-/// Before each read the transport's read timeout is set to the time left until
-/// the earliest deadline (see [`ReadTimeout`]); the resulting
-/// [`ErrorKind::TimedOut`] is an idle tick, as in [`serve`]. Writes and flushes
-/// are not bounded; use [`serve_with_io_timeouts`] to bound output too.
-pub fn serve_with_clock<IO, H, C>(
-    mut io: IO,
-    handler: &mut H,
-    config: ServerConfig,
-    clock: C,
-) -> Result<(), Error<IO::Error>>
-where
-    IO: Read + Write + ReadTimeout,
-    H: Handler + ?Sized,
-    C: Clock,
-{
-    let mut server = grpc::Server::new(config);
-    let mut cx = Context::from_waker(Waker::noop());
-    let result = serve_connection(
-        &mut io,
-        &mut server,
-        handler,
-        &mut cx,
-        &clock,
-        |_, _, _| {},
-        |io, buf, timeout| {
-            io.set_read_timeout(timeout);
-            io.read(buf).map(Some)
-        },
-    );
-    server.cancel_all(handler);
-    result
-}
-
 /// A handle that wakes a [`WakeableRead`] transport.
 ///
-/// [`serve_wakeable`] turns it into the [`Waker`] handlers receive in
+/// A server built [`with_wakeable_reads`](ServerBuilder::with_wakeable_reads)
+/// turns it into the [`Waker`] handlers receive in
 /// `poll_response`. Calling [`wake`](Self::wake) must make the transport's
 /// in-progress [`read_or_wake`](WakeableRead::read_or_wake) return `Ok(None)`,
 /// or the next one if none is in progress. It may be called from any thread
@@ -229,9 +121,11 @@ impl core::fmt::Debug for WakeHandle {
 
 /// A blocking transport that can wait for input *or* a wake-up.
 ///
-/// A plain [`Read`] can't be interrupted, so [`serve`] notices that a
+/// A plain [`Read`] can't be interrupted, so a server notices that a
 /// handler became ready only when a read returns or times out. Implementing
-/// this trait lets [`serve_wakeable`] react to a handler's wake immediately.
+/// this trait lets a server built
+/// [`with_wakeable_reads`](ServerBuilder::with_wakeable_reads) react to a
+/// handler's wake immediately.
 /// How to wait for both is up to the transport (a condition variable, an
 /// event flag with `WFE`/`SEV`, an interrupt that also ends the UART read, a
 /// self-pipe, ...).
@@ -250,104 +144,415 @@ impl core::fmt::Debug for WakeHandle {
 #[cfg(target_has_atomic = "ptr")]
 pub trait WakeableRead: Read {
     /// A handle that wakes [`read_or_wake`](Self::read_or_wake). It is
-    /// requested once per [`serve_wakeable`] call.
+    /// requested once, when [`Server::serve`] starts.
     fn wake_handle(&self) -> WakeHandle;
 
     /// Like [`Read::read`], but returns `Ok(None)` when woken through a
     /// [`WakeHandle`] before data arrived.
     fn read_or_wake(&mut self, buf: &mut [u8]) -> Result<Option<usize>, Self::Error>;
+}
 
-    /// [`read_or_wake`](Self::read_or_wake) that also gives up after `timeout`
-    /// (`None`: no limit), either by returning `Ok(None)` or by failing with
-    /// [`ErrorKind::TimedOut`]. Used by [`serve_wakeable_with_clock`] so that
-    /// the wait ends when the earliest deadline is reached.
-    ///
-    /// The default ignores `timeout`; deadlines are then only enforced when a
-    /// read returns for another reason.
+/// A [`WakeableRead`] transport whose wait can also be bounded by a timeout.
+///
+/// Required to combine
+/// [`with_wakeable_reads`](ServerBuilder::with_wakeable_reads) with
+/// [`with_deadline_clock`](ServerBuilder::with_deadline_clock): the server
+/// passes the time left until the earliest deadline, so that the wait ends
+/// when it is reached. There is deliberately no default implementation; one
+/// that ignored `timeout` would silently disable deadline enforcement.
+#[cfg(target_has_atomic = "ptr")]
+pub trait WakeableReadTimeout: WakeableRead {
+    /// [`read_or_wake`](WakeableRead::read_or_wake) that also gives up after
+    /// `timeout` (`None`: no limit), either by returning `Ok(None)` or by
+    /// failing with [`ErrorKind::TimedOut`].
     fn read_or_wake_timeout(
         &mut self,
         buf: &mut [u8],
         timeout: Option<Duration>,
-    ) -> Result<Option<usize>, Self::Error> {
-        let _ = timeout;
-        self.read_or_wake(buf)
+    ) -> Result<Option<usize>, Self::Error>;
+}
+
+/// Start building a blocking gRPC server on one connection.
+///
+/// Configure the factory with `.with_*` methods, choose a deadline policy and
+/// the transport capabilities to use, then [`build`](ServerBuilder::build) it
+/// and [`serve`](Server::serve) the application's services:
+///
+/// | Factory method | Transport must implement | Effect |
+/// |---|---|---|
+/// | [`without_deadlines`](ServerBuilder::without_deadlines) | `Read + Write` | `grpc-timeout` is not enforced |
+/// | [`with_deadline_clock`](ServerBuilder::with_deadline_clock) | [`ReadTimeout`] | Reads are bounded by the earliest deadline |
+/// | [`with_output_timeouts`](ServerBuilder::with_output_timeouts) | [`OutputTimeout`] | Writes and flushes are bounded too |
+/// | [`with_wakeable_reads`](ServerBuilder::with_wakeable_reads) | [`WakeableRead`] | Streaming handlers wake the read |
+/// | `with_wakeable_reads` + `with_deadline_clock` | [`WakeableReadTimeout`] | Wakeable reads bounded by deadlines |
+///
+/// ```no_run
+/// # fn demo<IO, C, H>(io: IO, clock: C, services: &mut H)
+/// # where IO: embedded_io::Read + embedded_io::Write + protolink::blocking::ReadTimeout,
+/// #       C: protolink::Clock, H: protolink::Handler {
+/// let server = protolink::blocking::server(io)
+///     .with_deadline_clock(clock)
+///     .build();
+/// server.serve(services).ok();
+/// # }
+/// ```
+///
+/// Building performs no I/O. A deadline policy is required, and each
+/// capability is only available when the transport implements it:
+///
+/// ```compile_fail
+/// # fn demo<IO: embedded_io::Read + embedded_io::Write>(io: IO) {
+/// // No deadline policy: `build` is not available.
+/// let server = protolink::blocking::server(io).build();
+/// # }
+/// ```
+///
+/// ```compile_fail
+/// # fn demo<IO: embedded_io::Read + embedded_io::Write, C: protolink::Clock>(io: IO, clock: C) {
+/// // A deadline clock needs a transport that implements `ReadTimeout`.
+/// let server = protolink::blocking::server(io).with_deadline_clock(clock).build();
+/// # }
+/// ```
+///
+/// ```compile_fail
+/// # use protolink::blocking::ReadTimeout;
+/// # fn demo<IO: embedded_io::Read + embedded_io::Write + ReadTimeout, C: protolink::Clock>(io: IO, clock: C) {
+/// // Output timeouts need a transport that implements `OutputTimeout`.
+/// let server = protolink::blocking::server(io)
+///     .with_deadline_clock(clock)
+///     .with_output_timeouts()
+///     .build();
+/// # }
+/// ```
+///
+/// ```compile_fail
+/// # use protolink::blocking::{ReadTimeout, WakeableRead};
+/// # fn demo<IO: WakeableRead + embedded_io::Write + ReadTimeout, C: protolink::Clock>(io: IO, clock: C) {
+/// // Wakeable reads bounded by deadlines need `WakeableReadTimeout`.
+/// let server = protolink::blocking::server(io)
+///     .with_wakeable_reads()
+///     .with_deadline_clock(clock)
+///     .build();
+/// # }
+/// ```
+pub fn server<IO: Read + Write>(io: IO) -> ServerBuilder<IO> {
+    ServerBuilder {
+        io,
+        config: ServerConfig::default(),
+        deadlines: DeadlinesUnspecified,
+        reads: PlainReads,
+        set_output: no_output_timeout::<IO>,
     }
 }
 
-/// Like [`serve`], for a transport that can wait for input or a wake-up.
-///
-/// Handlers receive a waker backed by [`WakeableRead::wake_handle`]. Waking it
-/// ends the wait for input, so a streaming handler that returned
-/// `Poll::Pending` and is woken later (from a timer, an interrupt or another
-/// thread) is polled again, and its output written, without any peer traffic
-/// and without a transport read timeout.
-///
-/// Read errors of kind [`ErrorKind::TimedOut`] or [`ErrorKind::Interrupted`]
-/// are still treated as idle ticks, as in [`serve`].
-///
-/// When the connection ends, every active streaming call is reported to
-/// [`Handler::on_cancel`].
+/// Deadline policy of a blocking factory: enforce `grpc-timeout` with the
+/// clock `C`. Set by `with_deadline_clock`.
+#[derive(Debug, Clone, Copy)]
+pub struct DeadlineClock<C>(C);
+
+/// Deadline policy of a blocking factory: no local enforcement. Set by
+/// `without_deadlines`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoDeadlines;
+
+/// Read mode of a blocking server: plain [`Read::read`], the default.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PlainReads;
+
+/// Read mode of a blocking server: [`WakeableRead::read_or_wake`]. Set by
+/// [`ServerBuilder::with_wakeable_reads`].
 #[cfg(target_has_atomic = "ptr")]
-pub fn serve_wakeable<IO, H>(
-    mut io: IO,
-    handler: &mut H,
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WakeableReads;
+
+type OutputFn<IO> = fn(&mut IO, Option<Duration>, bool);
+
+fn no_output_timeout<IO>(_: &mut IO, _: Option<Duration>, _: bool) {}
+
+/// Factory of a blocking [`Server`], created by [`server`].
+///
+/// `D` is the deadline policy ([`DeadlinesUnspecified`], [`NoDeadlines`] or
+/// [`DeadlineClock`]) and `R` the read mode ([`PlainReads`] or
+/// `WakeableReads`).
+pub struct ServerBuilder<IO, D = DeadlinesUnspecified, R = PlainReads> {
+    io: IO,
     config: ServerConfig,
-) -> Result<(), Error<IO::Error>>
-where
-    IO: WakeableRead + Write,
-    H: Handler + ?Sized,
-{
-    let mut server = grpc::Server::new(config);
-    let waker = io.wake_handle().into_waker();
-    let mut cx = Context::from_waker(&waker);
-    let result = serve_connection(
-        &mut io,
-        &mut server,
-        handler,
-        &mut cx,
-        &NoTimer,
-        |_, _, _| {},
-        |io, buf, _| io.read_or_wake(buf),
-    );
-    server.cancel_all(handler);
-    result
+    deadlines: D,
+    reads: R,
+    set_output: OutputFn<IO>,
 }
 
-/// [`serve_wakeable`] that also enforces `grpc-timeout` deadlines using
-/// `clock`, like [`serve_with_clock`].
-///
-/// The time left until the earliest deadline is passed to
-/// [`WakeableRead::read_or_wake_timeout`].
+impl<IO: core::fmt::Debug, D: core::fmt::Debug, R: core::fmt::Debug> core::fmt::Debug
+    for ServerBuilder<IO, D, R>
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ServerBuilder")
+            .field("io", &self.io)
+            .field("config", &self.config)
+            .field("deadlines", &self.deadlines)
+            .field("reads", &self.reads)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<IO, D, R> ServerBuilder<IO, D, R> {
+    /// Enforce each call's `grpc-timeout` with `clock`.
+    ///
+    /// A call's deadline starts when its request headers arrive. When it is
+    /// reached the call ends with `DEADLINE_EXCEEDED` (streaming handlers are
+    /// told through [`Handler::on_cancel`]). A unary handler that is running
+    /// when its deadline passes can't be preempted.
+    ///
+    /// Before each read the transport's read timeout is set to the time left
+    /// until the earliest deadline, so the transport must implement
+    /// [`ReadTimeout`] (or [`WakeableReadTimeout`] with
+    /// [`with_wakeable_reads`](Self::with_wakeable_reads)); `build` requires
+    /// it. Writes and flushes stay unbounded unless
+    /// [`with_output_timeouts`](ServerBuilder::with_output_timeouts) is chosen
+    /// too.
+    pub fn with_deadline_clock<C: Clock>(self, clock: C) -> ServerBuilder<IO, DeadlineClock<C>, R> {
+        ServerBuilder {
+            io: self.io,
+            config: self.config,
+            deadlines: DeadlineClock(clock),
+            reads: self.reads,
+            set_output: self.set_output,
+        }
+    }
+
+    /// Do not enforce deadlines locally. Calls still receive their
+    /// `grpc-timeout` in [`CallContext::deadline`](crate::CallContext::deadline),
+    /// on a clock that never advances. Clears
+    /// [`with_output_timeouts`](ServerBuilder::with_output_timeouts).
+    pub fn without_deadlines(self) -> ServerBuilder<IO, NoDeadlines, R> {
+        ServerBuilder {
+            io: self.io,
+            config: self.config,
+            deadlines: NoDeadlines,
+            reads: self.reads,
+            set_output: no_output_timeout::<IO>,
+        }
+    }
+
+    /// Wait for input *or* a wake-up of a streaming handler, see
+    /// [`WakeableRead`].
+    ///
+    /// Handlers receive a waker backed by [`WakeableRead::wake_handle`].
+    /// Waking it ends the wait for input, so a streaming handler that returned
+    /// `Poll::Pending` and is woken later (from a timer, an interrupt or
+    /// another thread) is polled again, and its output written, without any
+    /// peer traffic and without a transport read timeout. With a deadline
+    /// clock the transport must implement [`WakeableReadTimeout`].
+    #[cfg(target_has_atomic = "ptr")]
+    pub fn with_wakeable_reads(self) -> ServerBuilder<IO, D, WakeableReads>
+    where
+        IO: WakeableRead,
+    {
+        ServerBuilder {
+            io: self.io,
+            config: self.config,
+            deadlines: self.deadlines,
+            reads: WakeableReads,
+            set_output: self.set_output,
+        }
+    }
+
+    server_config_methods!();
+}
+
+impl<IO, C, R> ServerBuilder<IO, DeadlineClock<C>, R> {
+    /// Also bound writes and flushes by the earliest deadline, through the
+    /// transport's [`OutputTimeout`].
+    ///
+    /// The transport must implement both timeout capabilities honestly,
+    /// including flush acknowledgment waits. Any output error closes the
+    /// connection and cancels active handlers.
+    pub fn with_output_timeouts(mut self) -> Self
+    where
+        IO: OutputTimeout,
+    {
+        self.set_output = set_output_timeout::<IO>;
+        self
+    }
+}
+
+impl<IO: Read + Write> ServerBuilder<IO, NoDeadlines, PlainReads> {
+    /// Construct the server. Performs no I/O.
+    pub fn build(self) -> Server<IO, NoTimer> {
+        Server::from_parts(
+            self.io,
+            self.config,
+            NoTimer,
+            |io, buf, _| io.read(buf).map(Some),
+            None,
+            self.set_output,
+        )
+    }
+}
+
+impl<IO: Read + Write + ReadTimeout, C: Clock> ServerBuilder<IO, DeadlineClock<C>, PlainReads> {
+    /// Construct the server. Performs no I/O.
+    pub fn build(self) -> Server<IO, C> {
+        Server::from_parts(
+            self.io,
+            self.config,
+            self.deadlines.0,
+            |io, buf, timeout| {
+                io.set_read_timeout(timeout);
+                io.read(buf).map(Some)
+            },
+            None,
+            self.set_output,
+        )
+    }
+}
+
 #[cfg(target_has_atomic = "ptr")]
-pub fn serve_wakeable_with_clock<IO, H, C>(
-    mut io: IO,
-    handler: &mut H,
+impl<IO: WakeableRead + Write> ServerBuilder<IO, NoDeadlines, WakeableReads> {
+    /// Construct the server. Performs no I/O; the wake handle is requested
+    /// when [`serve`](Server::serve) starts.
+    pub fn build(self) -> Server<IO, NoTimer> {
+        Server::from_parts(
+            self.io,
+            self.config,
+            NoTimer,
+            |io, buf, _| io.read_or_wake(buf),
+            Some(IO::wake_handle),
+            self.set_output,
+        )
+    }
+}
+
+#[cfg(target_has_atomic = "ptr")]
+impl<IO: WakeableReadTimeout + Write, C: Clock> ServerBuilder<IO, DeadlineClock<C>, WakeableReads> {
+    /// Construct the server. Performs no I/O; the wake handle is requested
+    /// when [`serve`](Server::serve) starts.
+    pub fn build(self) -> Server<IO, C> {
+        Server::from_parts(
+            self.io,
+            self.config,
+            self.deadlines.0,
+            |io, buf, timeout| io.read_or_wake_timeout(buf, timeout),
+            Some(IO::wake_handle),
+            self.set_output,
+        )
+    }
+}
+
+type ReadFn<IO> = fn(
+    &mut IO,
+    &mut [u8],
+    Option<Duration>,
+) -> Result<Option<usize>, <IO as embedded_io::ErrorType>::Error>;
+
+#[cfg(target_has_atomic = "ptr")]
+type WakeFn<IO> = fn(&IO) -> WakeHandle;
+#[cfg(not(target_has_atomic = "ptr"))]
+type WakeFn<IO> = fn(&IO) -> core::convert::Infallible;
+
+/// A blocking gRPC server driver for one connection, built by [`server`].
+///
+/// It owns the transport, the configuration and the deadline clock. The
+/// application's services are only joined to it by [`serve`](Self::serve).
+pub struct Server<IO: embedded_io::ErrorType, C = NoTimer> {
+    io: IO,
     config: ServerConfig,
     clock: C,
-) -> Result<(), Error<IO::Error>>
-where
-    IO: WakeableRead + Write,
-    H: Handler + ?Sized,
-    C: Clock,
-{
-    let mut server = grpc::Server::new(config);
-    let waker = io.wake_handle().into_waker();
-    let mut cx = Context::from_waker(&waker);
-    let result = serve_connection(
-        &mut io,
-        &mut server,
-        handler,
-        &mut cx,
-        &clock,
-        |_, _, _| {},
-        |io, buf, timeout| io.read_or_wake_timeout(buf, timeout),
-    );
-    server.cancel_all(handler);
-    result
+    read: ReadFn<IO>,
+    wake: Option<WakeFn<IO>>,
+    set_output: OutputFn<IO>,
 }
 
-/// The serving loop shared by [`serve`] and [`serve_wakeable`] and their
-/// clock variants.
+impl<IO: embedded_io::ErrorType + core::fmt::Debug, C: core::fmt::Debug> core::fmt::Debug
+    for Server<IO, C>
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Server")
+            .field("io", &self.io)
+            .field("config", &self.config)
+            .field("clock", &self.clock)
+            .field("wakeable", &self.wake.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<IO: Read + Write, C: Clock> Server<IO, C> {
+    fn from_parts(
+        io: IO,
+        config: ServerConfig,
+        clock: C,
+        read: ReadFn<IO>,
+        wake: Option<WakeFn<IO>>,
+        set_output: OutputFn<IO>,
+    ) -> Self {
+        Self {
+            io,
+            config,
+            clock,
+            read,
+            wake,
+            set_output,
+        }
+    }
+
+    /// Serve gRPC on this connection until the peer disconnects or the
+    /// connection fails.
+    ///
+    /// `services` (a generated `<Service>Dispatch`, a
+    /// [`Registry`](crate::Registry), or any [`Handler`]) is borrowed
+    /// for the whole connection and receives every call on it; call state
+    /// keyed by [`CallId`] is therefore connection-local.
+    ///
+    /// With plain reads, streaming handlers are polled with a no-op waker
+    /// before every read, so a handler that returns `Poll::Pending` is polled
+    /// again only once the read returns. To keep such streams moving without
+    /// client traffic, give the transport a read timeout that surfaces as
+    /// [`ErrorKind::TimedOut`] (or [`ErrorKind::Interrupted`]): those errors
+    /// are treated as an idle tick, not a failure. Note that `std` sockets
+    /// report timeouts as `WouldBlock` on Unix, which `embedded_io` maps to
+    /// [`ErrorKind::Other`]; map it to `TimedOut` in the transport adapter.
+    /// [`with_wakeable_reads`](ServerBuilder::with_wakeable_reads) avoids the
+    /// timeout.
+    ///
+    /// When the connection ends, normally or with an error, every active
+    /// streaming call is reported to [`Handler::on_cancel`] before this
+    /// returns. If a handler panics, no cleanup is attempted.
+    pub fn serve<H: Handler + ?Sized>(self, services: &mut H) -> Result<(), Error<IO::Error>> {
+        let Self {
+            mut io,
+            config,
+            clock,
+            read,
+            wake,
+            set_output,
+        } = self;
+        let mut server = grpc::Server::new(config);
+        #[cfg(target_has_atomic = "ptr")]
+        let waker = match wake {
+            Some(wake_handle) => wake_handle(&io).into_waker(),
+            None => Waker::noop().clone(),
+        };
+        #[cfg(not(target_has_atomic = "ptr"))]
+        let waker = {
+            let _ = wake;
+            Waker::noop().clone()
+        };
+        let mut cx = Context::from_waker(&waker);
+        let result = serve_connection(
+            &mut io,
+            &mut server,
+            services,
+            &mut cx,
+            &clock,
+            set_output,
+            read,
+        );
+        server.cancel_all(services);
+        result
+    }
+}
+
+/// The serving loop of every [`Server`] configuration.
 ///
 /// `read` waits for input, at most for the timeout it is given (the time left
 /// until the earliest deadline; it may ignore it). `Ok(None)` means it was
@@ -434,16 +639,18 @@ where
 /// # Deadlines
 ///
 /// Calls can have a timeout ([`CallOptions`], [`ClientConfig::default_timeout`]),
-/// which is sent to the server as `grpc-timeout`. A client built with
-/// [`with_clock`](Self::with_clock) also enforces it: when the call's time is
-/// up it fails with `DEADLINE_EXCEEDED` and the stream is reset. Messages
-/// that were already received are still delivered first. The transport's read
-/// timeout is set to the time left, so a read that finds no data returns in
-/// time; see [`ReadTimeout`]. A client built with [`new`](Self::new) has no
-/// clock and leaves enforcement to the server.
+/// which is sent to the server as `grpc-timeout`. A client built
+/// [`with_deadline_clock`](ClientBuilder::with_deadline_clock) also enforces
+/// it: when the call's time is up it fails with `DEADLINE_EXCEEDED` and the
+/// stream is reset. Messages that were already received are still delivered
+/// first. The transport's read timeout is set to the time left, so a read that
+/// finds no data returns in time; see [`ReadTimeout`]. A client built
+/// [`without_deadlines`](ClientBuilder::without_deadlines) has no clock and
+/// leaves enforcement to the server.
 ///
-/// `with_clock` only bounds reads: a blocked write or flush can postpone
-/// expiry indefinitely. Use [`with_io_timeouts`](Self::with_io_timeouts) for
+/// A deadline clock only bounds reads: a blocked write or flush can postpone
+/// expiry indefinitely. Add
+/// [`with_output_timeouts`](ClientBuilder::with_output_timeouts) for
 /// deadline-aware output too. Transport/protocol failures permanently retire
 /// the connection; new calls are rejected and no further I/O is attempted,
 /// but buffered messages and terminal statuses remain retrievable.
@@ -453,7 +660,7 @@ pub struct Client<IO, C = NoTimer> {
     clock: C,
     /// Sets the transport's read timeout; a no-op without a clock.
     set_timeout: fn(&mut IO, Option<Duration>),
-    set_output_timeout: Option<fn(&mut IO, Option<Duration>, bool)>,
+    set_output_timeout: Option<OutputFn<IO>>,
     /// Read timeouts are idle ticks, not failures.
     idle_timeouts: bool,
 }
@@ -467,36 +674,124 @@ struct State<IO> {
     terminal: Option<Status>,
 }
 
-impl<IO: Read + Write> Client<IO> {
-    /// Create a client without a clock; the HTTP/2 preface is sent with the
-    /// first call. Timeouts are sent to the server but not enforced locally;
-    /// see [`with_clock`](Self::with_clock).
-    pub fn new(io: IO, config: ClientConfig) -> Self {
-        Self::build(io, config, NoTimer, |_, _| {}, false)
+/// Start building a blocking gRPC client on one connection.
+///
+/// ```no_run
+/// # fn demo<IO, C>(io: IO, clock: C)
+/// # where IO: embedded_io::Read + embedded_io::Write + protolink::blocking::ReadTimeout,
+/// #       C: protolink::Clock {
+/// let transport = protolink::blocking::client(io)
+///     .with_deadline_clock(clock)
+///     .build();
+/// // Hand `transport` to a generated `<Service>BlockingClient::new`.
+/// # let _ = transport;
+/// # }
+/// ```
+///
+/// Building performs no I/O: the HTTP/2 preface is sent with the first call.
+/// A deadline policy is required, as for [`server`], and a deadline clock
+/// needs a transport that can bound its reads:
+///
+/// ```compile_fail
+/// # fn demo<IO: embedded_io::Read + embedded_io::Write, C: protolink::Clock>(io: IO, clock: C) {
+/// let transport = protolink::blocking::client(io).with_deadline_clock(clock).build();
+/// # }
+/// ```
+pub fn client<IO: Read + Write>(io: IO) -> ClientBuilder<IO> {
+    ClientBuilder {
+        io,
+        config: ClientConfig::default(),
+        deadlines: DeadlinesUnspecified,
+        set_output: None,
     }
 }
 
-impl<IO: Read + Write + ReadTimeout, C: Clock> Client<IO, C> {
-    /// Create a client that enforces call timeouts using `clock`; the HTTP/2
-    /// preface is sent with the first call. Only reads are bounded; writes and
-    /// flushes can stall indefinitely. See [`with_io_timeouts`](Self::with_io_timeouts).
-    ///
-    /// Read errors of kind [`ErrorKind::TimedOut`] or [`ErrorKind::Interrupted`]
-    /// are treated as idle ticks, not as transport failures.
-    pub fn with_clock(io: IO, config: ClientConfig, clock: C) -> Self {
-        Self::build(io, config, clock, IO::set_read_timeout, true)
+/// Factory of a blocking [`Client`], created by [`client`].
+///
+/// `D` is the deadline policy: [`DeadlinesUnspecified`], [`NoDeadlines`] or
+/// [`DeadlineClock`].
+pub struct ClientBuilder<IO, D = DeadlinesUnspecified> {
+    io: IO,
+    config: ClientConfig,
+    deadlines: D,
+    set_output: Option<OutputFn<IO>>,
+}
+
+impl<IO: core::fmt::Debug, D: core::fmt::Debug> core::fmt::Debug for ClientBuilder<IO, D> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ClientBuilder")
+            .field("io", &self.io)
+            .field("config", &self.config)
+            .field("deadlines", &self.deadlines)
+            .field("output_timeouts", &self.set_output.is_some())
+            .finish()
     }
 }
 
-impl<IO: Read + Write + ReadTimeout + OutputTimeout, C: Clock> Client<IO, C> {
-    /// Enforce deadlines across reads, writes and flushes. Unlike
-    /// [`with_clock`](Self::with_clock), output stalls are bounded too.
-    /// Any output timeout retires this connection; expired calls retain
-    /// `DEADLINE_EXCEEDED`, other calls fail with `UNAVAILABLE`.
-    pub fn with_io_timeouts(io: IO, config: ClientConfig, clock: C) -> Self {
-        let mut client = Self::with_clock(io, config, clock);
-        client.set_output_timeout = Some(set_output_timeout::<IO>);
-        client
+impl<IO, D> ClientBuilder<IO, D> {
+    /// Enforce call timeouts locally with `clock`, see
+    /// [Deadlines](Client#deadlines). The transport must implement
+    /// [`ReadTimeout`]; `build` requires it. Read errors of kind
+    /// [`ErrorKind::TimedOut`] or [`ErrorKind::Interrupted`] are then treated
+    /// as idle ticks, not as transport failures.
+    pub fn with_deadline_clock<C: Clock>(self, clock: C) -> ClientBuilder<IO, DeadlineClock<C>> {
+        ClientBuilder {
+            io: self.io,
+            config: self.config,
+            deadlines: DeadlineClock(clock),
+            set_output: self.set_output,
+        }
+    }
+
+    /// Do not enforce timeouts locally. They are still sent as
+    /// `grpc-timeout`, so a server with a clock enforces them. Clears
+    /// [`with_output_timeouts`](ClientBuilder::with_output_timeouts).
+    pub fn without_deadlines(self) -> ClientBuilder<IO, NoDeadlines> {
+        ClientBuilder {
+            io: self.io,
+            config: self.config,
+            deadlines: NoDeadlines,
+            set_output: None,
+        }
+    }
+
+    client_config_methods!();
+}
+
+impl<IO, C> ClientBuilder<IO, DeadlineClock<C>> {
+    /// Also bound writes and flushes by the earliest deadline, through the
+    /// transport's [`OutputTimeout`]. Any output timeout retires the
+    /// connection; expired calls retain `DEADLINE_EXCEEDED`, other calls fail
+    /// with `UNAVAILABLE`.
+    pub fn with_output_timeouts(mut self) -> Self
+    where
+        IO: OutputTimeout,
+    {
+        self.set_output = Some(set_output_timeout::<IO>);
+        self
+    }
+}
+
+impl<IO: Read + Write> ClientBuilder<IO, NoDeadlines> {
+    /// Construct the client. Performs no I/O: the HTTP/2 preface is sent with
+    /// the first call.
+    pub fn build(self) -> Client<IO, NoTimer> {
+        Client::from_parts(self.io, self.config, NoTimer, |_, _| {}, None, false)
+    }
+}
+
+impl<IO: Read + Write + ReadTimeout, C: Clock> ClientBuilder<IO, DeadlineClock<C>> {
+    /// Construct the client. Performs no I/O: the HTTP/2 preface is sent with
+    /// the first call.
+    pub fn build(self) -> Client<IO, C> {
+        Client::from_parts(
+            self.io,
+            self.config,
+            self.deadlines.0,
+            IO::set_read_timeout,
+            self.set_output,
+            true,
+        )
     }
 }
 
@@ -508,11 +803,12 @@ fn retire<IO>(state: &mut State<IO>, status: Status) {
 }
 
 impl<IO: Read + Write, C: Clock> Client<IO, C> {
-    fn build(
+    fn from_parts(
         io: IO,
         config: ClientConfig,
         clock: C,
         set_timeout: fn(&mut IO, Option<Duration>),
+        set_output_timeout: Option<OutputFn<IO>>,
         idle_timeouts: bool,
     ) -> Self {
         Self {
@@ -524,7 +820,7 @@ impl<IO: Read + Write, C: Clock> Client<IO, C> {
             }),
             clock,
             set_timeout,
-            set_output_timeout: None,
+            set_output_timeout,
             idle_timeouts,
         }
     }

@@ -17,22 +17,110 @@ It is async first, `no_std + alloc`, with options for embedded-io, blocking I/O,
 
 | Crate | Path | Purpose |
 |---|---|---|
-| `protolink` | `.` | I/O drivers (async, blocking, tokio) and the COBS + ARQ link stack |
-| `protolink-grpc` | `grpc/` | Sans-IO gRPC server/client (unary and streaming), status mapping, micropb and prost codecs (features) |
-| `protolink-http2` | `http2/` | Sans-IO HTTP/2 connection, built on `zerodds-http2` + `zerodds-hpack` |
-| `protolink-grpc-gen` | `grpc-gen/` | Code generator: service traits, servers and clients for micropb or prost messages |
+| `protolink` | `protolink/` | Client and server factories and drivers (async, blocking, tokio) and the COBS + ARQ link stack |
+| `protolink-grpc` | `protolink-grpc/` | Sans-IO gRPC server/client (unary and streaming), routing (`Handler`, `Registry`, `MultiDispatch`), status mapping, micropb and prost codecs (features) |
+| `protolink-http2` | `protolink-http2/` | Sans-IO HTTP/2 connection, built on `zerodds-http2` + `zerodds-hpack` |
+| `protolink-grpc-gen` | `protolink-grpc-gen/` | Code generator: service traits, dispatchers and clients for micropb or prost messages |
+| `protolink-adaptors` | `protolink-adaptors/` | Buffered ports and runners that turn a bus (I2C controller/target) into an `embedded-io-async` stream, see [docs/ADAPTORS.md](docs/ADAPTORS.md) |
+| `protolink-i2c` | `protolink-i2c/` | The I2C mailbox protocol, controller transaction primitives and the target-driver trait |
 
 ```text
-application  ── implements generated <Service> trait / calls <Service>Client
-codegen      ── protolink-grpc-gen (service glue) + micropb-gen or prost-build (messages)
-gRPC         ── protolink-grpc
-HTTP/2       ── protolink-http2
-drivers      ── protolink (async / blocking / tokio)
-link         ── protolink::link (COBS framing + ARQ reliability, optional)
-transport    ── anything implementing embedded-io(-async) or tokio I/O
+Application object
+    ↓ implements generated traits
+Generated dispatcher / service registry
+    ↓ borrowed for the connection lifetime
+Server driver
+    ↓ owns
+gRPC → HTTP/2 → optional reliable link → byte stream
 ```
 
-## Usage
+| Layer | Crate |
+|---|---|
+| application | implements generated `<Service>` traits / calls `<Service>Client` |
+| codegen | `protolink-grpc-gen` (service glue) + `micropb-gen` or `prost-build` (messages) |
+| gRPC | `protolink-grpc` |
+| HTTP/2 | `protolink-http2` |
+| drivers | `protolink` (async / blocking / tokio) |
+| link | `protolink::link` (COBS framing + ARQ reliability, optional) |
+| transport | anything implementing `embedded-io(-async)` or tokio I/O |
+| adaptors | `protolink-adaptors` (I2C controller / target as a byte stream, optional) |
+
+## Assembling a stack
+
+Every stack is assembled with one vocabulary: `server(io)` / `client(io)` create a factory,
+`.with_*()` configures it, `.build()` constructs it without any I/O, and `.serve(&mut services)`
+drives one connection (`.run()` drives an adaptor runner). Application services are independent
+objects that meet the driver only at `serve`. [`docs/API.md`](docs/API.md) has the full contract,
+compile-tested examples, and a migration table from the previous constructors.
+
+### 1. Tokio server with a separate service object
+
+```rust
+use embedded_device_example::{Device, ServiceDispatch};
+
+let listener = tokio::net::TcpListener::bind("127.0.0.1:50051").await?;
+loop {
+    let (stream, _) = listener.accept().await?;
+    tokio::spawn(async move {
+        let mut device = Device::default();                    // the application object
+        let mut services = ServiceDispatch::new(&mut device);  // generated dispatcher, borrowing it
+        let server = protolink::tokio::server(stream)          // the driver: a TokioTimer enforces deadlines
+            .with_max_message_size(4096)
+            .build();
+        server.serve(&mut services).await
+    });
+}
+```
+
+### 2. Embedded client and server with an explicit deadline policy
+
+Outside tokio, every factory states whether it enforces `grpc-timeout`:
+
+```rust
+// Server, on any embedded_io_async::{Read, Write} transport, with a platform `protolink::Timer`:
+let server = protolink::server(io).with_deadline_timer(timer).build();
+server.serve(&mut ServiceDispatch::new(&mut device)).await?;
+
+// Client: the timeout is still sent as `grpc-timeout`, but only the server enforces it.
+let transport = protolink::client(io).without_deadlines().build();
+let mut client = ServiceClient::new(transport);
+let reply = client.command(&request).await?;
+
+// Blocking: a deadline clock needs a transport that bounds its reads (`blocking::ReadTimeout`).
+let server = protolink::blocking::server(io).with_deadline_clock(clock).build();
+```
+
+Leaving the deadline policy out does not compile.
+
+### 3. I2C port and runner, optional reliability, separately assembled services
+
+```rust
+use protolink_adaptors::{Binding, ControllerState, i2c_controller};
+
+static STATE: StaticCell<ControllerState<1>> = StaticCell::new();
+let Binding { port, runner } = i2c_controller(i2c, delay)  // bus adaptor; no traffic yet
+    .with_address(0x42)
+    .with_storage(STATE.init(ControllerState::new()))
+    .build()?;
+let io = protolink::link::reliable(port)                    // COBS + ARQ, only if wanted
+    .with_retransmission_timer(arq_timer)
+    .build();
+let server = protolink::server(io).with_deadline_timer(deadline_timer).build();
+
+// One application object behind two generated services.
+let mut services = protolink::MultiDispatch::builder(&mut device)
+    .with_service(ServiceMethods)
+    .with_service(DiagnosticsMethods)
+    .build()?;
+
+// Nothing is spawned: poll the runner next to the server.
+select(runner.run(), server.serve(&mut services)).await;
+```
+
+Independent objects are registered with `protolink::Registry::builder().with_service(..)`; both
+`Registry` and `MultiDispatch` reject two services that serve the same path when built.
+
+## Code generation
 
 `build.rs` — one pure-Rust parse feeds both generators, so `protoc` is not needed:
 
@@ -40,9 +128,10 @@ transport    ── anything implementing embedded-io(-async) or tokio I/O
 let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
 let fdset = out.join("service.fdset");
 
-let mut grpc = protolink_grpc_gen::Generator::new();
-grpc.file_descriptor_set_path(&fdset);
-grpc.compile_protos(&["proto/service.proto"], out.join("service_grpc.rs")).unwrap();
+protolink_grpc_gen::Generator::micropb()
+    .with_file_descriptor_set_path(&fdset)
+    .compile_protos(&["proto/service.proto"], out.join("service_grpc.rs"))
+    .unwrap();
 
 micropb_gen::Generator::new()
     .compile_fdset_file(&fdset, out.join("service.rs"))
@@ -51,7 +140,7 @@ micropb_gen::Generator::new()
 
 Include both outputs in the same module, then implement the generated trait.
 Messages can instead come from [prost](https://docs.rs/prost) (features
-`prost` on `protolink` and `protolink-grpc-gen`, `Generator::compile_protos_with_prost`;
+`prost` on `protolink` and `protolink-grpc-gen`, `Generator::prost().compile_protos(.., &mut config)`;
 see the `protolink-grpc-gen` README); the `micropb` feature stays the default.
 
 ```rust
@@ -63,15 +152,12 @@ pub mod proto {
 impl proto::service::Service for MyDevice {
     fn command(&mut self, ctx: &mut protolink::CallContext<'_>, request: Command) -> Result<Reply, protolink::Status> { /* ... */ }
 }
-
-// Server, on any embedded_io_async::{Read, Write} transport:
-let mut handler = proto::service::ServiceServer(MyDevice::default());
-protolink::serve(io, &mut handler, protolink::ServerConfig::default()).await?;
-
-// Client:
-let mut client = proto::service::ServiceClient::new(protolink::Client::new(io, Default::default()));
-let reply = client.command(&request).await?;
 ```
+
+For each service the generator emits the trait, `<Service>Dispatch<S>` (serves one implementation,
+owned or borrowed), `<Service>Methods` (for `MultiDispatch`), a `METHODS` descriptor table, and the
+`<Service>Client` / `<Service>BlockingClient` wrappers that take any transport built by a client
+factory.
 
 ### Streaming
 
@@ -118,8 +204,8 @@ let (a, b) = futures::join!(first.message(), second.message());
 ```
 
 The blocking server polls `Pending` streaming handlers when a read returns or times out. A transport that can
-wait for input or a wake-up can implement `blocking::WakeableRead` and be served with
-`blocking::serve_wakeable`, which polls a handler as soon as it wakes its waker, with no read timeout.
+wait for input or a wake-up can implement `blocking::WakeableRead` and be served by a server built
+`.with_wakeable_reads()`, which polls a handler as soon as it wakes its waker, with no read timeout.
 
 The transport is used by one operation at a time. A pending `message()` gives way when another call
 has something to write, which requires a cancel-safe transport `read` (tokio, the `link` stack and
@@ -138,7 +224,7 @@ call ends with `DEADLINE_EXCEEDED` when it runs out, on both sides. See
 
 ```rust
 use std::time::Duration;
-use protolink::{CallOptions, ClientConfig};
+use protolink::CallOptions;
 
 // One call:
 let reply = client
@@ -147,7 +233,9 @@ let reply = client
 let stream = client.command_stream_with_options(CallOptions::timeout(Duration::from_secs(30))).await?;
 
 // Every call that doesn't set its own:
-let config = ClientConfig { default_timeout: Some(Duration::from_secs(2)), ..Default::default() };
+let transport = protolink::tokio::client(stream)
+    .with_default_timeout(Duration::from_secs(2))
+    .build();
 ```
 
 Every generated client method has a `<method>_with_options` variant. The timeout covers the whole call,
@@ -160,11 +248,11 @@ turns it into a budget for work the handler starts. Expired streaming calls are 
 learns when to wake with `next_deadline()`. The drivers need a clock to enforce deadlines, and without
 one still *send* `grpc-timeout` (so the server enforces it) but never expire a call themselves:
 
-| Driver | Enforce deadlines with |
+| Factory | Deadline policy |
 |---|---|
-| tokio | nothing to do: `protolink::tokio::{client, serve}` use `TokioTimer` |
-| async (`embedded-io`) | `Client::with_timer(io, config, timer)`, `serve_with_timer(io, handler, config, timer)`, for a `protolink::Timer` |
-| blocking | `blocking::Client::with_clock(io, config, clock)`, `serve_with_clock`, `serve_wakeable_with_clock`, for a `protolink::Clock` and an `io` that implements `blocking::ReadTimeout` |
+| `protolink::tokio::{server, client}` | nothing to do: a `TokioTimer` is supplied |
+| `protolink::{server, client}` (`embedded-io-async`) | required: `.with_deadline_timer(timer)` for a `protolink::Timer`, or `.without_deadlines()` |
+| `protolink::blocking::{server, client}` | required: `.with_deadline_clock(clock)` for a `protolink::Clock` and an `io` that implements `blocking::ReadTimeout`, or `.without_deadlines()`; add `.with_output_timeouts()` (`blocking::OutputTimeout`) to bound writes and flushes too |
 
 `Clock` is `now() -> Duration` (monotonic, since any fixed point); `Timer` adds
 `sleep_until(deadline) -> impl Future<Output = ()>`. On `no_std`, implement them on the platform timer:
@@ -191,7 +279,7 @@ Things to know:
   with one call: the driver drops its pending read when a deadline is reached (the same requirement as
   streaming handlers and concurrent calls; tokio streams, `CobsFramed` and the `link` stack qualify).
 - **Blocking drivers bound the read with a read timeout.** They set it to the time left before each read
-  (`blocking::ReadTimeout`, or `WakeableRead::read_or_wake_timeout`) and treat `ErrorKind::TimedOut` as an
+  (`blocking::ReadTimeout`, or `blocking::WakeableReadTimeout`) and treat `ErrorKind::TimedOut` as an
   idle tick. Without that hook a deadline is only noticed when a read returns. `std` sockets report
   timeouts as `WouldBlock`, which `embedded-io` maps to `ErrorKind::Other`; map it to `TimedOut`.
 - When a client's call expires, buffered messages are still delivered before the status, the stream is
@@ -201,15 +289,14 @@ Things to know:
 ## Compression
 
 Message compression (`grpc-encoding` / `grpc-accept-encoding`) is off by default. Turn it on with
-`Compression` in `ClientConfig` / `ServerConfig`:
+`Compression`, through the factories' `.with_compression(..)` (or `ClientConfig` / `ServerConfig`):
 
 ```rust
-use protolink::{Compression, ServerConfig};
+use protolink::Compression;
 
-let config = ServerConfig {
-    compression: Compression::gzip(), // needs the `miniz-oxide` feature
-    ..ServerConfig::default()
-};
+let server = protolink::tokio::server(stream)
+    .with_compression(Compression::gzip()) // needs the `miniz-oxide` feature
+    .build();
 ```
 
 The algorithm is behind two traits in `protolink::compression`, so a target can use what it already has:
@@ -221,7 +308,7 @@ The algorithm is behind two traits in `protolink::compression`, so a target can 
 
 `Deflate` is two methods, `deflate` and `inflate` (plus an optional `crc32` override for a ROM CRC). A
 backend that can only decompress returns `CodecError::Unsupported` from `deflate` and leaves
-`Compression::send` unset: it then accepts compressed requests and answers uncompressed.
+`Compression::send` unset (no `with_send`): it then accepts compressed requests and answers uncompressed.
 
 ```rust
 use protolink::Compression;
@@ -230,7 +317,7 @@ use protolink::compression::{Codec, Gzip};
 // `RomMiniz` implements `Deflate` on top of the ROM routines.
 static GZIP: Gzip<RomMiniz> = Gzip::new(RomMiniz);
 static ACCEPT: [&dyn Codec; 1] = [&GZIP];
-let compression = Compression::new(&ACCEPT).send(&GZIP);
+let compression = Compression::new(&ACCEPT).with_send(&GZIP);
 ```
 
 The `miniz-oxide` feature adds the stock pure-Rust backend (`MinizOxide`, the ready-made `GZIP` and
@@ -321,14 +408,14 @@ with a terminal `ReliableError(ArqError::Timeout)`.
 ARQ retransmits on a timeout, so it needs a time source (the `arq_io_async::Timer` trait, re-exported
 as `protolink::link::Timer`, which is not the `protolink::Timer` used for [deadlines](#deadlines)):
 
-| Constructor | Requires | Timer |
+| Factory | Requires | Timer |
 |---|---|---|
-| `link::reliable_with_timer(raw, timer)` | `async` | any `Timer` implementation; the `no_std` path |
-| `link::reliable(raw)` | `async` + `std` (implied by `tokio`) | `link::StdTimer` (one reusable helper thread per link; works with any executor) |
+| `link::reliable(raw).with_retransmission_timer(timer).build()` | `async` | any `Timer` implementation; the `no_std` path |
+| `link::reliable(raw).build()` | `async` + `std` (implied by `tokio`) | `link::StdTimer` (one reusable helper thread per link; works with any executor) |
 
 On `no_std` targets, implement `Timer` on top of the platform timer (for example `embassy-time`) and
-call `reliable_with_timer`. `StdTimer` exists only with the `std` feature, so embedded builds do not
-pull it in.
+pass it to `with_retransmission_timer`; without `std` there is no default and `build` requires it.
+`StdTimer` exists only with the `std` feature, so embedded builds do not pull it in.
 
 ### DMA UARTs
 

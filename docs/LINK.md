@@ -1,6 +1,7 @@
 # Reliable raw links: framing, ARQ and recovery
 
-`link::reliable_with_timer` (and the `std` shortcut `link::reliable`) builds:
+`link::reliable(raw).with_retransmission_timer(timer).build()` (with `std`,
+`link::reliable(raw).build()` uses a `StdTimer`) builds:
 
 ```text
 application bytes -> ARQ -> COBS -> raw transport
@@ -37,7 +38,7 @@ The link uses the published crates `arq-io-async` 0.0.3 and `cobs-io-async`
 | `ReliableLink<S, Tmr>` | ARQ over `CobsTransport`, driven from `async` `Read`/`Write`; its error is `ReliableError`. |
 | `StdTimer` | Executor-independent `Timer` (`std` feature): one reusable helper thread per timer. |
 
-Public constructors keep their signatures. The concrete `ReliableLink` type
+The link is built by the `link::reliable(raw)` factory. The concrete `ReliableLink` type
 and its error type (`ReliableError`, wrapping `ArqError<LinkError<E>>`) changed;
 code that spelled out the old alias must migrate.
 
@@ -91,6 +92,10 @@ between fragmented reads and writes. Dropping an upper `read`, `write` or
 Transport errors are propagated, not treated as corrupt frames. Use
 `link::pump` for drivers whose pending operations cannot safely be cancelled;
 future recreation now happens in `CobsTransport`, not in an upstream adapter.
+The `protolink-adaptors` ports (I2C) are cancel-safe by construction, so they need no pump:
+they only move bytes in and out of rings, while a runner owns the bus. See
+[ADAPTORS.md](ADAPTORS.md). A port `flush` only means the bytes crossed the bus; the
+reliable-link `flush` below still means the peer acknowledged them.
 
 Both peers must continue driving ARQ until outstanding writes are acknowledged.
 A receiver which has already obtained all application bytes may still need to
@@ -111,7 +116,7 @@ peer has been written and flushed on the raw stream.
 ## Memory
 
 `CobsFramed` is about 1.1 KiB (1088 bytes on x86-64). The full stack built by
-`reliable_with_timer` is about 10.5 KiB (10.7 KiB with `FromTokio` over a Tokio
+`link::reliable` is about 10.5 KiB (10.7 KiB with `FromTokio` over a Tokio
 duplex stream and `StdTimer`), dominated by ARQ's two window buffers.
 
 ## Regression coverage

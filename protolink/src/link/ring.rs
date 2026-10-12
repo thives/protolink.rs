@@ -324,6 +324,27 @@ impl<T: Copy, const S: usize> RingTx<'_, T, S> {
         }
     }
 
+    /// Poll for at least `n` free slots: `Ready(free)` with `free >= n`, or
+    /// `Pending` until the reader has freed enough.
+    ///
+    /// `n` is clamped to the capacity, so `n == capacity` waits for an empty
+    /// ring. Like [`poll_writable`](Self::poll_writable) the waker is
+    /// registered before the final check, so a wakeup cannot be missed.
+    pub fn poll_writable_at_least(&mut self, cx: &mut Context<'_>, n: usize) -> Poll<usize> {
+        let n = n.min(S);
+        let free = self.remaining_capacity();
+        if free >= n {
+            return Poll::Ready(free);
+        }
+        self.ring.space_waker.register(cx.waker());
+        // Check again: the reader may have freed space before the waker was
+        // registered.
+        match self.remaining_capacity() {
+            free if free >= n => Poll::Ready(free),
+            _ => Poll::Pending,
+        }
+    }
+
     /// Push one item, waiting while the ring is full.
     ///
     /// Cancel-safe: if the future is dropped before it completes, nothing was
@@ -667,6 +688,36 @@ mod tests {
         };
         let ((), out) = tokio::join!(producer, consumer);
         assert_eq!(out, (0..100).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn writable_at_least_waits_for_the_whole_threshold() {
+        use core::future::poll_fn;
+
+        let mut ring = RingBuffer::<u8, 8>::new();
+        let (mut tx, mut rx) = ring.split();
+        assert_eq!(tx.push_slice(&[0; 8]), 8);
+        let waiter = async {
+            // Threshold larger than the capacity is clamped: wait for empty.
+            let free = poll_fn(|cx| tx.poll_writable_at_least(cx, 100)).await;
+            assert_eq!(free, 8);
+        };
+        let reader = async {
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+                // Freeing less than the threshold must not complete the waiter.
+                rx.consume(1);
+            }
+        };
+        tokio::join!(waiter, reader);
+        assert!(rx.is_empty());
+
+        // Already satisfied: ready without registering.
+        let mut cx = Context::from_waker(core::task::Waker::noop());
+        assert_eq!(tx.poll_writable_at_least(&mut cx, 8), Poll::Ready(8));
+        tx.push_slice(&[0; 6]);
+        assert_eq!(tx.poll_writable_at_least(&mut cx, 3), Poll::Pending);
+        assert_eq!(tx.poll_writable_at_least(&mut cx, 2), Poll::Ready(2));
     }
 
     #[tokio::test]

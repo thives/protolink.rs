@@ -16,7 +16,8 @@ use crate::{Codec, Emitter, Error, Kind, M, Service, ident_key, rust_ident, snak
 ///
 /// Each one is also emitted as a `compile_error!` into the generated module,
 /// so using the generator directly (outside of
-/// [`Generator::compile_protos_with_prost`](crate::Generator::compile_protos_with_prost))
+/// [`Generator::compile_protos`](crate::Generator::compile_protos) of
+/// `Generator<Prost>`)
 /// never silently produces incomplete bindings.
 #[derive(Debug, Clone, Default)]
 pub struct ErrorLog(Arc<Mutex<Vec<String>>>);
@@ -40,8 +41,8 @@ impl ErrorLog {
 ///
 /// The bindings of service `pkg.Name` go into module `name_grpc` of the
 /// package module prost generates; rename it with
-/// [`service_module`](Self::service_module). Create one with
-/// [`Generator::prost_service_generator`](crate::Generator::prost_service_generator)
+/// [`with_service_module`](Self::with_service_module). Create one with
+/// [`Generator::service_generator`](crate::Generator::service_generator)
 /// or [`new`](Self::new), register it with
 /// `prost_build::Config::service_generator`.
 #[derive(Debug, Clone)]
@@ -82,25 +83,25 @@ impl ProstServiceGenerator {
     }
 
     /// Path of the protolink gRPC runtime (default `::protolink::grpc`).
-    pub fn runtime_path(&mut self, path: impl Into<String>) -> &mut Self {
+    pub fn with_runtime_path(mut self, path: impl Into<String>) -> Self {
         self.emitter.runtime_path = path.into();
         self
     }
 
-    /// Generate service traits and server wrappers (default `true`).
-    pub fn server(&mut self, flag: bool) -> &mut Self {
+    /// Generate service traits and dispatchers (default `true`).
+    pub fn with_server(mut self, flag: bool) -> Self {
         self.emitter.server = flag;
         self
     }
 
     /// Generate async clients (default `true`).
-    pub fn client(&mut self, flag: bool) -> &mut Self {
+    pub fn with_client(mut self, flag: bool) -> Self {
         self.emitter.client = flag;
         self
     }
 
     /// Generate blocking clients (default `true`).
-    pub fn blocking_client(&mut self, flag: bool) -> &mut Self {
+    pub fn with_blocking_client(mut self, flag: bool) -> Self {
         self.emitter.blocking_client = flag;
         self
     }
@@ -123,11 +124,11 @@ impl ProstServiceGenerator {
     /// `compile_error!`, and reserves no module name, so it can be corrected
     /// and generation retried. Overrides and other settings survive reuse of
     /// the generator across several `prost_build::Config` compilations.
-    pub fn service_module(
-        &mut self,
+    pub fn with_service_module(
+        mut self,
         service: impl AsRef<str>,
         module: impl Into<String>,
-    ) -> &mut Self {
+    ) -> Self {
         self.modules.insert(
             service.as_ref().trim_start_matches('.').to_owned(),
             module.into(),
@@ -155,7 +156,7 @@ impl ProstServiceGenerator {
         if let Some(other) = self.used.insert(scope, full.clone()) {
             return Err(Error::Parse(format!(
                 "services `{other}` and `{full}` both generate a module named `{}`; \
-                 rename one with `service_module`",
+                 rename one with `with_service_module`",
                 ident_key(&module)
             )));
         }
@@ -327,10 +328,10 @@ mod tests {
 
     #[test]
     fn generation_modes_apply() {
-        let mut g = ProstServiceGenerator::new();
-        g.server(false)
-            .client(false)
-            .runtime_path("::protolink_grpc");
+        let mut g = ProstServiceGenerator::new()
+            .with_server(false)
+            .with_client(false)
+            .with_runtime_path("::protolink_grpc");
         let src = generate(&mut g, service("", "Thing"));
         assert!(src.contains("use ::protolink_grpc as __rt;"), "{src}");
         assert!(src.contains("\"/Thing/GetThing\""), "{src}");
@@ -363,8 +364,7 @@ mod tests {
 
     #[test]
     fn module_override_resolves_collisions() {
-        let mut g = ProstServiceGenerator::new();
-        g.service_module(".a.THING", "shouting");
+        let mut g = ProstServiceGenerator::new().with_service_module(".a.THING", "shouting");
         let errors = g.error_log();
         generate(&mut g, service("a", "Thing"));
         let src = generate(&mut g, service("a", "THING"));
@@ -401,9 +401,9 @@ mod tests {
     #[test]
     fn finalize_package_allows_regenerating() {
         for package in ["a", ""] {
-            let mut g = ProstServiceGenerator::new();
+            let mut g = ProstServiceGenerator::new()
+                .with_service_module(format!("{package}.Other"), "custom");
             let errors = g.error_log();
-            g.service_module(format!("{package}.Other"), "custom");
             generate(&mut g, service(package, "Thing"));
             g.finalize_package(package, &mut String::new());
             let again = generate(&mut g, service(package, "Thing"));
@@ -443,8 +443,9 @@ mod tests {
 
     #[test]
     fn finalize_package_keeps_errors_and_overrides() {
-        let mut g = ProstServiceGenerator::new();
-        g.service_module("a.Thing", "custom").server(false);
+        let mut g = ProstServiceGenerator::new()
+            .with_service_module("a.Thing", "custom")
+            .with_server(false);
         let errors = g.error_log();
         generate(&mut g, service("a", "Thing"));
         generate(&mut g, service("a", "Other"));
@@ -458,8 +459,7 @@ mod tests {
     }
 
     fn override_result(module: &str) -> (String, Vec<String>) {
-        let mut g = ProstServiceGenerator::new();
-        g.service_module("a.Thing", module);
+        let mut g = ProstServiceGenerator::new().with_service_module("a.Thing", module);
         let src = generate(&mut g, service("a", "Thing"));
         (src, g.error_log().take())
     }
@@ -506,9 +506,9 @@ mod tests {
 
     #[test]
     fn raw_and_plain_overrides_share_a_namespace() {
-        let mut g = ProstServiceGenerator::new();
-        g.service_module("a.One", "type")
-            .service_module("a.Two", "r#type");
+        let mut g = ProstServiceGenerator::new()
+            .with_service_module("a.One", "type")
+            .with_service_module("a.Two", "r#type");
         let errors = g.error_log();
         generate(&mut g, service("a", "One"));
         generate(&mut g, service("a", "Two"));
@@ -519,8 +519,7 @@ mod tests {
 
     #[test]
     fn override_collides_with_default_module_of_another_service() {
-        let mut g = ProstServiceGenerator::new();
-        g.service_module("a.One", "two_grpc");
+        let mut g = ProstServiceGenerator::new().with_service_module("a.One", "two_grpc");
         let errors = g.error_log();
         generate(&mut g, service("a", "One"));
         generate(&mut g, service("a", "Two"));
@@ -529,9 +528,8 @@ mod tests {
 
     #[test]
     fn corrected_override_does_not_leave_a_stale_reservation() {
-        let mut g = ProstServiceGenerator::new();
+        let mut g = ProstServiceGenerator::new().with_service_module("a.Thing", "foo-bar");
         let errors = g.error_log();
-        g.service_module("a.Thing", "foo-bar");
         let bad = generate(&mut g, service("a", "Thing"));
         assert!(bad.contains("compile_error!"));
         assert_eq!(errors.take().len(), 1);
@@ -539,7 +537,7 @@ mod tests {
         let other = generate(&mut g, service("a", "Thing2"));
         assert!(!other.contains("compile_error!"), "{other}");
         // ...and the corrected override takes the original service.
-        g.service_module("a.Thing", "thing_ok");
+        let mut g = g.with_service_module("a.Thing", "thing_ok");
         let ok = generate(&mut g, service("a", "Thing"));
         assert!(ok.contains("pub mod thing_ok {"), "{ok}");
         assert!(errors.take().is_empty());

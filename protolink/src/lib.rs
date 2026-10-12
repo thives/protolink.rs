@@ -15,26 +15,59 @@
 //! transport    ── anything implementing embedded-io(-async) or tokio I/O
 //! ```
 //!
+//! ## Assembling a stack
+//!
+//! Every driver is assembled with the same vocabulary:
+//!
+//! | Operation | Contract |
+//! |---|---|
+//! | [`server(io)`](server), [`client(io)`](client) | Create a factory |
+//! | `.with_*()` | Consume and configure a factory |
+//! | `.as_*()` | Borrowed view or adapter, not an ownership transfer |
+//! | `.into_*()` | Consuming conversion |
+//! | `.build()` | Construct and validate; no transport I/O or task spawning |
+//! | [`.serve(&mut services)`](Server::serve) | Drive one server connection |
+//! | `.run()` | Drive an adaptor or pump runner |
+//!
+//! The async factories live at the crate root, the blocking ones in
+//! [`blocking`] and the tokio ones in [`tokio`]. Application services are
+//! independent of the driver: they implement generated service traits, are
+//! wrapped in a generated `<Service>Dispatch` (or several in a
+//! [`Registry`]), and meet the driver only at `serve`:
+//!
+//! ```no_run
+//! # async fn demo<IO, T, H>(io: IO, timer: T, mut services: H) -> Result<(), protolink::Error<IO::Error>>
+//! # where IO: embedded_io_async::Read + embedded_io_async::Write, T: protolink::Timer, H: protolink::Handler {
+//! let server = protolink::server(io)
+//!     .with_deadline_timer(timer)
+//!     .with_max_message_size(4096)
+//!     .build();
+//! server.serve(&mut services).await?;
+//! # Ok(()) }
+//! ```
+//!
 //! ## Features
 //!
-//! - `async` / `embedded-io`: [`serve`] and [`Client`] over
+//! - `async` / `embedded-io`: [`server`] and [`client`] over
 //!   `embedded_io_async::{Read, Write}`, and the [`link`] module (including the
 //!   optional [`link::pump`] lower layer for DMA UARTs).
-//! - `blocking`: [`blocking::serve`] and [`blocking::Client`] over
-//!   `embedded_io::{Read, Write}`. [`blocking::serve_wakeable`] serves
-//!   transports that implement [`blocking::WakeableRead`], so streaming
+//! - `blocking`: [`blocking::server`] and [`blocking::client`] over
+//!   `embedded_io::{Read, Write}`. A blocking server built
+//!   [`with_wakeable_reads`](blocking::ServerBuilder::with_wakeable_reads)
+//!   serves transports that implement [`blocking::WakeableRead`], so streaming
 //!   handlers that were `Pending` progress as soon as they are woken, without
 //!   relying on read timeouts.
-//! - `tokio`: [`tokio`] helpers adapting tokio I/O to the async drivers.
+//! - `tokio`: [`tokio`] factories adapting tokio I/O to the async drivers.
 //! - `portable-atomic`: use [`portable-atomic`](https://docs.rs/portable-atomic) for link and
 //!   ARQ atomics on targets that need a portable implementation. On targets without native
 //!   compare-and-swap, also enable `portable-atomic-critical-section` and link a platform-provided
 //!   critical-section implementation.
 //! - Deadlines: [`Timer`] / [`Clock`] let the drivers enforce `grpc-timeout`;
 //!   see below.
-//! - `std`: `std` support in dependencies, including [`link::reliable`] (which
-//!   uses `std`'s clock for ARQ retransmission timeouts). Without it, use
-//!   [`link::reliable_with_timer`] and supply a platform timer.
+//! - `std`: `std` support in dependencies, including a default ARQ
+//!   retransmission timer for [`link::reliable`] ([`link::StdTimer`]). Without
+//!   it, supply a platform timer with
+//!   [`with_retransmission_timer`](link::ReliableBuilder::with_retransmission_timer).
 //!
 //! An allocator is always required (`no_std + alloc`).
 //!
@@ -58,21 +91,22 @@
 //! A call's timeout ([`CallOptions`], [`ClientConfig::default_timeout`]) is
 //! sent to the server as `grpc-timeout`, and generated clients have a
 //! `<method>_with_options` variant of every method. Enforcing it needs a time
-//! source, which the sans-IO cores don't have; the drivers take one:
+//! source, which the sans-IO cores don't have. Every factory makes the choice
+//! explicit:
 //!
-//! - tokio: [`tokio::serve`] and [`tokio::client`] use
+//! - tokio: [`tokio::server`] and [`tokio::client`] supply a
 //!   [`tokio::TokioTimer`].
-//! - async: [`Client::with_timer`] and [`serve_with_timer`] take a [`Timer`].
-//! - blocking: [`blocking::Client::with_clock`], [`blocking::serve_with_clock`]
-//!   and [`blocking::serve_wakeable_with_clock`] take a [`Clock`], and the
-//!   transport sets a read timeout through [`blocking::ReadTimeout`].
+//! - async: `.with_deadline_timer(timer)` takes a [`Timer`];
+//!   `.without_deadlines()` opts out.
+//! - blocking: `.with_deadline_clock(clock)` takes a [`Clock`] and needs a
+//!   transport that implements [`blocking::ReadTimeout`] (and, to bound output
+//!   too, [`blocking::OutputTimeout`]); `.without_deadlines()` opts out.
 //!
-//! Without a time source ([`NoTimer`], the default of [`Client::new`] and
-//! [`serve`]) calls still carry `grpc-timeout` but are never expired locally.
-//! With a timer the transport `read` must be cancel-safe, even without
-//! streaming: a pending read is dropped when a deadline is reached. A unary
-//! handler that is already running can't be preempted; it can check
-//! [`CallContext::remaining`]. [`Timer`] is unrelated to
+//! Without a time source calls still carry `grpc-timeout` but are never
+//! expired locally. With a timer the transport `read` must be cancel-safe,
+//! even without streaming: a pending read is dropped when a deadline is
+//! reached. A unary handler that is already running can't be preempted; it
+//! can check [`CallContext::remaining`]. [`Timer`] is unrelated to
 //! `link::Timer`, the ARQ retransmission timer.
 #![cfg_attr(not(feature = "std"), no_std)]
 // `deny` rather than `forbid` so that `link::ring`, the only module that needs
@@ -85,10 +119,14 @@ extern crate alloc;
 pub use protolink_grpc as grpc;
 pub use protolink_grpc::{
     BlockingStreamingCall, BlockingStreamingTransport, BlockingUnaryTransport, CallContext, CallId,
-    CallOptions, ClientConfig, Code, Compression, Handler, InvalidMetadata, Metadata,
-    MetadataValue, MethodKind, Next, Response, ResponseMetadata, Scheme, ServerConfig, Status,
-    StreamingCall, StreamingTransport, UnaryTransport, compression,
+    CallOptions, ClientConfig, Code, Compression, Dispatcher, Handler, InvalidMetadata, Metadata,
+    MetadataValue, MethodDescriptor, MethodKind, MultiDispatch, Next, Registry, Response,
+    ResponseMetadata, Route, RouteConflict, Scheme, ServerConfig, Status, StreamingCall,
+    StreamingTransport, UnaryTransport, compression,
 };
+
+mod builder;
+pub use builder::DeadlinesUnspecified;
 
 mod timer;
 pub use timer::{Clock, NoTimer, Timer};
@@ -99,7 +137,7 @@ pub use error::Error;
 #[cfg(feature = "async")]
 mod asynch;
 #[cfg(feature = "async")]
-pub use asynch::{Call, Client, serve, serve_with_timer};
+pub use asynch::{Call, Client, ClientBuilder, Server, ServerBuilder, client, server};
 #[cfg(feature = "async")]
 mod shared;
 

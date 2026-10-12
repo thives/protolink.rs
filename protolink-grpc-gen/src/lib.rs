@@ -3,15 +3,24 @@
 //! Generates gRPC service bindings for [protolink] from `.proto` service
 //! definitions. Message types are produced by [`micropb-gen`] or, with the
 //! `prost` feature, by [`prost-build`]; this crate produces the service glue
-//! that `tonic-build` would normally provide:
+//! that `tonic-build` would normally provide. For each service `Name`:
 //!
-//! - method path constants,
-//! - a service trait with methods for every RPC (unary, server-streaming,
-//!   client-streaming and bidirectional streaming),
-//! - a `<Service>Server<S>` wrapper implementing `protolink_grpc::Handler`,
-//! - an async `<Service>Client<T>`: unary methods for
-//!   `T: UnaryTransport`, streaming methods for `T: StreamingTransport`,
-//! - a `<Service>BlockingClient<T>`, the same over the blocking transports.
+//! - method path constants and a `METHODS` table of `MethodDescriptor`s (path,
+//!   shape and identifier of every method),
+//! - a service trait `Name` with methods for every RPC (unary,
+//!   server-streaming, client-streaming and bidirectional streaming), also
+//!   implemented for `&mut S` so dispatchers can borrow the implementation,
+//! - `NameDispatch<S>`, which serves one implementation (owned or borrowed) as
+//!   a `protolink_grpc::Handler`, with `new`, `get_ref`, `get_mut` and
+//!   `into_inner`,
+//! - `NameMethods`, the stateless method table that lets one application
+//!   object serve several services through `protolink_grpc::MultiDispatch`,
+//! - an async `NameClient<T>`: unary methods for `T: UnaryTransport`,
+//!   streaming methods for `T: StreamingTransport`,
+//! - a `NameBlockingClient<T>`, the same over the blocking transports.
+//!
+//! Generated traits carry no transport or executor bounds, and generated
+//! clients are independent of the transport factories that build `T`.
 //!
 //! ## Streaming methods
 //!
@@ -46,12 +55,17 @@
 //!
 //! ## Usage from `build.rs`
 //!
+//! Choose the message backend with [`Generator::micropb`] or
+//! [`Generator::prost`], configure it with consuming `with_*` methods, then
+//! compile:
+//!
 //! ```no_run
 //! let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
-//! let mut grpc = protolink_grpc_gen::Generator::new();
-//! // Write the parsed descriptors so micropb-gen can reuse them without protoc.
-//! grpc.file_descriptor_set_path(out.join("fdset.bin"));
-//! grpc.compile_protos(&["proto/service.proto"], out.join("grpc.rs")).unwrap();
+//! protolink_grpc_gen::Generator::micropb()
+//!     // Write the parsed descriptors so micropb-gen can reuse them without protoc.
+//!     .with_file_descriptor_set_path(out.join("fdset.bin"))
+//!     .compile_protos(&["proto/service.proto"], out.join("grpc.rs"))
+//!     .unwrap();
 //!
 //! // micropb_gen::Generator::new()
 //! //     .compile_fdset_file(out.join("fdset.bin"), out.join("messages.rs"))
@@ -69,27 +83,36 @@
 //!
 //! ## Prost
 //!
-//! With the `prost` feature, [`Generator::compile_protos_with_prost`] hands the
+//! With the `prost` feature, [`Generator::prost`]'s `compile_protos` hands the
 //! parsed descriptors to a `prost_build::Config` and generates the messages and
 //! the bindings together (no `protoc` needed). prost resolves the type names, and
 //! the bindings of service `Name` land in module `name_grpc` of the package
 //! module. See the crate README for placement, `extern_path`, and the
-//! collision policy. Use [`Generator::prost_service_generator`] to register the
-//! bindings on a `prost_build::Config` you configure yourself. Enable the
+//! collision policy. Use `Generator::<Prost>::service_generator` to register
+//! the bindings on a `prost_build::Config` you configure yourself. Enable the
 //! `prost` feature of `protolink-grpc` (or `protolink`) in the consumer.
 //!
 //! ```ignore
 //! let mut config = prost_build::Config::new();
-//! protolink_grpc_gen::Generator::new()
-//!     .compile_protos_with_prost(&["proto/service.proto"], &mut config)
+//! protolink_grpc_gen::Generator::prost()
+//!     .compile_protos(&["proto/service.proto"], &mut config)
 //!     .unwrap();
+//! ```
+//!
+//! The micropb naming settings do not exist on a prost generator, so they
+//! cannot be set and silently ignored:
+//!
+//! ```compile_fail
+//! let generator = protolink_grpc_gen::Generator::prost().with_messages_path("crate::pb");
 //! ```
 //!
 //! ## Micropb type names
 //!
 //! Type names are resolved exactly like micropb-gen does (`package_` modules,
-//! `Message_` modules for nested types). Keep [`Generator::suffixed_package_names`]
-//! and [`Generator::extern_type_path`] in sync with your micropb-gen settings.
+//! `Message_` modules for nested types). Keep
+//! [`with_suffixed_package_names`](Generator::with_suffixed_package_names) and
+//! [`with_extern_type_path`](Generator::with_extern_type_path) in sync with
+//! your micropb-gen settings.
 //!
 //! [protolink]: https://github.com/thives/protolink.rs
 //! [`micropb-gen`]: https://docs.rs/micropb-gen
@@ -137,54 +160,97 @@ impl From<io::Error> for Error {
     }
 }
 
-/// Code generator configuration.
+/// Code generator configuration, for the message backend `B`.
+///
+/// Created by [`Generator::micropb`] or, with the `prost` feature,
+/// [`Generator::prost`], and configured with consuming `with_*` methods.
+/// Settings that only one backend understands exist only on that backend's
+/// generator:
+///
+/// ```no_run
+/// let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
+/// protolink_grpc_gen::Generator::micropb()
+///     .with_messages_path("crate::messages")
+///     .with_file_descriptor_set_path(out.join("fdset.bin"))
+///     .compile_protos(&["proto/service.proto"], out.join("grpc.rs"))
+///     .unwrap();
+/// ```
 #[derive(Debug, Clone)]
-pub struct Generator {
+pub struct Generator<B = Micropb> {
     includes: Vec<PathBuf>,
     use_protoc: bool,
     fdset_path: Option<PathBuf>,
-    messages_path: String,
     runtime_path: String,
-    suffixed_package_names: bool,
-    extern_paths: HashMap<String, String>,
     server: bool,
     client: bool,
     blocking_client: bool,
+    backend: B,
 }
 
-impl Default for Generator {
-    fn default() -> Self {
-        Self::new()
+/// The micropb backend of a [`Generator`]: bindings for messages generated by
+/// `micropb-gen`. Holds the settings that mirror micropb-gen's naming.
+#[derive(Debug, Clone)]
+pub struct Micropb {
+    messages_path: String,
+    suffixed_package_names: bool,
+    extern_paths: HashMap<String, String>,
+}
+
+/// The prost backend of a [`Generator`]: bindings for messages generated by
+/// `prost-build`, which resolves the message type names itself.
+#[cfg(feature = "prost")]
+#[derive(Debug, Clone, Default)]
+pub struct Prost {
+    modules: Vec<(String, String)>,
+}
+
+impl Generator<Micropb> {
+    /// A generator of bindings for `micropb-gen` messages, with default
+    /// settings: server, async and blocking clients, runtime at
+    /// `::protolink::grpc`.
+    pub fn micropb() -> Self {
+        Self::with_backend(Micropb {
+            messages_path: String::new(),
+            suffixed_package_names: true,
+            extern_paths: HashMap::new(),
+        })
     }
 }
 
-impl Generator {
-    /// New generator with default settings.
-    pub fn new() -> Self {
+#[cfg(feature = "prost")]
+impl Generator<Prost> {
+    /// A generator of bindings for `prost-build` messages, with default
+    /// settings: server, async and blocking clients, runtime at
+    /// `::protolink::grpc`.
+    pub fn prost() -> Self {
+        Self::with_backend(Prost::default())
+    }
+}
+
+impl<B> Generator<B> {
+    fn with_backend(backend: B) -> Self {
         Self {
             includes: Vec::new(),
             use_protoc: false,
             fdset_path: None,
-            messages_path: String::new(),
             runtime_path: "::protolink::grpc".into(),
-            suffixed_package_names: true,
-            extern_paths: HashMap::new(),
             server: true,
             client: true,
             blocking_client: true,
+            backend,
         }
     }
 
     /// Add an include directory for import resolution. Defaults to the parent
     /// directory of every input file.
-    pub fn include(&mut self, path: impl Into<PathBuf>) -> &mut Self {
+    pub fn with_include(mut self, path: impl Into<PathBuf>) -> Self {
         self.includes.push(path.into());
         self
     }
 
     /// Parse with `protoc` (from `PROTOC` or `PATH`) instead of the built-in
     /// pure-Rust parser.
-    pub fn use_protoc(&mut self, flag: bool) -> &mut Self {
+    pub fn with_protoc(mut self, flag: bool) -> Self {
         self.use_protoc = flag;
         self
     }
@@ -192,76 +258,34 @@ impl Generator {
     /// Also write the parsed `FileDescriptorSet` here. Feed it to
     /// `micropb_gen::Generator::compile_fdset_file` to generate the messages
     /// from the exact same parse, without needing `protoc`.
-    pub fn file_descriptor_set_path(&mut self, path: impl Into<PathBuf>) -> &mut Self {
+    pub fn with_file_descriptor_set_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.fdset_path = Some(path.into());
-        self
-    }
-
-    /// Rust path of the module containing the micropb-generated code, as seen
-    /// from where the generated file is `include!`d. Empty (default) means the
-    /// same module. Paths starting with `crate::` or `::` are absolute.
-    pub fn messages_path(&mut self, path: impl Into<String>) -> &mut Self {
-        self.messages_path = path.into();
         self
     }
 
     /// Path of the protolink gRPC runtime. Defaults to `::protolink::grpc`;
     /// use `::protolink_grpc` when depending on `protolink-grpc` directly.
-    pub fn runtime_path(&mut self, path: impl Into<String>) -> &mut Self {
+    pub fn with_runtime_path(mut self, path: impl Into<String>) -> Self {
         self.runtime_path = path.into();
         self
     }
 
-    /// Mirror of `micropb_gen::Generator::suffixed_package_names` (default `true`).
-    pub fn suffixed_package_names(&mut self, flag: bool) -> &mut Self {
-        self.suffixed_package_names = flag;
-        self
-    }
-
-    /// Mirror of `micropb_gen::Generator::extern_type_path`: use `rust_path`
-    /// for the fully-qualified protobuf type `proto_path` (e.g. `.pkg.Msg`).
-    pub fn extern_type_path(
-        &mut self,
-        proto_path: impl AsRef<str>,
-        rust_path: impl Into<String>,
-    ) -> &mut Self {
-        let p = proto_path.as_ref();
-        let p = if p.starts_with('.') {
-            p.to_owned()
-        } else {
-            format!(".{p}")
-        };
-        self.extern_paths.insert(p, rust_path.into());
-        self
-    }
-
-    /// Generate service traits and server wrappers (default `true`).
-    pub fn server(&mut self, flag: bool) -> &mut Self {
+    /// Generate service traits and dispatchers (default `true`).
+    pub fn with_server(mut self, flag: bool) -> Self {
         self.server = flag;
         self
     }
 
     /// Generate async clients (default `true`).
-    pub fn client(&mut self, flag: bool) -> &mut Self {
+    pub fn with_client(mut self, flag: bool) -> Self {
         self.client = flag;
         self
     }
 
     /// Generate blocking clients (default `true`).
-    pub fn blocking_client(&mut self, flag: bool) -> &mut Self {
+    pub fn with_blocking_client(mut self, flag: bool) -> Self {
         self.blocking_client = flag;
         self
-    }
-
-    /// Parse `protos` and write the bindings for all their services to `out_file`.
-    pub fn compile_protos(
-        &self,
-        protos: &[impl AsRef<Path>],
-        out_file: impl AsRef<Path>,
-    ) -> Result<(), Error> {
-        let parsed = self.parse_protos(protos)?;
-        fs::write(out_file, self.generate(&parsed.inputs.file)?)?;
-        Ok(())
     }
 
     /// Parse `protos`, normalizing the descriptors for consumers. The set of
@@ -316,6 +340,60 @@ impl Generator {
         })
     }
 
+    fn emitter(&self, codec: Codec) -> Emitter {
+        Emitter {
+            runtime_path: self.runtime_path.clone(),
+            server: self.server,
+            client: self.client,
+            blocking_client: self.blocking_client,
+            codec,
+        }
+    }
+}
+
+impl Generator<Micropb> {
+    /// Rust path of the module containing the micropb-generated code, as seen
+    /// from where the generated file is `include!`d. Empty (default) means the
+    /// same module. Paths starting with `crate::` or `::` are absolute.
+    pub fn with_messages_path(mut self, path: impl Into<String>) -> Self {
+        self.backend.messages_path = path.into();
+        self
+    }
+
+    /// Mirror of `micropb_gen::Generator::suffixed_package_names` (default `true`).
+    pub fn with_suffixed_package_names(mut self, flag: bool) -> Self {
+        self.backend.suffixed_package_names = flag;
+        self
+    }
+
+    /// Mirror of `micropb_gen::Generator::extern_type_path`: use `rust_path`
+    /// for the fully-qualified protobuf type `proto_path` (e.g. `.pkg.Msg`).
+    pub fn with_extern_type_path(
+        mut self,
+        proto_path: impl AsRef<str>,
+        rust_path: impl Into<String>,
+    ) -> Self {
+        let p = proto_path.as_ref();
+        let p = if p.starts_with('.') {
+            p.to_owned()
+        } else {
+            format!(".{p}")
+        };
+        self.backend.extern_paths.insert(p, rust_path.into());
+        self
+    }
+
+    /// Parse `protos` and write the bindings for all their services to `out_file`.
+    pub fn compile_protos(
+        &self,
+        protos: &[impl AsRef<Path>],
+        out_file: impl AsRef<Path>,
+    ) -> Result<(), Error> {
+        let parsed = self.parse_protos(protos)?;
+        fs::write(out_file, self.generate(&parsed.inputs.file)?)?;
+        Ok(())
+    }
+
     /// Generate bindings from an encoded `FileDescriptorSet` (e.g. written by
     /// `protoc -o` or micropb-gen's `file_descriptor_set_path`).
     pub fn compile_fdset_file(
@@ -328,77 +406,6 @@ impl Generator {
             FileDescriptorSet::parse_from_bytes(&bytes).map_err(|e| Error::Parse(e.to_string()))?;
         fs::write(out_file, self.generate(&set.file)?)?;
         Ok(())
-    }
-
-    /// Service generator for `prost-build` that emits bindings for the `Prost`
-    /// codec, configured like this generator (`server`, `client`,
-    /// `blocking_client`, `runtime_path`). The micropb-specific settings
-    /// (`messages_path`, `suffixed_package_names`, `extern_type_path`) do not
-    /// apply: prost names the message types.
-    ///
-    /// Use it directly if you configure `prost_build::Config` yourself.
-    #[cfg(feature = "prost")]
-    pub fn prost_service_generator(&self) -> ProstServiceGenerator {
-        ProstServiceGenerator::with_emitter(Emitter {
-            codec: Codec::Prost,
-            ..self.emitter()
-        })
-    }
-
-    /// Parse `protos` and run `config` on the descriptors to generate both the
-    /// prost messages and the gRPC bindings, which end up in the package
-    /// modules prost writes. Needs no `protoc`, unless
-    /// [`use_protoc`](Self::use_protoc) is set.
-    ///
-    /// The service generator of `config` is replaced.
-    #[cfg(feature = "prost")]
-    pub fn compile_protos_with_prost(
-        &self,
-        protos: &[impl AsRef<Path>],
-        config: &mut prost_build::Config,
-    ) -> Result<(), Error> {
-        let parsed = self.parse_protos(protos)?;
-        self.compile_set_with_prost(&parsed.all, config)
-    }
-
-    /// [`compile_protos_with_prost`](Self::compile_protos_with_prost) for an
-    /// encoded `FileDescriptorSet`, which must include the imported files
-    /// (`protoc --include_imports`).
-    #[cfg(feature = "prost")]
-    pub fn compile_fdset_file_with_prost(
-        &self,
-        fdset: impl AsRef<Path>,
-        config: &mut prost_build::Config,
-    ) -> Result<(), Error> {
-        let bytes = fs::read(fdset)?;
-        let set =
-            FileDescriptorSet::parse_from_bytes(&bytes).map_err(|e| Error::Parse(e.to_string()))?;
-        self.compile_set_with_prost(&set, config)
-    }
-
-    #[cfg(feature = "prost")]
-    fn compile_set_with_prost(
-        &self,
-        set: &FileDescriptorSet,
-        config: &mut prost_build::Config,
-    ) -> Result<(), Error> {
-        use prost::Message as _;
-
-        let bytes = set
-            .write_to_bytes()
-            .map_err(|e| Error::Parse(e.to_string()))?;
-        let fds = prost_types::FileDescriptorSet::decode(bytes.as_slice())
-            .map_err(|e| Error::Parse(e.to_string()))?;
-        let service_generator = self.prost_service_generator();
-        let errors = service_generator.error_log();
-        config.service_generator(Box::new(service_generator));
-        config.compile_fds(fds)?;
-        let errors = errors.take();
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(Error::Parse(errors.join("\n")))
-        }
     }
 
     /// Generate the Rust source for all services in `files`.
@@ -467,7 +474,7 @@ impl Generator {
             }
         }
 
-        let emitter = self.emitter();
+        let emitter = self.emitter(Codec::Micropb);
         let mut out = String::from("// @generated by protolink-grpc-gen. DO NOT EDIT.\n");
         for (package, svc, module) in chosen {
             let service = self.resolve_service(package, svc, &module)?;
@@ -482,13 +489,14 @@ impl Generator {
     fn reserved_root_names(&self, files: &[FileDescriptorProto]) -> BTreeMap<String, String> {
         let mut names = BTreeMap::new();
         let messages_path = self
+            .backend
             .messages_path
             .trim_start_matches("self::")
             .trim_end_matches("::");
         if !messages_path.is_empty() {
             return names;
         }
-        let suffixed = self.suffixed_package_names;
+        let suffixed = self.backend.suffixed_package_names;
         let mut reserve = |name: String, what: String| {
             names.entry(ident_key(&name).to_owned()).or_insert(what);
         };
@@ -532,13 +540,14 @@ impl Generator {
                 "type name `{proto_type}` is not fully qualified"
             )));
         }
-        if let Some(p) = self.extern_paths.get(proto_type) {
+        if let Some(p) = self.backend.extern_paths.get(proto_type) {
             return Ok(p.clone());
         }
         let segs: Vec<&str> = proto_type[1..].split('.').collect();
         let (last, parents) = segs.split_last().expect("non-empty type name");
 
         let base = self
+            .backend
             .messages_path
             .trim_start_matches("self::")
             .trim_end_matches("::");
@@ -551,7 +560,7 @@ impl Generator {
         };
         for p in parents {
             path.push_str("::");
-            path.push_str(&resolve_path_elem(p, self.suffixed_package_names));
+            path.push_str(&resolve_path_elem(p, self.backend.suffixed_package_names));
         }
         path.push_str("::");
         path.push_str(&sanitized_ident(last));
@@ -585,14 +594,86 @@ impl Generator {
             methods,
         })
     }
+}
 
-    fn emitter(&self) -> Emitter {
-        Emitter {
-            runtime_path: self.runtime_path.clone(),
-            server: self.server,
-            client: self.client,
-            blocking_client: self.blocking_client,
-            codec: Codec::Micropb,
+#[cfg(feature = "prost")]
+impl Generator<Prost> {
+    /// Use `module` instead of `<service>_grpc` for the fully-qualified
+    /// protobuf service `service`, see
+    /// [`ProstServiceGenerator::with_service_module`].
+    pub fn with_service_module(
+        mut self,
+        service: impl AsRef<str>,
+        module: impl Into<String>,
+    ) -> Self {
+        self.backend
+            .modules
+            .push((service.as_ref().to_owned(), module.into()));
+        self
+    }
+
+    /// Service generator for `prost-build` that emits bindings for the `Prost`
+    /// codec, configured like this generator.
+    ///
+    /// Use it directly if you configure `prost_build::Config` yourself.
+    pub fn service_generator(&self) -> ProstServiceGenerator {
+        let mut generator = ProstServiceGenerator::with_emitter(self.emitter(Codec::Prost));
+        for (service, module) in &self.backend.modules {
+            generator = generator.with_service_module(service, module.clone());
+        }
+        generator
+    }
+
+    /// Parse `protos` and run `config` on the descriptors to generate both the
+    /// prost messages and the gRPC bindings, which end up in the package
+    /// modules prost writes. Needs no `protoc`, unless
+    /// [`with_protoc`](Self::with_protoc) is set.
+    ///
+    /// The service generator of `config` is replaced.
+    pub fn compile_protos(
+        &self,
+        protos: &[impl AsRef<Path>],
+        config: &mut prost_build::Config,
+    ) -> Result<(), Error> {
+        let parsed = self.parse_protos(protos)?;
+        self.compile_set(&parsed.all, config)
+    }
+
+    /// [`compile_protos`](Self::compile_protos) for an encoded
+    /// `FileDescriptorSet`, which must include the imported files
+    /// (`protoc --include_imports`).
+    pub fn compile_fdset_file(
+        &self,
+        fdset: impl AsRef<Path>,
+        config: &mut prost_build::Config,
+    ) -> Result<(), Error> {
+        let bytes = fs::read(fdset)?;
+        let set =
+            FileDescriptorSet::parse_from_bytes(&bytes).map_err(|e| Error::Parse(e.to_string()))?;
+        self.compile_set(&set, config)
+    }
+
+    fn compile_set(
+        &self,
+        set: &FileDescriptorSet,
+        config: &mut prost_build::Config,
+    ) -> Result<(), Error> {
+        use prost::Message as _;
+
+        let bytes = set
+            .write_to_bytes()
+            .map_err(|e| Error::Parse(e.to_string()))?;
+        let fds = prost_types::FileDescriptorSet::decode(bytes.as_slice())
+            .map_err(|e| Error::Parse(e.to_string()))?;
+        let service_generator = self.service_generator();
+        let errors = service_generator.error_log();
+        config.service_generator(Box::new(service_generator));
+        config.compile_fds(fds)?;
+        let errors = errors.take();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::Parse(errors.join("\n")))
         }
     }
 }
@@ -729,13 +810,20 @@ impl Emitter {
                 m.konst, m.name
             );
         }
-        let list: Vec<&str> = methods.iter().map(|m| m.konst.as_str()).collect();
-        let _ = writeln!(w, "    /// All method paths.");
         let _ = writeln!(
             w,
-            "    pub const METHODS: &[&::core::primitive::str] = &[{}];",
-            list.join(", ")
+            "    /// Every method: its path, shape and identifier (the index in this table)."
         );
+        let _ = writeln!(w, "    pub const METHODS: &[__rt::MethodDescriptor] = &[");
+        for (index, m) in methods.iter().enumerate() {
+            let _ = writeln!(
+                w,
+                "        __rt::MethodDescriptor::new({}, __rt::MethodKind::{}, {index}),",
+                m.konst,
+                m.kind.runtime_name()
+            );
+        }
+        let _ = writeln!(w, "    ];");
 
         if self.server {
             self.gen_server(w, full, name, methods, streaming);
@@ -752,7 +840,21 @@ impl Emitter {
 
     fn gen_server(&self, w: &mut String, full: &str, name: &str, methods: &[M], streaming: bool) {
         let codec = format!("__rt::codec::{}", self.codec.name());
+        let unary = methods.iter().any(|m| m.kind == Kind::Unary);
+        let bidi = methods.iter().any(|m| m.kind == Kind::Bidi);
+        let fns: Vec<TraitFn> = methods.iter().flat_map(TraitFn::of).collect();
+
+        // The service trait.
         let _ = writeln!(w, "\n    /// Server-side implementation of `{full}`.");
+        let _ = writeln!(
+            w,
+            "    ///\n    \
+             /// Implement it on the application's own type; it has no transport or\n    \
+             /// executor requirements. Serve it with [`{name}Dispatch`] or, together with\n    \
+             /// other services of the same object, with the runtime's `MultiDispatch`\n    \
+             /// and [`{name}Methods`]. It is also implemented for `&mut S`, so a\n    \
+             /// dispatcher can borrow the implementation."
+        );
         if streaming {
             let _ = writeln!(
                 w,
@@ -767,213 +869,122 @@ impl Emitter {
             );
         }
         let _ = writeln!(w, "    pub trait {name} {{");
-        let mut first = true;
-        for m in methods {
-            if !first {
+        for (i, f) in fns.iter().enumerate() {
+            if i > 0 {
                 w.push('\n');
             }
-            first = false;
-            let (n, func, req, resp) = (&m.name, &m.func, &m.req, &m.resp);
-            let (poll, end, cancel) = (&m.poll, &m.end, &m.cancel);
-            let unimpl = format!("__rt::Status::unimplemented(\"`{n}` is not implemented\")");
-            let start = |w: &mut String, doc: &str| {
-                let _ = writeln!(
-                    w,
-                    "        /// {doc}\n        \
-                     fn {func}(&mut self, ctx: &mut __rt::CallContext<'_>, request: {req}) -> ::core::result::Result<(), __rt::Status> {{\n            \
-                     let _ = (ctx, request);\n            \
-                     Err({unimpl})\n        }}\n"
-                );
-            };
-            let poll_stream = |w: &mut String, doc: &str| {
-                let _ = writeln!(
-                    w,
-                    "        /// {doc}\n        \
-                     /// Return `Next::Message` for each response, then `Next::Done` with\n        \
-                     /// the final status.\n        \
-                     fn {poll}(&mut self, ctx: &mut __rt::CallContext<'_>, cx: &mut __rt::__private::Context<'_>) -> __rt::__private::Poll<__rt::Next<{resp}>> {{\n            \
-                     let _ = (ctx, cx);\n            \
-                     __rt::__private::Poll::Ready(__rt::Next::Done(Err({unimpl})))\n        }}\n"
-                );
-            };
-            let cancel_fn = |w: &mut String| {
-                let _ = writeln!(
-                    w,
-                    "        /// A `{n}` call ended without the service finishing it (cancelled,\n        \
-                     /// reset, malformed or the connection closed): release its state.\n        \
-                     fn {cancel}(&mut self, ctx: &mut __rt::CallContext<'_>) {{\n            \
-                     let _ = ctx;\n        }}"
-                );
-            };
-            match m.kind {
-                Kind::Unary => {
-                    let _ = writeln!(
-                        w,
-                        "        /// Handle `{n}`.\n        \
-                         fn {func}(&mut self, ctx: &mut __rt::CallContext<'_>, request: {req}) -> ::core::result::Result<{resp}, __rt::Status>;"
-                    );
+            for line in f.doc.lines() {
+                let _ = writeln!(w, "        /// {line}");
+            }
+            match &f.default {
+                Some(body) => {
+                    let _ = writeln!(w, "        {} {{\n            {body}\n        }}", f.sig);
                 }
-                Kind::Server => {
-                    start(
-                        w,
-                        &format!(
-                            "Start a `{n}` call (server streaming) with its request.\n        \
-                             /// Responses are then pulled with `{poll}`."
-                        ),
-                    );
-                    poll_stream(w, &format!("Next response of a `{n}` call."));
-                    cancel_fn(w);
-                }
-                Kind::Client => {
-                    start(
-                        w,
-                        &format!(
-                            "One request message of a `{n}` call (client streaming), in order."
-                        ),
-                    );
-                    let _ = writeln!(
-                        w,
-                        "        /// The response of a `{n}` call, polled once the client has sent\n        \
-                         /// all of its requests.\n        \
-                         fn {poll}(&mut self, ctx: &mut __rt::CallContext<'_>, cx: &mut __rt::__private::Context<'_>) -> __rt::__private::Poll<::core::result::Result<{resp}, __rt::Status>> {{\n            \
-                         let _ = (ctx, cx);\n            \
-                         __rt::__private::Poll::Ready(Err({unimpl}))\n        }}\n"
-                    );
-                    cancel_fn(w);
-                }
-                Kind::Bidi => {
-                    start(
-                        w,
-                        &format!(
-                            "One request message of a `{n}` call (bidirectional streaming),\n        \
-                             /// in order."
-                        ),
-                    );
-                    let _ = writeln!(
-                        w,
-                        "        /// The client finished sending requests on a `{n}` call.\n        \
-                         fn {end}(&mut self, ctx: &mut __rt::CallContext<'_>) -> ::core::result::Result<(), __rt::Status> {{\n            \
-                         let _ = ctx;\n            \
-                         Ok(())\n        }}\n"
-                    );
-                    poll_stream(
-                        w,
-                        &format!(
-                            "Next response of a `{n}` call, polled from the start of the call."
-                        ),
-                    );
-                    cancel_fn(w);
+                None => {
+                    let _ = writeln!(w, "        {};", f.sig);
                 }
             }
         }
         let _ = writeln!(w, "    }}\n");
-        let _ = writeln!(
-            w,
-            "    /// Routes `{full}` requests to a [`{name}`] implementation.\n    \
-             #[derive(Debug, Clone, Default)]\n    \
-             pub struct {name}Server<S>(pub S);\n\n    \
-             impl<S> {name}Server<S> {{\n        \
-             /// Wrap a service implementation.\n        \
-             pub fn new(service: S) -> Self {{\n            Self(service)\n        }}\n\n        \
-             /// Unwrap the service implementation.\n        \
-             pub fn into_inner(self) -> S {{\n            self.0\n        }}\n    }}\n"
-        );
-        let _ = writeln!(
-            w,
-            "    impl<S: self::{name}> __rt::Handler for {name}Server<S> {{"
-        );
 
-        // Unary dispatch.
+        // Forwarding for borrowed implementations.
         let _ = writeln!(
             w,
-            "        fn call(&mut self, ctx: &mut __rt::CallContext<'_>, request: &[::core::primitive::u8]) -> ::core::option::Option<::core::result::Result<__rt::__private::Vec<::core::primitive::u8>, __rt::Status>> {{\n            \
-             match ctx.path {{"
+            "    impl<S: self::{name} + ?::core::marker::Sized> self::{name} for &mut S {{"
         );
-        for m in methods {
-            if m.kind == Kind::Unary {
-                let _ = writeln!(
-                    w,
-                    "                {} => Some(__rt::codec::unary::<{codec}, _, _>(request, |req| <S as self::{name}>::{}(&mut self.0, ctx, req))),",
-                    m.konst, m.func
-                );
-            } else {
-                let _ = writeln!(
-                    w,
-                    "                {} => Some(Err(__rt::Status::unimplemented(\"`{}` is a streaming method\"))),",
-                    m.konst, m.name
-                );
+        for (i, f) in fns.iter().enumerate() {
+            if i > 0 {
+                w.push('\n');
             }
-        }
-        let _ = writeln!(
-            w,
-            "                _ => None,\n            }}\n        }}\n"
-        );
-
-        // Method kinds.
-        let _ = writeln!(
-            w,
-            "        fn method_kind(&self, path: &::core::primitive::str) -> ::core::option::Option<__rt::MethodKind> {{\n            \
-             match path {{"
-        );
-        for m in methods {
             let _ = writeln!(
                 w,
-                "                {} => Some(__rt::MethodKind::{}),",
-                m.konst,
-                m.kind.runtime_name()
+                "        {} {{\n            <S as self::{name}>::{}(&mut **self, {})\n        }}",
+                f.sig, f.name, f.args
             );
         }
-        let _ = writeln!(w, "                _ => None,\n            }}\n        }}");
+        let _ = writeln!(w, "    }}\n");
 
-        // Paths this service does not serve at all.
+        // The stateless method table, applied to any implementation.
         let _ = writeln!(
             w,
-            "\n        fn is_unknown_method(&self, path: &::core::primitive::str) -> ::core::primitive::bool {{\n            \
-             self.method_kind(path).is_none()\n        }}"
+            "    /// The methods of `{full}` for any [`{name}`] implementation: the stateless\n    \
+             /// descriptor that lets one application object serve several services\n    \
+             /// through the runtime's `MultiDispatch`.\n    \
+             #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]\n    \
+             pub struct {name}Methods;\n"
         );
-
+        let _ = writeln!(
+            w,
+            "    impl<S: self::{name} + ?::core::marker::Sized> __rt::ServiceMethods<S> for {name}Methods {{\n        \
+             fn methods(&self) -> &'static [__rt::MethodDescriptor] {{\n            METHODS\n        }}"
+        );
+        let unknown = "__rt::Status::unimplemented(\"unknown method\")";
+        let ctx_ty = "&mut __rt::CallContext<'_>";
+        let bytes = "&[::core::primitive::u8]";
+        let vec = "__rt::__private::Vec<::core::primitive::u8>";
+        let indexed = || methods.iter().enumerate();
+        if unary {
+            let _ = writeln!(
+                w,
+                "\n        fn call(&self, service: &mut S, ctx: {ctx_ty}, request: {bytes}) -> ::core::result::Result<{vec}, __rt::Status> {{\n            \
+                 match ctx.route.method {{"
+            );
+            for (i, m) in indexed().filter(|(_, m)| m.kind == Kind::Unary) {
+                let _ = writeln!(
+                    w,
+                    "                {i} => __rt::codec::unary::<{codec}, _, _>(request, |req| <S as self::{name}>::{}(service, ctx, req)),",
+                    m.func
+                );
+            }
+            let _ = writeln!(
+                w,
+                "                _ => Err({unknown}),\n            }}\n        }}"
+            );
+        }
         if streaming {
-            let streams = || methods.iter().filter(|m| m.kind != Kind::Unary);
+            let streams = || indexed().filter(|(_, m)| m.kind != Kind::Unary);
             let _ = writeln!(
                 w,
-                "\n        fn on_message(&mut self, ctx: &mut __rt::CallContext<'_>, message: &[::core::primitive::u8]) -> ::core::result::Result<(), __rt::Status> {{\n            \
-                 match ctx.path {{"
+                "\n        fn on_message(&self, service: &mut S, ctx: {ctx_ty}, message: {bytes}) -> ::core::result::Result<(), __rt::Status> {{\n            \
+                 match ctx.route.method {{"
             );
-            for m in streams() {
+            for (i, m) in streams() {
                 let _ = writeln!(
                     w,
-                    "                {} => __rt::codec::message::<{codec}, _>(message, |req| <S as self::{name}>::{}(&mut self.0, ctx, req)),",
-                    m.konst, m.func
+                    "                {i} => __rt::codec::message::<{codec}, _>(message, |req| <S as self::{name}>::{}(service, ctx, req)),",
+                    m.func
                 );
             }
             let _ = writeln!(
                 w,
-                "                _ => Err(__rt::Status::unimplemented(\"unknown method\")),\n            }}\n        }}"
+                "                _ => Err({unknown}),\n            }}\n        }}"
             );
 
-            let _ = writeln!(
-                w,
-                "\n        fn on_half_close(&mut self, ctx: &mut __rt::CallContext<'_>) -> ::core::result::Result<(), __rt::Status> {{\n            \
-                 match ctx.path {{"
-            );
-            for m in streams().filter(|m| m.kind == Kind::Bidi) {
+            if bidi {
                 let _ = writeln!(
                     w,
-                    "                {} => <S as self::{name}>::{}(&mut self.0, ctx),",
-                    m.konst, m.end
+                    "\n        fn on_half_close(&self, service: &mut S, ctx: {ctx_ty}) -> ::core::result::Result<(), __rt::Status> {{\n            \
+                     match ctx.route.method {{"
+                );
+                for (i, m) in streams().filter(|(_, m)| m.kind == Kind::Bidi) {
+                    let _ = writeln!(
+                        w,
+                        "                {i} => <S as self::{name}>::{}(service, ctx),",
+                        m.end
+                    );
+                }
+                let _ = writeln!(
+                    w,
+                    "                _ => Ok(()),\n            }}\n        }}"
                 );
             }
-            let _ = writeln!(
-                w,
-                "                _ => Ok(()),\n            }}\n        }}"
-            );
 
             let _ = writeln!(
                 w,
-                "\n        fn poll_response(&mut self, ctx: &mut __rt::CallContext<'_>, cx: &mut __rt::__private::Context<'_>) -> __rt::__private::Poll<__rt::Next<__rt::__private::Vec<::core::primitive::u8>>> {{\n            \
-                 match ctx.path {{"
+                "\n        fn poll_response(&self, service: &mut S, ctx: {ctx_ty}, cx: &mut __rt::__private::Context<'_>) -> __rt::__private::Poll<__rt::Next<{vec}>> {{\n            \
+                 match ctx.route.method {{"
             );
-            for m in streams() {
+            for (i, m) in streams() {
                 let helper = if m.kind == Kind::Client {
                     "poll_single"
                 } else {
@@ -981,30 +992,220 @@ impl Emitter {
                 };
                 let _ = writeln!(
                     w,
-                    "                {} => __rt::codec::{helper}::<{codec}, _>(<S as self::{name}>::{}(&mut self.0, ctx, cx)),",
-                    m.konst, m.poll
+                    "                {i} => __rt::codec::{helper}::<{codec}, _>(<S as self::{name}>::{}(service, ctx, cx)),",
+                    m.poll
                 );
             }
             let _ = writeln!(
                 w,
-                "                _ => __rt::__private::Poll::Ready(__rt::Next::Done(Err(__rt::Status::unimplemented(\"unknown method\")))),\n            }}\n        }}"
+                "                _ => __rt::__private::Poll::Ready(__rt::Next::Done(Err({unknown}))),\n            }}\n        }}"
             );
 
             let _ = writeln!(
                 w,
-                "\n        fn on_cancel(&mut self, ctx: &mut __rt::CallContext<'_>) {{\n            \
-                 match ctx.path {{"
+                "\n        fn on_cancel(&self, service: &mut S, ctx: {ctx_ty}) {{\n            \
+                 match ctx.route.method {{"
             );
-            for m in streams() {
+            for (i, m) in streams() {
                 let _ = writeln!(
                     w,
-                    "                {} => <S as self::{name}>::{}(&mut self.0, ctx),",
-                    m.konst, m.cancel
+                    "                {i} => <S as self::{name}>::{}(service, ctx),",
+                    m.cancel
                 );
             }
             let _ = writeln!(w, "                _ => {{}}\n            }}\n        }}");
         }
-        let _ = writeln!(w, "    }}");
+        let _ = writeln!(w, "    }}\n");
+
+        // The dispatcher of a single implementation.
+        let _ = writeln!(
+            w,
+            "    /// Serves `{full}` from one [`{name}`] implementation, owned or borrowed:\n    \
+             /// `{name}Dispatch::new(service)` or `{name}Dispatch::new(&mut service)`.\n    \
+             ///\n    \
+             /// Hand it to a server driver's `serve`, or register it with other services in\n    \
+             /// the runtime's `Registry`.\n    \
+             #[derive(Debug, Clone, Default)]\n    \
+             pub struct {name}Dispatch<S> {{\n        service: S,\n    }}\n\n    \
+             impl<S> {name}Dispatch<S> {{\n        \
+             /// Serve `service`.\n        \
+             pub fn new(service: S) -> Self {{\n            Self {{ service }}\n        }}\n\n        \
+             /// The service implementation.\n        \
+             pub fn get_ref(&self) -> &S {{\n            &self.service\n        }}\n\n        \
+             /// The service implementation, mutably.\n        \
+             pub fn get_mut(&mut self) -> &mut S {{\n            &mut self.service\n        }}\n\n        \
+             /// Unwrap the service implementation.\n        \
+             pub fn into_inner(self) -> S {{\n            self.service\n        }}\n    }}\n"
+        );
+        let forward = |w: &mut String, sig: &str, call: &str| {
+            let _ = writeln!(
+                w,
+                "\n        {sig} {{\n            __rt::ServiceMethods::<S>::{call}\n        }}"
+            );
+        };
+        let _ = writeln!(
+            w,
+            "    impl<S: self::{name}> __rt::Handler for {name}Dispatch<S> {{\n        \
+             fn route(&self, path: &::core::primitive::str) -> ::core::option::Option<__rt::Route> {{\n            \
+             __rt::Route::find(METHODS, path)\n        }}"
+        );
+        if unary {
+            forward(
+                w,
+                &format!(
+                    "fn call(&mut self, ctx: {ctx_ty}, request: {bytes}) -> ::core::result::Result<{vec}, __rt::Status>"
+                ),
+                &format!("call(&self::{name}Methods, &mut self.service, ctx, request)"),
+            );
+        }
+        if streaming {
+            forward(
+                w,
+                &format!(
+                    "fn on_message(&mut self, ctx: {ctx_ty}, message: {bytes}) -> ::core::result::Result<(), __rt::Status>"
+                ),
+                &format!("on_message(&self::{name}Methods, &mut self.service, ctx, message)"),
+            );
+            if bidi {
+                forward(
+                    w,
+                    &format!(
+                        "fn on_half_close(&mut self, ctx: {ctx_ty}) -> ::core::result::Result<(), __rt::Status>"
+                    ),
+                    &format!("on_half_close(&self::{name}Methods, &mut self.service, ctx)"),
+                );
+            }
+            forward(
+                w,
+                &format!(
+                    "fn poll_response(&mut self, ctx: {ctx_ty}, cx: &mut __rt::__private::Context<'_>) -> __rt::__private::Poll<__rt::Next<{vec}>>"
+                ),
+                &format!("poll_response(&self::{name}Methods, &mut self.service, ctx, cx)"),
+            );
+            forward(
+                w,
+                &format!("fn on_cancel(&mut self, ctx: {ctx_ty})"),
+                &format!("on_cancel(&self::{name}Methods, &mut self.service, ctx)"),
+            );
+        }
+        let _ = writeln!(w, "    }}\n");
+        let _ = writeln!(
+            w,
+            "    impl<S: self::{name}> __rt::Dispatcher for {name}Dispatch<S> {{\n        \
+             fn methods(&self) -> &[__rt::MethodDescriptor] {{\n            METHODS\n        }}\n    }}"
+        );
+    }
+}
+
+/// One method of a generated service trait.
+struct TraitFn {
+    name: String,
+    /// Doc comment lines, without the `///`.
+    doc: String,
+    /// `fn name(&mut self, ...) -> ...`
+    sig: String,
+    /// The arguments after `self`, for forwarding.
+    args: &'static str,
+    /// Default body, or `None` for a required method.
+    default: Option<String>,
+}
+
+impl TraitFn {
+    /// The trait methods generated for `m`.
+    fn of(m: &M) -> Vec<TraitFn> {
+        let (n, func, req, resp) = (&m.name, &m.func, &m.req, &m.resp);
+        let (poll, end, cancel) = (&m.poll, &m.end, &m.cancel);
+        let ctx = "ctx: &mut __rt::CallContext<'_>";
+        let cx = "cx: &mut __rt::__private::Context<'_>";
+        let unimpl = format!("__rt::Status::unimplemented(\"`{n}` is not implemented\")");
+        let start = |doc: String| TraitFn {
+            name: func.clone(),
+            doc,
+            sig: format!(
+                "fn {func}(&mut self, {ctx}, request: {req}) -> ::core::result::Result<(), __rt::Status>"
+            ),
+            args: "ctx, request",
+            default: Some(format!(
+                "let _ = (ctx, request);\n            Err({unimpl})"
+            )),
+        };
+        let poll_stream = |doc: String| TraitFn {
+            name: poll.clone(),
+            doc: format!(
+                "{doc}\nReturn `Next::Message` for each response, then `Next::Done` with\nthe final status."
+            ),
+            sig: format!(
+                "fn {poll}(&mut self, {ctx}, {cx}) -> __rt::__private::Poll<__rt::Next<{resp}>>"
+            ),
+            args: "ctx, cx",
+            default: Some(format!(
+                "let _ = (ctx, cx);\n            __rt::__private::Poll::Ready(__rt::Next::Done(Err({unimpl})))"
+            )),
+        };
+        let cancel_fn = TraitFn {
+            name: cancel.clone(),
+            doc: format!(
+                "A `{n}` call ended without the service finishing it (cancelled,\nreset, malformed or the connection closed): release its state."
+            ),
+            sig: format!("fn {cancel}(&mut self, {ctx})"),
+            args: "ctx",
+            default: Some("let _ = ctx;".into()),
+        };
+        match m.kind {
+            Kind::Unary => vec![TraitFn {
+                name: func.clone(),
+                doc: format!("Handle `{n}`."),
+                sig: format!(
+                    "fn {func}(&mut self, {ctx}, request: {req}) -> ::core::result::Result<{resp}, __rt::Status>"
+                ),
+                args: "ctx, request",
+                default: None,
+            }],
+            Kind::Server => vec![
+                start(format!(
+                    "Start a `{n}` call (server streaming) with its request.\nResponses are then pulled with `{poll}`."
+                )),
+                poll_stream(format!("Next response of a `{n}` call.")),
+                cancel_fn,
+            ],
+            Kind::Client => vec![
+                start(format!(
+                    "One request message of a `{n}` call (client streaming), in order."
+                )),
+                TraitFn {
+                    name: poll.clone(),
+                    doc: format!(
+                        "The response of a `{n}` call, polled once the client has sent\nall of its requests."
+                    ),
+                    sig: format!(
+                        "fn {poll}(&mut self, {ctx}, {cx}) -> __rt::__private::Poll<::core::result::Result<{resp}, __rt::Status>>"
+                    ),
+                    args: "ctx, cx",
+                    default: Some(format!(
+                        "let _ = (ctx, cx);\n            __rt::__private::Poll::Ready(Err({unimpl}))"
+                    )),
+                },
+                cancel_fn,
+            ],
+            Kind::Bidi => vec![
+                start(format!(
+                    "One request message of a `{n}` call (bidirectional streaming),\nin order."
+                )),
+                TraitFn {
+                    name: end.clone(),
+                    doc: format!("The client finished sending requests on a `{n}` call."),
+                    sig: format!(
+                        "fn {end}(&mut self, {ctx}) -> ::core::result::Result<(), __rt::Status>"
+                    ),
+                    args: "ctx",
+                    default: Some("let _ = ctx;\n            Ok(())".into()),
+                },
+                poll_stream(format!(
+                    "Next response of a `{n}` call, polled from the start of the call."
+                )),
+                cancel_fn,
+            ],
+        }
     }
 }
 
@@ -1432,7 +1633,7 @@ service Service {
 
     #[test]
     fn micropb_naming() {
-        let g = Generator::new();
+        let g = Generator::micropb();
         assert_eq!(
             g.type_path(".a.b.Command").unwrap(),
             "super::a_::b_::Command"
@@ -1442,16 +1643,16 @@ service Service {
             "super::a_::b_::Command_::Inner"
         );
         assert_eq!(g.type_path(".Top").unwrap(), "super::Top");
-        let mut g = Generator::new();
-        g.suffixed_package_names(false)
-            .messages_path("crate::proto");
+        let g = Generator::micropb()
+            .with_suffixed_package_names(false)
+            .with_messages_path("crate::proto");
         assert_eq!(
             g.type_path(".a.b.Msg").unwrap(),
             "crate::proto::r#a::r#b::Msg"
         );
-        g.extern_type_path(".a.b.Msg", "crate::Custom");
+        let g = g.with_extern_type_path(".a.b.Msg", "crate::Custom");
         assert_eq!(g.type_path(".a.b.Msg").unwrap(), "crate::Custom");
-        g.messages_path("pb");
+        let g = g.with_messages_path("pb");
         assert_eq!(g.type_path(".x.lower").unwrap(), "super::pb::r#x::r#lower");
     }
 
@@ -1461,7 +1662,7 @@ service Service {
         let files = vec![parse(
             "package p; message M {} service __rt { rpc Get(M) returns (M); }",
         )];
-        let src = Generator::new().generate(&files).unwrap();
+        let src = Generator::micropb().generate(&files).unwrap();
         assert!(src.contains("pub trait __rt_ {"), "{src}");
         assert!(src.contains("use ::protolink::grpc as __rt;") || src.contains(" as __rt;"));
     }
@@ -1477,22 +1678,26 @@ service Service {
                     rpc Collect(stream M) returns (M);
                 }}"
             ));
-            let src = Generator::new().generate(&[file]).unwrap();
+            let src = Generator::micropb().generate(&[file]).unwrap();
             for expected in [
                 format!("pub trait {name} {{"),
-                format!("pub struct {name}Server<S>(pub S);"),
+                format!("pub struct {name}Dispatch<S> {{"),
+                format!("pub struct {name}Methods;"),
+                format!(
+                    "impl<S: self::{name} + ?::core::marker::Sized> self::{name} for &mut S {{"
+                ),
                 format!("pub const SERVICE_NAME: &::core::primitive::str = \"p.{name}\";"),
                 format!("pub const METHOD_UNARY: &::core::primitive::str = \"/p.{name}/Unary\";"),
             ] {
                 assert!(src.contains(&expected), "missing `{expected}`:\n{src}");
             }
             for expected in [
-                "pub const METHODS: &[&::core::primitive::str] = &[METHOD_UNARY, METHOD_STREAM, METHOD_FAN, METHOD_COLLECT];",
-                "fn call(&mut self, ctx: &mut __rt::CallContext<'_>, request: &[::core::primitive::u8]) -> ::core::option::Option<::core::result::Result<__rt::__private::Vec<::core::primitive::u8>, __rt::Status>>",
-                "fn method_kind(&self, path: &::core::primitive::str)",
-                "fn is_unknown_method(&self, path: &::core::primitive::str) -> ::core::primitive::bool",
+                "pub const METHODS: &[__rt::MethodDescriptor] = &[",
+                "fn call(&mut self, ctx: &mut __rt::CallContext<'_>, request: &[::core::primitive::u8]) -> ::core::result::Result<__rt::__private::Vec<::core::primitive::u8>, __rt::Status>",
+                "fn route(&self, path: &::core::primitive::str) -> ::core::option::Option<__rt::Route>",
                 "fn on_message(&mut self, ctx: &mut __rt::CallContext<'_>, message: &[::core::primitive::u8])",
                 "fn poll_response(&mut self, ctx: &mut __rt::CallContext<'_>, cx: &mut __rt::__private::Context<'_>) -> __rt::__private::Poll<__rt::Next<__rt::__private::Vec<::core::primitive::u8>>>",
+                "fn methods(&self) -> &'static [__rt::MethodDescriptor]",
             ] {
                 assert!(src.contains(expected), "missing `{expected}`:\n{src}");
             }
@@ -1504,23 +1709,61 @@ service Service {
 
     #[test]
     fn generates_service() {
-        let src = generate(&Generator::new());
+        let src = generate(&Generator::micropb());
         assert!(src.contains(
             "pub const METHOD_COMMAND: &::core::primitive::str = \"/a.b.Service/Command\";"
         ));
-        assert!(src.contains("pub const METHODS: &[&::core::primitive::str] = &[METHOD_COMMAND, METHOD_NESTED, METHOD_EVENT_SUBSCRIBE, METHOD_UPLOAD, METHOD_CHAT];"));
+        // The method table: path, shape and identifier (its index).
+        for line in [
+            "__rt::MethodDescriptor::new(METHOD_COMMAND, __rt::MethodKind::Unary, 0),",
+            "__rt::MethodDescriptor::new(METHOD_NESTED, __rt::MethodKind::Unary, 1),",
+            "__rt::MethodDescriptor::new(METHOD_EVENT_SUBSCRIBE, __rt::MethodKind::ServerStreaming, 2),",
+            "__rt::MethodDescriptor::new(METHOD_UPLOAD, __rt::MethodKind::ClientStreaming, 3),",
+            "__rt::MethodDescriptor::new(METHOD_CHAT, __rt::MethodKind::BidiStreaming, 4),",
+        ] {
+            assert!(src.contains(line), "missing `{line}`");
+        }
         // The call context, with the deadline, reaches the service method.
         assert!(src.contains(
-            "__rt::codec::unary::<__rt::codec::Micropb, _, _>(request, |req| <S as self::Service>::command(&mut self.0, ctx, req))"
+            "0 => __rt::codec::unary::<__rt::codec::Micropb, _, _>(request, |req| <S as self::Service>::command(service, ctx, req)),"
         ));
+        // The dispatcher keeps its implementation private and routes through
+        // the method table.
+        for line in [
+            "pub struct ServiceDispatch<S> {\n        service: S,\n    }",
+            "pub fn get_ref(&self) -> &S {",
+            "pub fn get_mut(&mut self) -> &mut S {",
+            "pub fn into_inner(self) -> S {",
+            "__rt::Route::find(METHODS, path)",
+            "__rt::ServiceMethods::<S>::call(&self::ServiceMethods, &mut self.service, ctx, request)",
+            "impl<S: self::Service> __rt::Dispatcher for ServiceDispatch<S> {",
+        ] {
+            assert!(src.contains(line), "missing `{line}`");
+        }
+        assert!(!src.contains("Server<S>"));
     }
 
     #[test]
     fn generates_streaming_service_methods() {
-        let src = generate(&Generator::new());
+        let src = generate(&Generator::micropb());
         // Streaming methods default to UNIMPLEMENTED; unary ones are required.
-        assert!(src.contains("Err(__rt::Status::unimplemented(\"`Upload` is not implemented\"))"));
-        assert!(!src.contains("fn command(&mut self, ctx: &mut __rt::CallContext<'_>, request: super::a_::b_::Command) -> ::core::result::Result<super::a_::b_::Reply, __rt::Status> {"));
+        let service_trait = &src[src.find("pub trait Service {").unwrap()..];
+        let service_trait = &service_trait[..service_trait.find("\n    }\n").unwrap()];
+        assert!(
+            service_trait
+                .contains("Err(__rt::Status::unimplemented(\"`Upload` is not implemented\"))")
+        );
+        assert!(service_trait.contains("fn command(&mut self, ctx: &mut __rt::CallContext<'_>, request: super::a_::b_::Command) -> ::core::result::Result<super::a_::b_::Reply, __rt::Status>;"));
+        // Every method, required or not, is forwarded for `&mut S`.
+        for line in [
+            "<S as self::Service>::command(&mut **self, ctx, request)",
+            "<S as self::Service>::upload(&mut **self, ctx, request)",
+            "<S as self::Service>::poll_chat(&mut **self, ctx, cx)",
+            "<S as self::Service>::end_chat(&mut **self, ctx)",
+            "<S as self::Service>::cancel_event_subscribe(&mut **self, ctx)",
+        ] {
+            assert!(src.contains(line), "missing `{line}`");
+        }
         // Only bidirectional calls have an end-of-requests hook.
         assert!(src.contains("fn end_chat("));
         assert!(!src.contains("fn end_upload("));
@@ -1529,32 +1772,33 @@ service Service {
 
     #[test]
     fn generates_streaming_routing() {
-        let src = generate(&Generator::new());
+        let src = generate(&Generator::micropb());
         for line in [
-            "METHOD_COMMAND => Some(__rt::MethodKind::Unary),",
-            "METHOD_EVENT_SUBSCRIBE => Some(__rt::MethodKind::ServerStreaming),",
-            "METHOD_UPLOAD => Some(__rt::MethodKind::ClientStreaming),",
-            "METHOD_CHAT => Some(__rt::MethodKind::BidiStreaming),",
-            "METHOD_EVENT_SUBSCRIBE => Some(Err(__rt::Status::unimplemented(\"`EventSubscribe` is a streaming method\"))),",
-            "METHOD_UPLOAD => __rt::codec::message::<__rt::codec::Micropb, _>(message, |req| <S as self::Service>::upload(&mut self.0, ctx, req)),",
-            "METHOD_CHAT => <S as self::Service>::end_chat(&mut self.0, ctx),",
-            "METHOD_EVENT_SUBSCRIBE => __rt::codec::poll_stream::<__rt::codec::Micropb, _>(<S as self::Service>::poll_event_subscribe(&mut self.0, ctx, cx)),",
-            "METHOD_UPLOAD => __rt::codec::poll_single::<__rt::codec::Micropb, _>(<S as self::Service>::poll_upload(&mut self.0, ctx, cx)),",
-            "METHOD_CHAT => __rt::codec::poll_stream::<__rt::codec::Micropb, _>(<S as self::Service>::poll_chat(&mut self.0, ctx, cx)),",
-            "METHOD_UPLOAD => <S as self::Service>::cancel_upload(&mut self.0, ctx),",
-            "fn is_unknown_method(&self, path: &::core::primitive::str) -> ::core::primitive::bool {\n            self.method_kind(path).is_none()",
+            "1 => __rt::codec::unary::<__rt::codec::Micropb, _, _>(request, |req| <S as self::Service>::nested(service, ctx, req)),",
+            "3 => __rt::codec::message::<__rt::codec::Micropb, _>(message, |req| <S as self::Service>::upload(service, ctx, req)),",
+            "4 => <S as self::Service>::end_chat(service, ctx),",
+            "2 => __rt::codec::poll_stream::<__rt::codec::Micropb, _>(<S as self::Service>::poll_event_subscribe(service, ctx, cx)),",
+            "3 => __rt::codec::poll_single::<__rt::codec::Micropb, _>(<S as self::Service>::poll_upload(service, ctx, cx)),",
+            "4 => __rt::codec::poll_stream::<__rt::codec::Micropb, _>(<S as self::Service>::poll_chat(service, ctx, cx)),",
+            "3 => <S as self::Service>::cancel_upload(service, ctx),",
+            "match ctx.route.method {",
         ] {
             assert!(src.contains(line), "missing `{line}`");
         }
         // Only bidi calls observe the half-close.
-        assert!(!src.contains("::end_upload(&mut self.0"));
-        // Unary methods are not routed to the streaming entry points.
-        assert!(!src.contains("METHOD_COMMAND => __rt::codec::message"));
+        assert!(!src.contains("::end_upload(service"));
+        // Unary methods are not routed to the streaming entry points, nor
+        // streaming methods to the unary one.
+        assert!(!src.contains("0 => __rt::codec::message"));
+        assert!(!src.contains("2 => __rt::codec::unary"));
+        // Routing is the method table; there is no other routing authority.
+        assert!(!src.contains("method_kind"));
+        assert!(!src.contains("is_unknown_method"));
     }
 
     #[test]
     fn generates_streaming_clients() {
-        let src = generate(&Generator::new());
+        let src = generate(&Generator::micropb());
         for line in [
             // Each shape returns its own wrapper type.
             "pub async fn event_subscribe(&self, request: &super::a_::b_::EventSubscribe) -> ::core::result::Result<__rt::codec::ServerStreaming<",
@@ -1575,7 +1819,7 @@ service Service {
 
     #[test]
     fn generates_unary_clients_with_options() {
-        let src = generate(&Generator::new());
+        let src = generate(&Generator::micropb());
         for line in [
             "self.command_with_options(request, __rt::CallOptions::default()).await",
             "__rt::UnaryTransport::unary(&mut self.transport, METHOD_COMMAND, &request, options).await?",
@@ -1589,8 +1833,9 @@ service Service {
 
     #[test]
     fn unary_only_service_has_no_streaming_items() {
-        let mut g = Generator::new();
-        g.client(false).blocking_client(false);
+        let g = Generator::micropb()
+            .with_client(false)
+            .with_blocking_client(false);
         let src = g
             .generate(&[parse(
                 "package p; message M {} service S { rpc Get(M) returns (M); }",
@@ -1601,8 +1846,10 @@ service Service {
                 "fn get(&mut self, ctx: &mut __rt::CallContext<'_>, request: super::p_::M) -> ::core::result::Result<super::p_::M, __rt::Status>;"
             )
         );
-        assert!(src.contains("METHOD_GET => Some(__rt::MethodKind::Unary),"));
-        assert!(src.contains("self.method_kind(path).is_none()"));
+        assert!(
+            src.contains("__rt::MethodDescriptor::new(METHOD_GET, __rt::MethodKind::Unary, 0),")
+        );
+        assert!(src.contains("__rt::Route::find(METHODS, path)"));
         assert!(!src.contains("fn on_message"));
         assert!(!src.contains("fn poll_response"));
     }
@@ -1614,7 +1861,7 @@ service Service {
                        rpc Feed(stream M) returns (stream M);\n\
                        rpc PollFeed(M) returns (M);\n\
                      }";
-        let err = Generator::new().generate(&[parse(proto)]).unwrap_err();
+        let err = Generator::micropb().generate(&[parse(proto)]).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("`Feed` and `PollFeed`") || msg.contains("`PollFeed` and `Feed`"),
@@ -1630,7 +1877,7 @@ service Service {
                        rpc Get(M) returns (M);\n\
                        rpc GetWithOptions(M) returns (M);\n\
                      }";
-        let err = Generator::new().generate(&[parse(proto)]).unwrap_err();
+        let err = Generator::micropb().generate(&[parse(proto)]).unwrap_err();
         assert!(err.to_string().contains("`get_with_options`"), "{err}");
     }
 
@@ -1650,18 +1897,19 @@ service Service {
                     (true, false, false),
                     (false, true, false),
                 ] {
-                    let mut g = Generator::new();
-                    g.client(asynchronous)
-                        .blocking_client(blocking)
-                        .server(server);
+                    let g = Generator::micropb()
+                        .with_client(asynchronous)
+                        .with_blocking_client(blocking)
+                        .with_server(server);
                     let err = g.generate(std::slice::from_ref(&file)).unwrap_err();
                     let msg = err.to_string();
                     assert!(msg.contains("service `p.S`"), "{msg}");
                     assert!(msg.contains(&format!("RPC `{rpc}`")), "{msg}");
                     assert!(msg.contains("reserved client method"), "{msg}");
                 }
-                let mut g = Generator::new();
-                g.client(false).blocking_client(false);
+                let g = Generator::micropb()
+                    .with_client(false)
+                    .with_blocking_client(false);
                 g.generate(&[file]).unwrap();
             }
         }
@@ -1672,15 +1920,15 @@ service Service {
         let file = parse(
             "message M {} service S { rpc Get(M) returns (M); rpc GetWithOptions(M) returns (M); }",
         );
-        let mut server_only = Generator::new();
-        server_only.client(false).blocking_client(false);
+        let server_only = Generator::micropb()
+            .with_client(false)
+            .with_blocking_client(false);
         server_only.generate(&[file]).unwrap();
 
         let file = parse(
             "message M {} service S { rpc Feed(stream M) returns (stream M); rpc PollFeed(M) returns (M); }",
         );
-        let mut clients_only = Generator::new();
-        clients_only.server(false);
+        let clients_only = Generator::micropb().with_server(false);
         clients_only.generate(&[file]).unwrap();
     }
 
@@ -1688,7 +1936,7 @@ service Service {
     fn rejects_escaped_rpc_collisions() {
         let file =
             parse("message M {} service S { rpc Self(M) returns (M); rpc Self_(M) returns (M); }");
-        let err = Generator::new().generate(&[file]).unwrap_err();
+        let err = Generator::micropb().generate(&[file]).unwrap_err();
         assert!(err.to_string().contains("`self_`"), "{err}");
     }
 
@@ -1722,7 +1970,7 @@ service Service {
             (vec!["service Self {} service Self_ {}"], "self_"),
         ] {
             let files: Vec<_> = bodies.into_iter().map(parse).collect();
-            let err = Generator::new().generate(&files).unwrap_err();
+            let err = Generator::micropb().generate(&files).unwrap_err();
             let msg = err.to_string();
             assert!(msg.contains("both generate a module"), "{msg}");
             assert!(msg.contains(&format!("`{module}`")), "{msg}");
@@ -1742,21 +1990,20 @@ service Service {
     #[test]
     fn message_module_collisions_use_the_grpc_fallback() {
         // Default suffixing: `Foo_` is `foo_`, which is the package module.
-        let g = Generator::new();
+        let g = Generator::micropb();
         assert_eq!(
             modules(&g, &["package foo; service Foo_ {}"]).unwrap(),
             ["foo__grpc"]
         );
         // Without suffixing, `Foo` is `foo`, which is `r#foo`.
-        let mut g = Generator::new();
-        g.suffixed_package_names(false);
+        let g = Generator::micropb().with_suffixed_package_names(false);
         assert_eq!(
             modules(&g, &["package foo; service Foo {}"]).unwrap(),
             ["foo_grpc"]
         );
         // Noncolliding names are unchanged.
         assert_eq!(
-            modules(&Generator::new(), &["package foo; service Foo {}"]).unwrap(),
+            modules(&Generator::micropb(), &["package foo; service Foo {}"]).unwrap(),
             ["foo"]
         );
         // Root-level messages, enums and nested-type modules are reserved too.
@@ -1780,8 +2027,7 @@ service Service {
 
     #[test]
     fn message_module_fallback_collisions_fail_explicitly() {
-        let mut g = Generator::new();
-        g.suffixed_package_names(false);
+        let g = Generator::micropb().with_suffixed_package_names(false);
         // The fallback is itself a message module.
         let err = modules(
             &g,
@@ -1807,18 +2053,19 @@ service Service {
 
     #[test]
     fn separate_message_module_does_not_rename_services() {
-        let mut g = Generator::new();
-        g.suffixed_package_names(false).messages_path("pb");
+        let g = Generator::micropb()
+            .with_suffixed_package_names(false)
+            .with_messages_path("pb");
         assert_eq!(
             modules(&g, &["package foo; service Foo {}"]).unwrap(),
             ["foo"]
         );
-        g.messages_path("self::pb");
+        let g = g.with_messages_path("self::pb");
         assert_eq!(
             modules(&g, &["package foo; service Foo {}"]).unwrap(),
             ["foo"]
         );
-        g.messages_path("self::");
+        let g = g.with_messages_path("self::");
         assert_eq!(
             modules(&g, &["package foo; service Foo {}"]).unwrap(),
             ["foo_grpc"]
@@ -1827,7 +2074,7 @@ service Service {
 
     #[test]
     fn cross_package_service_collisions_still_qualify_first() {
-        let g = Generator::new();
+        let g = Generator::micropb();
         assert_eq!(
             modules(&g, &["package a; service S {}", "package b; service S {}"]).unwrap(),
             ["a_s", "b_s"]
@@ -1837,9 +2084,10 @@ service Service {
     #[test]
     fn absolute_message_paths_are_exact() {
         let t = |path: &str| {
-            let mut g = Generator::new();
-            g.messages_path(path);
-            g.type_path(".p.M").unwrap()
+            Generator::micropb()
+                .with_messages_path(path)
+                .type_path(".p.M")
+                .unwrap()
         };
         assert_eq!(t(""), "super::p_::M");
         assert_eq!(t("self::"), "super::p_::M");
@@ -1863,8 +2111,7 @@ service Service {
             "syntax = \"proto3\";\nmessage M { optional uint32 a = 1; oneof x { uint32 b = 2; uint32 c = 3; } }\n",
         )
         .unwrap();
-        let mut g = Generator::new();
-        g.file_descriptor_set_path(dir.join("o.bin"));
+        let g = Generator::micropb().with_file_descriptor_set_path(dir.join("o.bin"));
         g.compile_protos(&[&proto], dir.join("o.rs")).unwrap();
         let set =
             FileDescriptorSet::parse_from_bytes(&fs::read(dir.join("o.bin")).unwrap()).unwrap();
@@ -1882,8 +2129,7 @@ service Service {
         fs::create_dir_all(&dir).unwrap();
         let proto = dir.join("t.proto");
         fs::write(&proto, PROTO).unwrap();
-        let mut g = Generator::new();
-        g.file_descriptor_set_path(dir.join("fd.bin"));
+        let g = Generator::micropb().with_file_descriptor_set_path(dir.join("fd.bin"));
         g.compile_protos(&[&proto], dir.join("a.rs")).unwrap();
         g.compile_fdset_file(dir.join("fd.bin"), dir.join("b.rs"))
             .unwrap();

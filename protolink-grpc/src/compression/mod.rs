@@ -162,7 +162,7 @@ impl Compression {
     };
 
     /// Accept the given encodings. Nothing is compressed until
-    /// [`send`](Self::send) is set.
+    /// [`with_send`](Self::with_send) chooses an encoding.
     pub const fn new(accept: &'static [&'static dyn Codec]) -> Self {
         Self {
             accept,
@@ -172,13 +172,13 @@ impl Compression {
     }
 
     /// Compress outgoing messages with `codec`.
-    pub const fn send(mut self, codec: &'static dyn Codec) -> Self {
+    pub const fn with_send(mut self, codec: &'static dyn Codec) -> Self {
         self.send = Some(codec);
         self
     }
 
     /// Never compress messages shorter than `min_size` bytes.
-    pub const fn min_size(mut self, min_size: usize) -> Self {
+    pub const fn with_min_size(mut self, min_size: usize) -> Self {
         self.min_size = min_size;
         self
     }

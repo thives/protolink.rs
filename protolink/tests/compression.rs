@@ -9,7 +9,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use http::{HeaderMap, Request, Response};
 use protolink::grpc::{FnHandler, Status};
-use protolink::{ClientConfig, Compression, ServerConfig};
+use protolink::{Compression, ServerConfig};
 
 /// Compressible, and longer than the default `min_size`.
 fn text() -> Vec<u8> {
@@ -113,7 +113,12 @@ fn serve(server: Compression) -> tokio::io::DuplexStream {
             compression: server,
             ..ServerConfig::default()
         };
-        protolink::tokio::serve(a, &mut h, config).await.unwrap();
+        protolink::tokio::server(a)
+            .with_config(config)
+            .build()
+            .serve(&mut h)
+            .await
+            .unwrap();
     });
     b
 }
@@ -247,13 +252,9 @@ async fn protolink_client_sends_and_reads_gzip() {
     let (a, b) = tokio::io::duplex(16 * 1024);
     tokio::spawn(gzip_echo_h2_server(a));
     with_timeout(async {
-        let mut client = protolink::tokio::client(
-            b,
-            ClientConfig {
-                compression: Compression::gzip(),
-                ..ClientConfig::default()
-            },
-        );
+        let mut client = protolink::tokio::client(b)
+            .with_compression(Compression::gzip())
+            .build();
         let data = text();
         assert_eq!(client.unary("/echo.Echo/Echo", &data).await.unwrap(), data);
         // The encoding stays in effect for later calls on the connection.
@@ -271,16 +272,17 @@ async fn protolink_client_and_server_agree_on_gzip() {
             compression: Compression::gzip(),
             ..ServerConfig::default()
         };
-        protolink::tokio::serve(a, &mut h, config).await.unwrap();
+        protolink::tokio::server(a)
+            .with_config(config)
+            .build()
+            .serve(&mut h)
+            .await
+            .unwrap();
     });
     with_timeout(async {
-        let mut client = protolink::tokio::client(
-            b,
-            ClientConfig {
-                compression: Compression::gzip(),
-                ..ClientConfig::default()
-            },
-        );
+        let mut client = protolink::tokio::client(b)
+            .with_compression(Compression::gzip())
+            .build();
         let data = text();
         for message in [data.clone(), b"short".to_vec(), Vec::new(), data] {
             assert_eq!(

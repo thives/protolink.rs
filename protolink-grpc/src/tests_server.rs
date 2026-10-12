@@ -19,17 +19,18 @@ struct HandlerState {
 }
 
 impl Handler for HandlerState {
-    fn call(&mut self, _: &mut CallContext<'_>, request: &[u8]) -> Option<Result<Vec<u8>, Status>> {
-        Some(Ok(request.to_vec()))
-    }
-
-    fn method_kind(&self, path: &str) -> Option<MethodKind> {
-        Some(match path {
+    fn route(&self, path: &str) -> Option<Route> {
+        let kind = match path {
             "/test/Unary" => MethodKind::Unary,
             "/test/Client" => MethodKind::ClientStreaming,
             "/test/Bidi" => MethodKind::BidiStreaming,
             _ => MethodKind::ServerStreaming,
-        })
+        };
+        Some(Route::new(kind, 0))
+    }
+
+    fn call(&mut self, _: &mut CallContext<'_>, request: &[u8]) -> Result<Vec<u8>, Status> {
+        Ok(request.to_vec())
     }
 
     fn on_message(&mut self, ctx: &mut CallContext<'_>, msg: &[u8]) -> Result<(), Status> {
@@ -183,28 +184,25 @@ impl InvalidResponseMetadata {
 }
 
 impl Handler for InvalidResponseMetadata {
-    fn call(
-        &mut self,
-        ctx: &mut CallContext<'_>,
-        request: &[u8],
-    ) -> Option<Result<Vec<u8>, Status>> {
-        if ctx.path == "/test/Valid" {
-            return Some(Ok(request.to_vec()));
-        }
-        self.set_metadata(ctx);
-        Some(if self.reply {
-            Ok(request.to_vec())
-        } else {
-            Err(Status::permission_denied("handler rejected request"))
-        })
-    }
-
-    fn method_kind(&self, path: &str) -> Option<MethodKind> {
-        Some(if path == "/test/EarlyInvalid" {
+    fn route(&self, path: &str) -> Option<Route> {
+        let kind = if path == "/test/EarlyInvalid" {
             MethodKind::BidiStreaming
         } else {
             MethodKind::Unary
-        })
+        };
+        Some(Route::new(kind, 0))
+    }
+
+    fn call(&mut self, ctx: &mut CallContext<'_>, request: &[u8]) -> Result<Vec<u8>, Status> {
+        if ctx.path == "/test/Valid" {
+            return Ok(request.to_vec());
+        }
+        self.set_metadata(ctx);
+        if self.reply {
+            Ok(request.to_vec())
+        } else {
+            Err(Status::permission_denied("handler rejected request"))
+        }
     }
 
     fn poll_response(

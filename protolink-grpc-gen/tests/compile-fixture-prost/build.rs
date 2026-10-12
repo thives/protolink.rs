@@ -6,24 +6,23 @@ fn enabled(feature: &str) -> bool {
 
 fn main() {
     let protos = ["proto/api.proto", "proto/second.proto"];
-    let mut grpc = protolink_grpc_gen::Generator::new();
-    grpc.runtime_path("::protolink_grpc")
-        .server(enabled("SERVER"))
-        .client(enabled("ASYNC_CLIENT"))
-        .blocking_client(enabled("BLOCKING_CLIENT"));
+    let grpc = protolink_grpc_gen::Generator::prost()
+        .with_runtime_path("::protolink_grpc")
+        .with_server(enabled("SERVER"))
+        .with_client(enabled("ASYNC_CLIENT"))
+        .with_blocking_client(enabled("BLOCKING_CLIENT"))
+        .with_include("proto");
     for proto in protos {
         println!("cargo:rerun-if-changed={proto}");
     }
     println!("cargo:rerun-if-changed=proto/common.proto");
     println!("cargo:rerun-if-changed=proto/other.proto");
-    grpc.include("proto");
 
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     let mut config = prost_build::Config::new();
     // `no_std` consumers cannot use the default `HashMap`.
     config.btree_map(["."]).out_dir(&out);
-    grpc.compile_protos_with_prost(&protos, &mut config)
-        .unwrap();
+    grpc.compile_protos(&protos, &mut config).unwrap();
 
     escaped_override(&grpc, &out);
 }
@@ -31,7 +30,10 @@ fn main() {
 /// Second pass with a directly configured service generator (the convenience
 /// API above replaces it): a keyword module override, from a hand-built
 /// descriptor set so no `protoc` is involved.
-fn escaped_override(grpc: &protolink_grpc_gen::Generator, out: &std::path::Path) {
+fn escaped_override(
+    grpc: &protolink_grpc_gen::Generator<protolink_grpc_gen::Prost>,
+    out: &std::path::Path,
+) {
     use prost_types::{
         DescriptorProto, FileDescriptorProto, FileDescriptorSet, MethodDescriptorProto,
         ServiceDescriptorProto,
@@ -61,8 +63,9 @@ fn escaped_override(grpc: &protolink_grpc_gen::Generator, out: &std::path::Path)
         }],
     };
 
-    let mut service = grpc.prost_service_generator();
-    service.service_module("escaped.Probe", "type");
+    let service = grpc
+        .service_generator()
+        .with_service_module("escaped.Probe", "type");
     let errors = service.error_log();
     let dir = out.join("escaped");
     std::fs::create_dir_all(&dir).unwrap();

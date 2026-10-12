@@ -252,12 +252,8 @@ struct OneThenWait {
 }
 
 impl Handler for OneThenWait {
-    fn call(&mut self, _: &mut CallContext<'_>, _: &[u8]) -> Option<Result<Vec<u8>, Status>> {
-        None
-    }
-
-    fn method_kind(&self, _: &str) -> Option<MethodKind> {
-        Some(MethodKind::ServerStreaming)
+    fn route(&self, _: &str) -> Option<Route> {
+        Some(Route::new(MethodKind::ServerStreaming, 0))
     }
 
     fn on_message(&mut self, _: &mut CallContext<'_>, _: &[u8]) -> Result<(), Status> {
@@ -404,9 +400,13 @@ impl Raw {
 struct Counting(usize);
 
 impl Handler for Counting {
-    fn call(&mut self, _: &mut CallContext<'_>, request: &[u8]) -> Option<Result<Vec<u8>, Status>> {
+    fn route(&self, _: &str) -> Option<Route> {
+        Some(Route::new(MethodKind::Unary, 0))
+    }
+
+    fn call(&mut self, _: &mut CallContext<'_>, request: &[u8]) -> Result<Vec<u8>, Status> {
         self.0 += 1;
-        Some(Ok(request.to_vec()))
+        Ok(request.to_vec())
     }
 }
 
@@ -534,12 +534,8 @@ struct Stuck {
 }
 
 impl Handler for Stuck {
-    fn call(&mut self, _: &mut CallContext<'_>, _: &[u8]) -> Option<Result<Vec<u8>, Status>> {
-        None
-    }
-
-    fn method_kind(&self, _: &str) -> Option<MethodKind> {
-        Some(MethodKind::ServerStreaming)
+    fn route(&self, _: &str) -> Option<Route> {
+        Some(Route::new(MethodKind::ServerStreaming, 0))
     }
 
     fn on_message(&mut self, _: &mut CallContext<'_>, _: &[u8]) -> Result<(), Status> {
@@ -615,17 +611,18 @@ struct Recorder {
 }
 
 impl Handler for Recorder {
-    fn call(
-        &mut self,
-        ctx: &mut CallContext<'_>,
-        request: &[u8],
-    ) -> Option<Result<Vec<u8>, Status>> {
-        self.seen.push(("call", ctx.id, ctx.deadline));
-        Some(Ok(request.to_vec()))
+    fn route(&self, path: &str) -> Option<Route> {
+        let kind = if path == "/t.T/Watch" {
+            MethodKind::ServerStreaming
+        } else {
+            MethodKind::Unary
+        };
+        Some(Route::new(kind, 0))
     }
 
-    fn method_kind(&self, path: &str) -> Option<MethodKind> {
-        (path == "/t.T/Watch").then_some(MethodKind::ServerStreaming)
+    fn call(&mut self, ctx: &mut CallContext<'_>, request: &[u8]) -> Result<Vec<u8>, Status> {
+        self.seen.push(("call", ctx.id, ctx.deadline));
+        Ok(request.to_vec())
     }
 
     fn on_message(&mut self, ctx: &mut CallContext<'_>, _: &[u8]) -> Result<(), Status> {
@@ -700,11 +697,12 @@ fn every_streaming_method_sees_the_deadline() {
 }
 
 #[test]
-fn a_tuple_of_handlers_passes_the_context_on() {
+fn a_forwarded_handler_passes_the_context_on() {
     let mut raw = Raw::new();
-    let mut handler = (Recorder::default(), Counting(0));
+    let mut recorder = Recorder::default();
+    let mut handler = &mut recorder;
     let id = raw.open(Some("1S"), Some(b"x"), &mut handler);
-    assert_eq!(handler.0.seen, [("call", id, Some(Duration::from_secs(1)))]);
+    assert_eq!(recorder.seen, [("call", id, Some(Duration::from_secs(1)))]);
 }
 
 #[test]
@@ -713,6 +711,7 @@ fn remaining_counts_down_and_saturates() {
     let mut response = ResponseMetadata::default();
     let mut ctx = CallContext::new(
         "/t.T/M",
+        Route::new(MethodKind::Unary, 0),
         1,
         Some(Duration::from_secs(10)),
         &md,

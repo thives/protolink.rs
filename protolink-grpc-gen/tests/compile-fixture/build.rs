@@ -15,14 +15,14 @@ fn generate(out: &Path, name: &str, messages_path: &str) {
     println!("cargo:rerun-if-changed={proto}");
     let suffixed = !enabled("UNSUFFIXED_PACKAGES");
     let fdset = out.join(format!("{name}.fdset"));
-    let mut grpc = protolink_grpc_gen::Generator::new();
-    grpc.runtime_path("::protolink_grpc")
-        .suffixed_package_names(suffixed)
-        .messages_path(messages_path)
-        .server(enabled("SERVER"))
-        .client(enabled("ASYNC_CLIENT"))
-        .blocking_client(enabled("BLOCKING_CLIENT"))
-        .file_descriptor_set_path(&fdset);
+    let grpc = protolink_grpc_gen::Generator::micropb()
+        .with_runtime_path("::protolink_grpc")
+        .with_suffixed_package_names(suffixed)
+        .with_messages_path(messages_path)
+        .with_server(enabled("SERVER"))
+        .with_client(enabled("ASYNC_CLIENT"))
+        .with_blocking_client(enabled("BLOCKING_CLIENT"))
+        .with_file_descriptor_set_path(&fdset);
     grpc.compile_protos(&[&proto], out.join(format!("{name}_grpc.rs")))
         .unwrap();
     let mut messages = micropb_gen::Generator::new();
@@ -36,12 +36,12 @@ fn generate(out: &Path, name: &str, messages_path: &str) {
 fn main() {
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     let suffixed = !enabled("UNSUFFIXED_PACKAGES");
-    let mut grpc = protolink_grpc_gen::Generator::new();
-    grpc.runtime_path("::protolink_grpc")
-        .suffixed_package_names(suffixed)
-        .server(enabled("SERVER"))
-        .client(enabled("ASYNC_CLIENT"))
-        .blocking_client(enabled("BLOCKING_CLIENT"));
+    let mut grpc = protolink_grpc_gen::Generator::micropb()
+        .with_runtime_path("::protolink_grpc")
+        .with_suffixed_package_names(suffixed)
+        .with_server(enabled("SERVER"))
+        .with_client(enabled("ASYNC_CLIENT"))
+        .with_blocking_client(enabled("BLOCKING_CLIENT"));
 
     let protos = [
         PathBuf::from("proto/shapes.proto"),
@@ -50,10 +50,10 @@ fn main() {
     ];
     for proto in &protos {
         println!("cargo:rerun-if-changed={}", proto.display());
-        grpc.include(proto.parent().unwrap());
+        grpc = grpc.with_include(proto.parent().unwrap());
     }
     let fdset = out.join("messages.fdset");
-    grpc.file_descriptor_set_path(&fdset);
+    let grpc = grpc.with_file_descriptor_set_path(&fdset);
     grpc.compile_protos(&protos, out.join("grpc.rs")).unwrap();
 
     // Same descriptor-set API as examples/embedded-device/build.rs.
@@ -67,13 +67,12 @@ fn main() {
     // Built-in client names remain legal on server traits, in every build mode.
     println!("cargo:rerun-if-changed=proto/lifecycle.proto");
     let lifecycle_fdset = out.join("lifecycle.fdset");
-    let mut lifecycle = protolink_grpc_gen::Generator::new();
-    lifecycle
-        .runtime_path("::protolink_grpc")
-        .suffixed_package_names(suffixed)
-        .client(false)
-        .blocking_client(false)
-        .file_descriptor_set_path(&lifecycle_fdset);
+    let lifecycle = protolink_grpc_gen::Generator::micropb()
+        .with_runtime_path("::protolink_grpc")
+        .with_suffixed_package_names(suffixed)
+        .with_client(false)
+        .with_blocking_client(false)
+        .with_file_descriptor_set_path(&lifecycle_fdset);
     lifecycle
         .compile_protos(&["proto/lifecycle.proto"], out.join("lifecycle_grpc.rs"))
         .unwrap();

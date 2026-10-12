@@ -21,7 +21,7 @@ pub mod proto {
 }
 
 use proto::embedded_::smoke_::Payload;
-use proto::smoke::{Smoke, SmokeServer};
+use proto::smoke::{Smoke, SmokeDispatch};
 
 struct Echo;
 
@@ -152,10 +152,12 @@ fn request() -> Payload {
 pub fn blocking_smoke() {
     use proto::smoke::SmokeBlockingClient;
     let request = request();
-    let mut client = SmokeBlockingClient::new(protolink::blocking::Client::new(
-        SmokeIo::new(),
-        black_box(protolink::ClientConfig::default()),
-    ));
+    let mut client = SmokeBlockingClient::new(
+        protolink::blocking::client(SmokeIo::new())
+            .with_config(black_box(protolink::ClientConfig::default()))
+            .without_deadlines()
+            .build(),
+    );
     let _ = black_box(client.unary(&request));
     if let Ok(mut stream) = client.server_stream(&request) {
         let _ = black_box(stream.message());
@@ -169,12 +171,12 @@ pub fn blocking_smoke() {
         let _ = black_box(stream.close_send());
         let _ = black_box(stream.message());
     }
-    let mut handler = SmokeServer::new(Echo);
-    let _ = black_box(protolink::blocking::serve(
-        SmokeIo::new(),
-        &mut handler,
-        black_box(protolink::ServerConfig::default()),
-    ));
+    let mut handler = SmokeDispatch::new(Echo);
+    let server = protolink::blocking::server(SmokeIo::new())
+        .with_config(black_box(protolink::ServerConfig::default()))
+        .without_deadlines()
+        .build();
+    let _ = black_box(server.serve(&mut handler));
 }
 
 /// Monomorphize all generated async RPC shapes, server, and CAS-backed wakers.
@@ -191,10 +193,12 @@ pub async fn async_smoke() {
     black_box(rx.pop().await);
 
     let request = request();
-    let mut client = SmokeClient::new(protolink::Client::new(
-        SmokeIo::new(),
-        black_box(protolink::ClientConfig::default()),
-    ));
+    let mut client = SmokeClient::new(
+        protolink::client(SmokeIo::new())
+            .with_config(black_box(protolink::ClientConfig::default()))
+            .without_deadlines()
+            .build(),
+    );
     let _ = black_box(client.unary(&request).await);
     if let Ok(mut stream) = client.server_stream(&request).await {
         let _ = black_box(stream.message().await);
@@ -208,15 +212,12 @@ pub async fn async_smoke() {
         let _ = black_box(stream.close_send().await);
         let _ = black_box(stream.message().await);
     }
-    let mut handler = SmokeServer::new(Echo);
-    let _ = black_box(
-        protolink::serve(
-            SmokeIo::new(),
-            &mut handler,
-            black_box(protolink::ServerConfig::default()),
-        )
-        .await,
-    );
+    let mut handler = SmokeDispatch::new(Echo);
+    let server = protolink::server(SmokeIo::new())
+        .with_config(black_box(protolink::ServerConfig::default()))
+        .without_deadlines()
+        .build();
+    let _ = black_box(server.serve(&mut handler).await);
 }
 
 /// Keep the optional gzip backend in the linked image without a real peer.

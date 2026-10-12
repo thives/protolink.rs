@@ -1,7 +1,7 @@
 all: build embedded features test clippy fmt docs miri
 
 # no_std crates that must build for embedded targets
-no_std := "-p protolink -p protolink-grpc -p protolink-http2"
+no_std := "-p protolink -p protolink-grpc -p protolink-http2 -p protolink-i2c -p protolink-adaptors"
 
 clippy:
   cargo clippy --workspace --all-features --all-targets -- -D warnings
@@ -25,7 +25,7 @@ embedded:
 
 # Every feature on its own, and the combinations that interact (needs cargo-hack)
 features:
-  cargo hack check --each-feature --no-dev-deps -p protolink -p protolink-grpc -p protolink-http2 -p protolink-grpc-gen
+  cargo hack check --each-feature --no-dev-deps -p protolink -p protolink-grpc -p protolink-http2 -p protolink-grpc-gen -p protolink-i2c -p protolink-adaptors
   cargo check --no-default-features --features async,std -p protolink
   cargo check --no-default-features --features blocking,std -p protolink
   cargo check --no-default-features --features async,blocking -p protolink

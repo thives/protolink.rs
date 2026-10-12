@@ -50,37 +50,57 @@ fn unknown_method_is_unimplemented() {
     assert_eq!(err.code, Code::Unimplemented);
 }
 
-/// Handler that reports exactly one path as known.
+/// Handler that routes exactly one path.
 struct Knows(&'static str);
 
 impl Handler for Knows {
-    fn call(&mut self, _: &mut CallContext<'_>, _: &[u8]) -> Option<Result<Vec<u8>, Status>> {
-        None
+    fn route(&self, path: &str) -> Option<Route> {
+        (path == self.0).then_some(Route::new(MethodKind::Unary, 7))
     }
 
-    fn is_unknown_method(&self, path: &str) -> bool {
-        path != self.0
+    fn call(&mut self, ctx: &mut CallContext<'_>, _: &[u8]) -> Result<Vec<u8>, Status> {
+        assert_eq!(ctx.route, Route::new(MethodKind::Unary, 7));
+        Ok(b"known".to_vec())
     }
 }
 
 #[test]
-fn tuple_handler_is_unknown_only_if_every_member_says_so() {
-    let pair = (Knows("/a"), Knows("/b"));
-    assert!(!pair.is_unknown_method("/a"));
-    assert!(!pair.is_unknown_method("/b"));
-    assert!(pair.is_unknown_method("/c"));
+fn routes_resolve_known_paths_only() {
+    let knows = Knows("/a");
+    assert_eq!(knows.route("/a"), Some(Route::new(MethodKind::Unary, 7)));
+    assert_eq!(knows.route("/c"), None);
 
-    // A closure handler can't enumerate its paths.
-    let dynamic = (Knows("/a"), FnHandler(echo));
-    assert!(!dynamic.is_unknown_method("/c"));
+    // A closure handler routes every path and decides when called.
+    assert_eq!(
+        FnHandler(echo).route("/c"),
+        Some(Route::new(MethodKind::Unary, 0))
+    );
 
-    // The `&mut H` impl forwards.
+    // The `&mut H` and `Box<H>` impls forward.
     let mut knows = Knows("/a");
     let forwarded = &mut knows;
-    assert!(!<&mut Knows as Handler>::is_unknown_method(
-        &forwarded, "/a"
-    ));
-    assert!(<&mut Knows as Handler>::is_unknown_method(&forwarded, "/c"));
+    assert!(<&mut Knows as Handler>::route(&forwarded, "/a").is_some());
+    assert!(<&mut Knows as Handler>::route(&forwarded, "/c").is_none());
+    let boxed: alloc::boxed::Box<dyn Handler> = alloc::boxed::Box::new(Knows("/a"));
+    assert!(boxed.route("/a").is_some());
+}
+
+#[test]
+fn the_selected_route_reaches_the_handler() {
+    let mut client = Client::new(ClientConfig::default());
+    let mut server = Server::new(ServerConfig::default());
+    let mut handler = Knows("/t.T/Known");
+    let known = client.start_unary("/t.T/Known", b"").unwrap();
+    let unknown = client.start_unary("/t.T/Other", b"").unwrap();
+    pump(&mut client, &mut server, &mut handler);
+    assert_eq!(
+        client.take_response(known).unwrap().unwrap().message,
+        b"known"
+    );
+    assert_eq!(
+        client.take_response(unknown).unwrap().unwrap_err().code,
+        Code::Unimplemented
+    );
 }
 
 #[test]
@@ -125,17 +145,18 @@ fn multiple_calls_on_one_connection() {
 }
 
 #[test]
-fn tuple_handlers_route_in_order() {
-    let mut handler = (
-        FnHandler(|p: &str, _: &[u8]| (p == "/a.A/X").then(|| Ok(b"a".to_vec()))),
-        FnHandler(|p: &str, _: &[u8]| (p == "/b.B/X").then(|| Ok(b"b".to_vec()))),
-    );
+fn closure_handlers_answer_unserved_paths_with_unimplemented() {
+    let mut handler = FnHandler(|p: &str, _: &[u8]| (p == "/b.B/X").then(|| Ok(b"b".to_vec())));
     let md = Metadata::new();
     let mut response = ResponseMetadata::default();
-    let mut ctx = CallContext::new("/b.B/X", 1, None, &md, &mut response);
-    assert_eq!(handler.call(&mut ctx, b""), Some(Ok(b"b".to_vec())));
+    let route = handler.route("/b.B/X").unwrap();
+    let mut ctx = CallContext::new("/b.B/X", route, 1, None, &md, &mut response);
+    assert_eq!(handler.call(&mut ctx, b""), Ok(b"b".to_vec()));
     ctx.path = "/c.C/X";
-    assert_eq!(handler.call(&mut ctx, b""), None);
+    assert_eq!(
+        handler.call(&mut ctx, b"").unwrap_err().code,
+        Code::Unimplemented
+    );
 }
 
 /// Drive the server with a raw HTTP/2 client to check non-gRPC requests.

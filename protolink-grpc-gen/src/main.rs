@@ -12,12 +12,12 @@ options:
       --runtime-path PATH    protolink gRPC runtime path (default ::protolink::grpc)
       --no-suffixed-packages mirror micropb-gen suffixed_package_names(false)
       --protoc               parse with protoc instead of the pure-Rust parser
-      --no-server            do not generate service traits / servers
+      --no-server            do not generate service traits / dispatchers
       --no-client            do not generate async clients
       --no-blocking-client   do not generate blocking clients";
 
 fn main() -> ExitCode {
-    let mut generator = protolink_grpc_gen::Generator::new();
+    let mut generator = protolink_grpc_gen::Generator::micropb();
     let mut out = None;
     let mut protos: Vec<PathBuf> = Vec::new();
     let mut args = std::env::args().skip(1);
@@ -31,31 +31,31 @@ fn main() -> ExitCode {
         match arg.as_str() {
             "-o" | "--out" => out = Some(PathBuf::from(value(&arg))),
             "-I" | "--include" => {
-                generator.include(value(&arg));
+                generator = generator.with_include(value(&arg));
             }
             "--fdset" => {
-                generator.file_descriptor_set_path(value(&arg));
+                generator = generator.with_file_descriptor_set_path(value(&arg));
             }
             "--messages-path" => {
-                generator.messages_path(value(&arg));
+                generator = generator.with_messages_path(value(&arg));
             }
             "--runtime-path" => {
-                generator.runtime_path(value(&arg));
+                generator = generator.with_runtime_path(value(&arg));
             }
             "--no-suffixed-packages" => {
-                generator.suffixed_package_names(false);
+                generator = generator.with_suffixed_package_names(false);
             }
             "--protoc" => {
-                generator.use_protoc(true);
+                generator = generator.with_protoc(true);
             }
             "--no-server" => {
-                generator.server(false);
+                generator = generator.with_server(false);
             }
             "--no-client" => {
-                generator.client(false);
+                generator = generator.with_client(false);
             }
             "--no-blocking-client" => {
-                generator.blocking_client(false);
+                generator = generator.with_blocking_client(false);
             }
             "-h" | "--help" => {
                 println!("{USAGE}");

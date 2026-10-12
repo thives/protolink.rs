@@ -66,4 +66,17 @@ grpcurl -plaintext -import-path "$proto" -proto device.proto \
   -d '{"correlationId":8,"getStatus":{}}' "$addr" "$service/Command" |
   jq -e '.correlationId == 8' >/dev/null
 
+# The second generated service, served by the same device object. Each grpcurl
+# invocation is a new connection with its own device, so this one ran two
+# commands: one executed, one rejected.
+printf '%s\n' \
+  '{"setOutput":{"channel":0,"enabled":true}}' \
+  '{"setOutput":{"channel":9,"enabled":true}}' |
+  grpcurl -plaintext -import-path "$proto" -proto device.proto -d @ \
+    "$addr" "$service/CommandBatch" >/dev/null
+grpcurl -plaintext -import-path "$proto" -proto device.proto \
+  -d '{}' "$addr" "protolink.examples.embedded.device.Diagnostics/GetCounters" >/tmp/counters.json
+# A fresh connection has a fresh device: all counters are zero (omitted in JSON).
+jq -e '(.executed // 0) == 0 and (.rejected // 0) == 0' /tmp/counters.json >/dev/null
+
 echo "grpcurl interoperability checks passed"

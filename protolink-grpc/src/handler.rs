@@ -1,3 +1,4 @@
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::task::{Context, Poll};
 use core::time::Duration;
@@ -29,6 +30,62 @@ impl Default for ResponseMetadata {
     }
 }
 
+/// The method selected for a call: its shape and an identifier that is
+/// meaningful to the [`Handler`] that selected it.
+///
+/// [`Handler::route`] resolves a call's path to a route once, when the request
+/// headers arrive. The server keeps it with the call and hands it back in
+/// [`CallContext::route`] for every later lifecycle event, so a handler never
+/// re-resolves the path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Route {
+    /// The shape of the method. Decides which [`Handler`] methods the call
+    /// is driven through.
+    pub kind: MethodKind,
+    /// Identifies the method within the handler that resolved it, for
+    /// example its index in a [`MethodDescriptor`] table.
+    pub method: u32,
+}
+
+impl Route {
+    /// A route to `method` of shape `kind`.
+    pub const fn new(kind: MethodKind, method: u32) -> Self {
+        Self { kind, method }
+    }
+
+    /// The route of the method at `path` in `methods`, if any.
+    pub fn find(methods: &[MethodDescriptor], path: &str) -> Option<Self> {
+        methods.iter().find(|m| m.path == path).map(|m| m.route())
+    }
+}
+
+/// A statically known method: its path, shape and identifier.
+///
+/// Generated services describe their methods with a `METHODS` table of these;
+/// [`Registry`](crate::Registry) and [`MultiDispatch`](crate::MultiDispatch)
+/// merge such tables and reject duplicate paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MethodDescriptor {
+    /// The method path, `/package.Service/Method`.
+    pub path: &'static str,
+    /// The shape of the method.
+    pub kind: MethodKind,
+    /// Identifies the method within its service, see [`Route::method`].
+    pub method: u32,
+}
+
+impl MethodDescriptor {
+    /// A descriptor of `method` at `path`, of shape `kind`.
+    pub const fn new(path: &'static str, kind: MethodKind, method: u32) -> Self {
+        Self { path, kind, method }
+    }
+
+    /// The route that selects this method.
+    pub const fn route(&self) -> Route {
+        Route::new(self.kind, self.method)
+    }
+}
+
 /// What a [`Handler`] is told about the call it is working on, and where it
 /// sets the call's response metadata.
 ///
@@ -37,6 +94,10 @@ impl Default for ResponseMetadata {
 pub struct CallContext<'a> {
     /// The method path, `/package.Service/Method`.
     pub path: &'a str,
+    /// The route [`Handler::route`] selected for this call. Composite
+    /// handlers such as [`Registry`](crate::Registry) replace it with the
+    /// inner handler's route while they delegate.
+    pub route: Route,
     /// The call's id, unique per connection. Streaming handlers key their
     /// per-call state by it.
     pub id: CallId,
@@ -51,9 +112,11 @@ pub struct CallContext<'a> {
 }
 
 impl<'a> CallContext<'a> {
-    /// A context for `path`, for the server and for testing handlers.
+    /// A context for a call of `path`, for the server and for testing
+    /// handlers.
     pub fn new(
         path: &'a str,
+        route: Route,
         id: CallId,
         deadline: Option<Duration>,
         metadata: &'a Metadata,
@@ -61,6 +124,7 @@ impl<'a> CallContext<'a> {
     ) -> Self {
         Self {
             path,
+            route,
             id,
             deadline,
             metadata,
@@ -91,27 +155,45 @@ impl<'a> CallContext<'a> {
     pub fn trailing_metadata_mut(&mut self) -> &mut Metadata {
         &mut self.response.trailing
     }
+
+    /// Run `f` with [`route`](Self::route) temporarily replaced by `route`.
+    pub(crate) fn with_route<R>(&mut self, route: Route, f: impl FnOnce(&mut Self) -> R) -> R {
+        let outer = core::mem::replace(&mut self.route, route);
+        let result = f(self);
+        self.route = outer;
+        result
+    }
 }
 
-/// Server-side request handler. Generated `*Server` wrappers implement this.
+/// The server-side contract between a connection and the application.
+///
+/// Generated `<Service>Dispatch` wrappers, [`Registry`](crate::Registry) and
+/// [`MultiDispatch`](crate::MultiDispatch) implement it. Implementing it by
+/// hand is the low-level, dynamic facility: the handler decides at runtime
+/// which paths it serves (see [`FnHandler`]).
+///
+/// # Routing
+///
+/// When a call's request headers arrive the server asks
+/// [`route`](Self::route) once which method serves the path. `None` answers
+/// `UNIMPLEMENTED` at once. Otherwise the returned [`Route`] is stored with
+/// the call, decides by its [`kind`](Route::kind) which methods below drive
+/// the call, and is passed back in [`CallContext::route`] to every one of
+/// them. A handler therefore resolves each path exactly once per call; this
+/// is the only routing authority.
 ///
 /// # Unary calls
 ///
-/// `call` returns `None` when the path is not handled, which lets handlers be
-/// combined: a tuple `(A, B, ...)` of handlers tries each in order. The server
-/// answers unhandled paths with `UNIMPLEMENTED` once the client has sent its
-/// request, unless the handler recognizes the path as unknown up front (see
-/// [`is_unknown_method`](Self::is_unknown_method)), in which case the answer
-/// is sent as soon as the request headers arrive.
+/// [`call`](Self::call) receives the request message once the client has
+/// half-closed, and returns the response or a status.
 ///
 /// # Streaming calls
 ///
-/// A handler declares its streaming methods through
-/// [`method_kind`](Self::method_kind). Calls of those paths are driven through
-/// the remaining methods instead of `call`, identified by the [`CallId`] in
-/// their [`CallContext`], which is unique per connection. Per-call state is kept by the handler, typically in
-/// a map keyed by `CallId`. The default implementations reject every streaming
-/// call with `UNIMPLEMENTED`, so unary-only handlers need not implement them.
+/// Calls of streaming routes are driven through the remaining methods,
+/// identified by the [`CallId`] in their [`CallContext`], which is unique per
+/// connection. Per-call state is kept by the handler, typically in a map keyed
+/// by `CallId`. The default implementations reject every call with
+/// `UNIMPLEMENTED`, so handlers only implement what their routes need.
 ///
 /// For each call, the server invokes:
 ///
@@ -130,10 +212,16 @@ impl<'a> CallContext<'a> {
 /// `on_half_close`, or [`Next::Done`] from `poll_response`. If it ends any
 /// other way (the client cancels or resets the stream, the request is
 /// malformed or too large, the call's deadline passes, the connection fails
-/// or is closed), the server
-/// calls [`on_cancel`](Self::on_cancel) instead, so the handler can release
-/// the call's state. `on_cancel` may be called for a call the handler has not
-/// seen yet.
+/// or is closed), the server calls [`on_cancel`](Self::on_cancel) instead, so
+/// the handler can release the call's state. `on_cancel` may be called for a
+/// call the handler has not seen yet.
+///
+/// # Connections
+///
+/// A driver borrows the handler for the lifetime of one connection, so call
+/// state keyed by [`CallId`] is connection-local; separate connections use
+/// separate handlers (with business state shared through handles the
+/// application chooses, if needed).
 ///
 /// # Deadlines
 ///
@@ -165,35 +253,14 @@ impl<'a> CallContext<'a> {
 /// wake-up; only external events (a timer, an interrupt, another task) do.
 /// Spurious polls are allowed.
 pub trait Handler {
+    /// Select the method that serves `path`, or `None` if nothing does.
+    /// Called once per call, when its request headers arrive.
+    fn route(&self, path: &str) -> Option<Route>;
+
     /// Handle the unary call `ctx.path` with the encoded `request` message.
-    fn call(
-        &mut self,
-        ctx: &mut CallContext<'_>,
-        request: &[u8],
-    ) -> Option<Result<Vec<u8>, Status>>;
-
-    /// Whether this handler knows that it serves nothing at `path`, neither
-    /// unary nor streaming. The server then answers `UNIMPLEMENTED` as soon
-    /// as the request headers arrive, so a streaming client learns about it
-    /// without having to half-close first.
-    ///
-    /// The default is `false`: the path may still be served dynamically
-    /// through [`call`](Self::call), so the server waits for the request to
-    /// end. Return `true` only if [`call`](Self::call) would return `None` and
-    /// [`method_kind`](Self::method_kind) would return `None` for `path`.
-    /// Generated `*Server` wrappers implement this; a tuple of handlers
-    /// reports `true` only if every member does.
-    fn is_unknown_method(&self, path: &str) -> bool {
-        let _ = path;
-        false
-    }
-
-    /// The kind of method served at `path`, or `None` if it is not handled
-    /// here. Paths reported as `None` or [`MethodKind::Unary`] are served
-    /// through [`call`](Self::call).
-    fn method_kind(&self, path: &str) -> Option<MethodKind> {
-        let _ = path;
-        None
+    fn call(&mut self, ctx: &mut CallContext<'_>, request: &[u8]) -> Result<Vec<u8>, Status> {
+        let _ = request;
+        Err(unimplemented(ctx.path))
     }
 
     /// One request message of the streaming call `ctx.id` on `ctx.path`.
@@ -228,45 +295,51 @@ pub(crate) fn unimplemented(path: &str) -> Status {
     Status::unimplemented(alloc::format!("unknown method {path}"))
 }
 
-impl<H: Handler + ?Sized> Handler for &mut H {
-    fn call(
-        &mut self,
-        ctx: &mut CallContext<'_>,
-        request: &[u8],
-    ) -> Option<Result<Vec<u8>, Status>> {
-        (**self).call(ctx, request)
-    }
+macro_rules! forward_handler {
+    () => {
+        fn route(&self, path: &str) -> Option<Route> {
+            (**self).route(path)
+        }
 
-    fn is_unknown_method(&self, path: &str) -> bool {
-        (**self).is_unknown_method(path)
-    }
+        fn call(&mut self, ctx: &mut CallContext<'_>, request: &[u8]) -> Result<Vec<u8>, Status> {
+            (**self).call(ctx, request)
+        }
 
-    fn method_kind(&self, path: &str) -> Option<MethodKind> {
-        (**self).method_kind(path)
-    }
+        fn on_message(&mut self, ctx: &mut CallContext<'_>, message: &[u8]) -> Result<(), Status> {
+            (**self).on_message(ctx, message)
+        }
 
-    fn on_message(&mut self, ctx: &mut CallContext<'_>, message: &[u8]) -> Result<(), Status> {
-        (**self).on_message(ctx, message)
-    }
+        fn on_half_close(&mut self, ctx: &mut CallContext<'_>) -> Result<(), Status> {
+            (**self).on_half_close(ctx)
+        }
 
-    fn on_half_close(&mut self, ctx: &mut CallContext<'_>) -> Result<(), Status> {
-        (**self).on_half_close(ctx)
-    }
+        fn poll_response(
+            &mut self,
+            ctx: &mut CallContext<'_>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Next<Vec<u8>>> {
+            (**self).poll_response(ctx, cx)
+        }
 
-    fn poll_response(
-        &mut self,
-        ctx: &mut CallContext<'_>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Next<Vec<u8>>> {
-        (**self).poll_response(ctx, cx)
-    }
-
-    fn on_cancel(&mut self, ctx: &mut CallContext<'_>) {
-        (**self).on_cancel(ctx)
-    }
+        fn on_cancel(&mut self, ctx: &mut CallContext<'_>) {
+            (**self).on_cancel(ctx)
+        }
+    };
 }
 
-/// [`Handler`] backed by a closure (unary calls only).
+impl<H: Handler + ?Sized> Handler for &mut H {
+    forward_handler!();
+}
+
+impl<H: Handler + ?Sized> Handler for Box<H> {
+    forward_handler!();
+}
+
+/// [`Handler`] backed by a closure: the dynamic, unary-only facility.
+///
+/// Every path is routed to the closure as a unary method; it returns `None`
+/// for paths it does not serve, which are answered with `UNIMPLEMENTED` once
+/// the request has arrived.
 #[derive(Debug, Clone)]
 pub struct FnHandler<F>(pub F);
 
@@ -274,104 +347,11 @@ impl<F> Handler for FnHandler<F>
 where
     F: FnMut(&str, &[u8]) -> Option<Result<Vec<u8>, Status>>,
 {
-    fn call(
-        &mut self,
-        ctx: &mut CallContext<'_>,
-        request: &[u8],
-    ) -> Option<Result<Vec<u8>, Status>> {
-        (self.0)(ctx.path, request)
+    fn route(&self, _: &str) -> Option<Route> {
+        Some(Route::new(MethodKind::Unary, 0))
+    }
+
+    fn call(&mut self, ctx: &mut CallContext<'_>, request: &[u8]) -> Result<Vec<u8>, Status> {
+        (self.0)(ctx.path, request).unwrap_or_else(|| Err(unimplemented(ctx.path)))
     }
 }
-
-macro_rules! tuple_handler {
-    ($($name:ident),+) => {
-        /// Unary calls try each handler in order. Streaming calls go to the
-        /// first handler whose [`method_kind`](Handler::method_kind) knows
-        /// the path. A path is unknown up front only if every handler says so.
-        impl<$($name: Handler),+> Handler for ($($name,)+) {
-            #[allow(non_snake_case)]
-            fn call(&mut self, ctx: &mut CallContext<'_>, request: &[u8]) -> Option<Result<Vec<u8>, Status>> {
-                let ($($name,)+) = self;
-                $(
-                    if let Some(r) = $name.call(ctx, request) {
-                        return Some(r);
-                    }
-                )+
-                None
-            }
-
-            #[allow(non_snake_case)]
-            fn is_unknown_method(&self, path: &str) -> bool {
-                let ($($name,)+) = self;
-                true $(&& $name.is_unknown_method(path))+
-            }
-
-            #[allow(non_snake_case)]
-            fn method_kind(&self, path: &str) -> Option<MethodKind> {
-                let ($($name,)+) = self;
-                $(
-                    if let Some(k) = $name.method_kind(path) {
-                        return Some(k);
-                    }
-                )+
-                None
-            }
-
-            #[allow(non_snake_case)]
-            fn on_message(&mut self, ctx: &mut CallContext<'_>, message: &[u8]) -> Result<(), Status> {
-                let ($($name,)+) = self;
-                $(
-                    if $name.method_kind(ctx.path).is_some() {
-                        return $name.on_message(ctx, message);
-                    }
-                )+
-                Err(unimplemented(ctx.path))
-            }
-
-            #[allow(non_snake_case)]
-            fn on_half_close(&mut self, ctx: &mut CallContext<'_>) -> Result<(), Status> {
-                let ($($name,)+) = self;
-                $(
-                    if $name.method_kind(ctx.path).is_some() {
-                        return $name.on_half_close(ctx);
-                    }
-                )+
-                Ok(())
-            }
-
-            #[allow(non_snake_case)]
-            fn poll_response(
-                &mut self,
-                ctx: &mut CallContext<'_>,
-                cx: &mut Context<'_>,
-            ) -> Poll<Next<Vec<u8>>> {
-                let ($($name,)+) = self;
-                $(
-                    if $name.method_kind(ctx.path).is_some() {
-                        return $name.poll_response(ctx, cx);
-                    }
-                )+
-                Poll::Ready(Next::Done(Err(unimplemented(ctx.path))))
-            }
-
-            #[allow(non_snake_case)]
-            fn on_cancel(&mut self, ctx: &mut CallContext<'_>) {
-                let ($($name,)+) = self;
-                $(
-                    if $name.method_kind(ctx.path).is_some() {
-                        return $name.on_cancel(ctx);
-                    }
-                )+
-            }
-        }
-    };
-}
-
-tuple_handler!(A);
-tuple_handler!(A, B);
-tuple_handler!(A, B, C);
-tuple_handler!(A, B, C, D);
-tuple_handler!(A, B, C, D, E);
-tuple_handler!(A, B, C, D, E, F);
-tuple_handler!(A, B, C, D, E, F, G);
-tuple_handler!(A, B, C, D, E, F, G, H);

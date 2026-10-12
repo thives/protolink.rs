@@ -66,9 +66,45 @@ pub fn servers() {
         }
     }
     fn handler(_: impl Handler) {}
-    handler(fixture::api::echo_grpc::EchoServer::new(Echo));
-    handler(fixture::api::match_grpc::MatchServer::new(Match));
-    handler(fixture::api::second_grpc::SecondServer::new(Second));
+    handler(fixture::api::echo_grpc::EchoDispatch::new(Echo));
+    handler(fixture::api::match_grpc::MatchDispatch::new(Match));
+    handler(fixture::api::second_grpc::SecondDispatch::new(Second));
+
+    // Borrowed implementations, independent objects in a registry, and one
+    // object behind two services.
+    let mut echo = Echo;
+    let mut second = Second;
+    handler(fixture::api::echo_grpc::EchoDispatch::new(&mut echo));
+    let registry = protolink_grpc::Registry::builder()
+        .with_service(fixture::api::echo_grpc::EchoDispatch::new(&mut echo))
+        .with_service(fixture::api::second_grpc::SecondDispatch::new(&mut second))
+        .build();
+    if let Ok(registry) = registry {
+        handler(registry);
+    }
+    struct Both;
+    impl fixture::api::match_grpc::Match for Both {
+        fn r#type(&mut self, _: &mut CallContext<'_>, request: Request) -> Result<Reply, Status> {
+            Ok(Reply {
+                inner: request.inner,
+            })
+        }
+        fn r#async(&mut self, _: &mut CallContext<'_>, request: Common) -> Result<Common, Status> {
+            Ok(request)
+        }
+    }
+    impl fixture::api::second_grpc::Second for Both {
+        fn ping(&mut self, _: &mut CallContext<'_>, request: Common) -> Result<Common, Status> {
+            Ok(request)
+        }
+    }
+    let multi = protolink_grpc::MultiDispatch::builder(Both)
+        .with_service(fixture::api::match_grpc::MatchMethods)
+        .with_service(fixture::api::second_grpc::SecondMethods)
+        .build();
+    if let Ok(multi) = multi {
+        handler(multi);
+    }
 }
 
 #[cfg(feature = "async-client")]

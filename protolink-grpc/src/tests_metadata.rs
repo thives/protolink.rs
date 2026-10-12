@@ -32,16 +32,21 @@ struct Meta {
 }
 
 impl Handler for Meta {
-    fn call(
-        &mut self,
-        ctx: &mut CallContext<'_>,
-        request: &[u8],
-    ) -> Option<Result<Vec<u8>, Status>> {
+    fn route(&self, path: &str) -> Option<Route> {
+        let kind = if matches!(path, "/m.M/Count" | "/m.M/FailStream" | "/m.M/Quiet") {
+            MethodKind::ServerStreaming
+        } else {
+            MethodKind::Unary
+        };
+        Some(Route::new(kind, 0))
+    }
+
+    fn call(&mut self, ctx: &mut CallContext<'_>, request: &[u8]) -> Result<Vec<u8>, Status> {
         match ctx.path {
             "/m.M/Space" => {
                 ctx.trailing_metadata_mut().insert("x-trail", "t").unwrap();
                 let message = core::str::from_utf8(request).unwrap();
-                Some(Err(Status::permission_denied(message)))
+                Err(Status::permission_denied(message))
             }
             "/m.M/Echo" => {
                 let reply = ctx
@@ -57,7 +62,7 @@ impl Handler for Meta {
                     initial.insert_bin("x-bin", &bin).unwrap();
                 }
                 ctx.trailing_metadata_mut().insert("x-trail", "t").unwrap();
-                Some(Ok(reply))
+                Ok(reply)
             }
             "/m.M/Fail" => {
                 ctx.initial_metadata_mut()
@@ -67,7 +72,7 @@ impl Handler for Meta {
                 ctx.trailing_metadata_mut().insert("x-trail", "t").unwrap();
                 let mut md = Metadata::new();
                 md.insert("x-status", "s").unwrap();
-                Some(Err(Status::aborted("no").with_metadata(md)))
+                Err(Status::aborted("no").with_metadata(md))
             }
             "/m.M/BinaryEcho" => {
                 let values: Vec<Vec<u8>> = ctx
@@ -84,7 +89,7 @@ impl Handler for Meta {
                         .insert_bin("trace-bin", &value)
                         .unwrap();
                 }
-                Some(Ok(Vec::new()))
+                Ok(Vec::new())
             }
             "/m.M/Mirror" => {
                 // Copy every text entry of the request to both response blocks.
@@ -102,21 +107,16 @@ impl Handler for Meta {
                     ctx.initial_metadata_mut().unwrap().insert(&k, &v).unwrap();
                     ctx.trailing_metadata_mut().insert(&k, &v).unwrap();
                 }
-                Some(Ok(Vec::new()))
+                Ok(Vec::new())
             }
-            "/m.M/UserAgent" => Some(Ok(ctx
+            "/m.M/UserAgent" => Ok(ctx
                 .metadata()
                 .get_all("user-agent")
                 .collect::<Vec<_>>()
                 .join(",")
-                .into_bytes())),
-            _ => None,
+                .into_bytes()),
+            path => Err(crate::handler::unimplemented(path)),
         }
-    }
-
-    fn method_kind(&self, path: &str) -> Option<MethodKind> {
-        matches!(path, "/m.M/Count" | "/m.M/FailStream" | "/m.M/Quiet")
-            .then_some(MethodKind::ServerStreaming)
     }
 
     fn on_message(&mut self, ctx: &mut CallContext<'_>, message: &[u8]) -> Result<(), Status> {
@@ -536,7 +536,8 @@ fn handlers_can_be_tested_with_a_hand_built_context() {
     let request = md(&[("k", "v")]);
     let mut response = ResponseMetadata::default();
     {
-        let mut ctx = CallContext::new("/m.M/Echo", 1, None, &request, &mut response);
+        let route = Route::new(MethodKind::Unary, 0);
+        let mut ctx = CallContext::new("/m.M/Echo", route, 1, None, &request, &mut response);
         assert_eq!(ctx.metadata().get("k"), Some("v"));
         ctx.initial_metadata_mut()
             .unwrap()
@@ -548,23 +549,25 @@ fn handlers_can_be_tested_with_a_hand_built_context() {
     assert_eq!(response.trailing.get("b"), Some("2"));
 
     response.initial = None;
-    let mut ctx = CallContext::new("/m.M/Echo", 1, None, &request, &mut response);
+    let route = Route::new(MethodKind::Unary, 0);
+    let mut ctx = CallContext::new("/m.M/Echo", route, 1, None, &request, &mut response);
     assert!(ctx.initial_metadata_mut().is_none());
 }
 
 #[test]
-fn tuple_and_reference_handlers_pass_the_context_through() {
-    let mut handler = (Meta::default(), Meta::default());
+fn reference_handlers_pass_the_context_through() {
+    let mut handler = Meta::default();
     let request = md(&[("x-req", "q")]);
     let mut response = ResponseMetadata::default();
-    let mut ctx = CallContext::new("/m.M/Echo", 1, None, &request, &mut response);
+    let route = handler.route("/m.M/Echo").unwrap();
+    let mut ctx = CallContext::new("/m.M/Echo", route, 1, None, &request, &mut response);
     let mut by_ref = &mut handler;
-    let reply = <&mut (Meta, Meta) as Handler>::call(&mut by_ref, &mut ctx, b"");
-    assert_eq!(reply, Some(Ok(b"q".to_vec())));
+    let reply = <&mut Meta as Handler>::call(&mut by_ref, &mut ctx, b"");
+    assert_eq!(reply, Ok(b"q".to_vec()));
     assert_eq!(
         response.initial.unwrap().get("x-init"),
         Some("i"),
-        "the first handler wrote through the shared context"
+        "the handler wrote through the shared context"
     );
 }
 

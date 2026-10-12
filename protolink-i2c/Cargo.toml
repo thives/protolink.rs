@@ -1,0 +1,15 @@
+[package]
+name = "protolink-i2c"
+version = "0.0.3"
+authors = [
+  "Thomas Ivesdal-Tronstad <>",
+]
+license = "MIT OR Apache-2.0"
+description = "Hardware-facing I2C mailbox protocol and target-driver contract for protolink adaptors."
+repository = "https://github.com/thives/protolink.rs"
+keywords = ["i2c", "embedded", "no_std", "async"]
+edition = "2024"
+rust-version = "1.88"
+
+[dependencies]
+embedded-hal-async = "1"

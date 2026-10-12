@@ -14,13 +14,11 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use embedded_io::{ErrorKind, ErrorType, Read, Write};
-use protolink::blocking::{
-    ReadTimeout, WakeHandle, WakeableRead, serve, serve_wakeable_with_clock, serve_with_clock,
-};
+use protolink::blocking::{ReadTimeout, WakeHandle, WakeableRead, WakeableReadTimeout};
 use protolink::grpc::Client;
 use protolink::{
-    CallContext, CallOptions, ClientConfig, Clock, Code, Error, Handler, MethodKind, Next,
-    ServerConfig, Status,
+    CallContext, CallOptions, ClientConfig, Clock, Code, Error, Handler, MethodKind, Next, Route,
+    Status,
 };
 
 const QUIET: &str = "/t.T/Quiet";
@@ -125,7 +123,9 @@ impl WakeableRead for ChannelIo {
     fn read_or_wake(&mut self, buf: &mut [u8]) -> Result<Option<usize>, ErrorKind> {
         self.read_or_wake_timeout(buf, None)
     }
+}
 
+impl WakeableReadTimeout for ChannelIo {
     fn read_or_wake_timeout(
         &mut self,
         buf: &mut [u8],
@@ -140,12 +140,8 @@ impl WakeableRead for ChannelIo {
 struct Quiet(Arc<AtomicUsize>);
 
 impl Handler for Quiet {
-    fn call(&mut self, _: &mut CallContext<'_>, _: &[u8]) -> Option<Result<Vec<u8>, Status>> {
-        None
-    }
-
-    fn method_kind(&self, path: &str) -> Option<MethodKind> {
-        (path == QUIET).then_some(MethodKind::ServerStreaming)
+    fn route(&self, path: &str) -> Option<Route> {
+        (path == QUIET).then_some(Route::new(MethodKind::ServerStreaming, 0))
     }
 
     fn on_message(&mut self, _: &mut CallContext<'_>, _: &[u8]) -> Result<(), Status> {
@@ -285,13 +281,22 @@ where
 
 #[test]
 fn server_with_a_clock_expires_a_quiet_call() {
-    expires_a_quiet_call(|io, h| serve_with_clock(io, h, ServerConfig::default(), Wall::new()));
+    expires_a_quiet_call(|io, h| {
+        protolink::blocking::server(io)
+            .with_deadline_clock(Wall::new())
+            .build()
+            .serve(h)
+    });
 }
 
 #[test]
 fn wakeable_server_with_a_clock_expires_a_quiet_call() {
     expires_a_quiet_call(|io, h| {
-        serve_wakeable_with_clock(io, h, ServerConfig::default(), Wall::new())
+        protolink::blocking::server(io)
+            .with_deadline_clock(Wall::new())
+            .with_wakeable_reads()
+            .build()
+            .serve(h)
     });
 }
 
@@ -299,7 +304,12 @@ fn wakeable_server_with_a_clock_expires_a_quiet_call() {
 fn server_without_a_clock_does_not_enforce_the_deadline() {
     let (io, mut peer) = connect();
     let handler = peer.handler();
-    let server = spawn(io, handler, |io, h| serve(io, h, ServerConfig::default()));
+    let server = spawn(io, handler, |io, h| {
+        protolink::blocking::server(io)
+            .without_deadlines()
+            .build()
+            .serve(h)
+    });
     let id = peer.start(DEADLINE);
     assert_eq!(peer.end(id, DEADLINE * 4), None);
     assert_eq!(peer.cancelled.load(SeqCst), 0);
@@ -314,7 +324,10 @@ fn a_call_without_a_timeout_is_not_expired() {
     let (io, mut peer) = connect();
     let handler = peer.handler();
     let server = spawn(io, handler, |io, h| {
-        serve_with_clock(io, h, ServerConfig::default(), Wall::new())
+        protolink::blocking::server(io)
+            .with_deadline_clock(Wall::new())
+            .build()
+            .serve(h)
     });
     let id = peer.client.start_streaming(QUIET).unwrap();
     peer.client.send_message(id, b"request").unwrap();
@@ -381,8 +394,9 @@ impl ReadTimeout for Silent {
 #[test]
 fn client_unary_times_out() {
     let (io, written) = Silent::new();
-    let mut client =
-        protolink::blocking::Client::with_clock(io, ClientConfig::default(), Wall::new());
+    let mut client = protolink::blocking::client(io)
+        .with_deadline_clock(Wall::new())
+        .build();
     let started = Instant::now();
     let err = client
         .unary_with("/t.T/Echo", b"hi", CallOptions::timeout(DEADLINE))
@@ -398,7 +412,9 @@ fn client_unary_times_out() {
 #[test]
 fn client_streaming_call_times_out_in_message() {
     let (io, _) = Silent::new();
-    let client = protolink::blocking::Client::with_clock(io, ClientConfig::default(), Wall::new());
+    let client = protolink::blocking::client(io)
+        .with_deadline_clock(Wall::new())
+        .build();
     let mut call = client
         .streaming_with("/t.T/Chat", CallOptions::timeout(DEADLINE))
         .unwrap();
@@ -416,7 +432,10 @@ fn client_default_timeout_applies() {
         default_timeout: Some(DEADLINE),
         ..ClientConfig::default()
     };
-    let mut client = protolink::blocking::Client::with_clock(io, config, Wall::new());
+    let mut client = protolink::blocking::client(io)
+        .with_config(config)
+        .with_deadline_clock(Wall::new())
+        .build();
     let err = client.unary("/t.T/Echo", b"hi").unwrap_err();
     assert_eq!(err.code, Code::DeadlineExceeded, "{err:?}");
 }
@@ -424,8 +443,9 @@ fn client_default_timeout_applies() {
 #[test]
 fn client_zero_timeout_fails_without_sending() {
     let (io, written) = Silent::new();
-    let mut client =
-        protolink::blocking::Client::with_clock(io, ClientConfig::default(), Wall::new());
+    let mut client = protolink::blocking::client(io)
+        .with_deadline_clock(Wall::new())
+        .build();
     let err = client
         .unary_with("/t.T/Echo", b"hi", CallOptions::timeout(Duration::ZERO))
         .unwrap_err();
@@ -452,7 +472,9 @@ fn client_without_a_clock_treats_a_timed_out_read_as_failure() {
             Err(ErrorKind::TimedOut)
         }
     }
-    let mut client = protolink::blocking::Client::new(TimesOut, ClientConfig::default());
+    let mut client = protolink::blocking::client(TimesOut)
+        .without_deadlines()
+        .build();
     let err = client
         .unary_with("/t.T/Echo", b"hi", CallOptions::timeout(DEADLINE))
         .unwrap_err();

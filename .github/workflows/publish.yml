@@ -14,6 +14,8 @@ on:
           - protolink-http2
           - protolink-grpc
           - protolink-grpc-gen
+          - protolink-i2c
+          - protolink-adaptors
 
 permissions:
   contents: read

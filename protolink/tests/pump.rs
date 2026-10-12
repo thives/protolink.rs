@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use embedded_io_async::{Error as _, ErrorKind, ErrorType, Read, Write};
 use protolink::link::pump::{DefaultPumpState, PumpError, PumpFailure, PumpState, run};
-use protolink::link::{LinkError, StdTimer, reliable_with_timer};
+use protolink::link::{LinkError, StdTimer, reliable};
 
 async fn with_timeout<F: Future>(f: F) -> F::Output {
     tokio::time::timeout(Duration::from_secs(10), f)
@@ -683,8 +683,12 @@ async fn reliable_link_over_dma_uart() {
         let (rb, tb) = dma(&ab, &ba, &stats);
         let (ha, mut rxa, mut txa) = sa.split(ra, ta);
         let (hb, mut rxb, mut txb) = sb.split(rb, tb);
-        let mut a = reliable_with_timer(ha, StdTimer::new());
-        let mut b = reliable_with_timer(hb, StdTimer::new());
+        let mut a = reliable(ha)
+            .with_retransmission_timer(StdTimer::new())
+            .build();
+        let mut b = reliable(hb)
+            .with_retransmission_timer(StdTimer::new())
+            .build();
 
         let request = payload(3000);
         let reply = payload(1500).into_iter().rev().collect::<Vec<_>>();
@@ -761,8 +765,12 @@ async fn without_the_pump_arq_aborts_dma_transfers() {
     let stats = Arc::new(Stats::default());
     let (ra, ta) = dma(&ba, &ab, &stats);
     let (rb, tb) = dma(&ab, &ba, &stats);
-    let mut a = reliable_with_timer(Duplex(ra, ta), StdTimer::new());
-    let mut b = reliable_with_timer(Duplex(rb, tb), StdTimer::new());
+    let mut a = reliable(Duplex(ra, ta))
+        .with_retransmission_timer(StdTimer::new())
+        .build();
+    let mut b = reliable(Duplex(rb, tb))
+        .with_retransmission_timer(StdTimer::new())
+        .build();
     let request = payload(3000);
 
     let transfer = async {

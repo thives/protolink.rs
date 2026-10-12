@@ -6,17 +6,19 @@
 //!
 //! ```no_run
 //! # async fn example() -> std::io::Result<()> {
-//! use protolink::grpc::{FnHandler, ServerConfig};
+//! use protolink::grpc::FnHandler;
 //!
 //! let listener = tokio::net::TcpListener::bind("127.0.0.1:50051").await?;
 //! let (stream, _) = listener.accept().await?;
-//! let mut handler = FnHandler(|_path: &str, req: &[u8]| Some(Ok(req.to_vec())));
-//! protolink::tokio::serve(stream, &mut handler, ServerConfig::default()).await.ok();
+//! let mut services = FnHandler(|_path: &str, req: &[u8]| Some(Ok(req.to_vec())));
+//! let server = protolink::tokio::server(stream).build();
+//! server.serve(&mut services).await.ok();
 //! # Ok(()) }
 //! ```
 //!
-//! [`serve`] and [`client`] enforce deadlines (`grpc-timeout`) with a
-//! [`TokioTimer`], so they work with tokio's paused test clock too.
+//! [`server`] and [`client`] are the async factories with a [`TokioTimer`]
+//! already chosen as the deadline timer, so they enforce `grpc-timeout` and
+//! work with tokio's paused test clock too.
 
 use core::time::Duration;
 
@@ -24,8 +26,7 @@ use ::tokio::io::{AsyncRead, AsyncWrite};
 use ::tokio::time::Instant;
 pub use embedded_io_adapters::tokio_1::FromTokio;
 
-use crate::grpc::{ClientConfig, Handler, ServerConfig};
-use crate::{Client, Clock, Error, Timer};
+use crate::{ClientBuilder, Clock, ServerBuilder, Timer};
 
 /// A [`Timer`] on tokio's clock.
 ///
@@ -80,24 +81,30 @@ pub fn compat<T: AsyncRead + AsyncWrite + Unpin>(io: T) -> FromTokio<T> {
     FromTokio::new(io)
 }
 
-/// [`serve_with_timer`](crate::serve_with_timer) on a tokio stream, with a
-/// [`TokioTimer`].
-pub async fn serve<T, H>(
-    io: T,
-    handler: &mut H,
-    config: ServerConfig,
-) -> Result<(), Error<std::io::Error>>
-where
-    T: AsyncRead + AsyncWrite + Unpin,
-    H: Handler + ?Sized,
-{
-    crate::serve_with_timer(FromTokio::new(io), handler, config, TokioTimer::new()).await
+/// Start building a server on a tokio stream, with a [`TokioTimer`] as the
+/// deadline timer.
+///
+/// The same [`ServerBuilder`] as [`crate::server`]; the timer can still be
+/// replaced with [`with_deadline_timer`](ServerBuilder::with_deadline_timer)
+/// or removed with [`without_deadlines`](ServerBuilder::without_deadlines).
+pub fn server<T: AsyncRead + AsyncWrite + Unpin>(io: T) -> ServerBuilder<FromTokio<T>, TokioTimer> {
+    crate::server(FromTokio::new(io)).with_deadline_timer(TokioTimer::new())
 }
 
-/// A [`Client`] on a tokio stream, with a [`TokioTimer`].
-pub fn client<T: AsyncRead + AsyncWrite + Unpin>(
-    io: T,
-    config: ClientConfig,
-) -> Client<FromTokio<T>, TokioTimer> {
-    Client::with_timer(FromTokio::new(io), config, TokioTimer::new())
+/// Start building a client on a tokio stream, with a [`TokioTimer`] as the
+/// deadline timer.
+///
+/// ```no_run
+/// # async fn demo(stream: tokio::net::TcpStream) {
+/// use core::time::Duration;
+///
+/// let transport = protolink::tokio::client(stream)
+///     .with_default_timeout(Duration::from_secs(5))
+///     .build();
+/// // Hand `transport` to a generated `<Service>Client::new`.
+/// # let _ = transport;
+/// # }
+/// ```
+pub fn client<T: AsyncRead + AsyncWrite + Unpin>(io: T) -> ClientBuilder<FromTokio<T>, TokioTimer> {
+    crate::client(FromTokio::new(io)).with_deadline_timer(TokioTimer::new())
 }

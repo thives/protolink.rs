@@ -14,10 +14,17 @@
 //! # Server streaming: replay the event log.
 //! grpcurl -plaintext -import-path examples/embedded-device/proto -proto device.proto \
 //!   -d '{}' 127.0.0.1:50051 protolink.examples.embedded.device.Service/EventSubscribe
+//!
+//! # The second service of the same device.
+//! grpcurl -plaintext -import-path examples/embedded-device/proto -proto device.proto \
+//!   -d '{}' 127.0.0.1:50051 protolink.examples.embedded.device.Diagnostics/GetCounters
 //! ```
+//!
+//! Each connection gets its own [`Device`], which serves both generated
+//! services through one [`MultiDispatch`](protolink::MultiDispatch). The
+//! driver is built per connection and only meets the device in `serve`.
 
-use embedded_device_example::{Device, ServiceServer};
-use protolink::ServerConfig;
+use embedded_device_example::{Device, DiagnosticsMethods, ServiceMethods};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> std::io::Result<()> {
@@ -30,10 +37,14 @@ async fn main() -> std::io::Result<()> {
         let (stream, peer) = listener.accept().await?;
         stream.set_nodelay(true)?;
         tokio::spawn(async move {
-            let mut handler = ServiceServer(Device::default());
-            if let Err(e) =
-                protolink::tokio::serve(stream, &mut handler, ServerConfig::default()).await
-            {
+            let mut device = Device::default();
+            let mut services = protolink::MultiDispatch::builder(&mut device)
+                .with_service(ServiceMethods)
+                .with_service(DiagnosticsMethods)
+                .build()
+                .expect("the services have distinct paths");
+            let server = protolink::tokio::server(stream).build();
+            if let Err(e) = server.serve(&mut services).await {
                 eprintln!("{peer}: {e}");
             }
         });

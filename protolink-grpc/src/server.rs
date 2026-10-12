@@ -16,7 +16,7 @@ use crate::inbound::Inbound;
 use crate::status::encode_message;
 use crate::{
     CallContext, CallId, DEFAULT_MAX_MESSAGE_SIZE, Handler, Metadata, MethodKind, Next,
-    ResponseMetadata, Status, lpm, timeout,
+    ResponseMetadata, Route, Status, lpm, timeout,
 };
 
 /// Maximum drive iterations per call and polling pass. Each iteration pulls
@@ -66,7 +66,9 @@ impl Default for ServerConfig {
 #[derive(Debug)]
 struct Call {
     path: String,
-    kind: MethodKind,
+    /// Selected by [`Handler::route`] when the call started; every later
+    /// event of the call is delivered with it.
+    route: Route,
     /// When the call runs out of time, on the server's clock (see
     /// [`Server::tick`]), from the request's `grpc-timeout`.
     deadline: Option<Duration>,
@@ -90,6 +92,7 @@ impl Call {
     fn ctx(&mut self, id: StreamId) -> CallContext<'_> {
         CallContext::new(
             &self.path,
+            self.route,
             id,
             self.deadline,
             &self.request_metadata,
@@ -230,7 +233,7 @@ impl Server {
 
     /// End the call with `DEADLINE_EXCEEDED`.
     fn expire<H: Handler + ?Sized>(&mut self, id: StreamId, handler: &mut H) {
-        let Some(kind) = self.calls.get(&id).map(|c| c.kind) else {
+        let Some(kind) = self.calls.get(&id).map(|c| c.route.kind) else {
             return;
         };
         // Trailers (and deferred resets) cannot pass flow-controlled DATA.
@@ -312,7 +315,7 @@ impl Server {
             if self.conn.has_stream(id) {
                 let _ = self.conn.reset_stream(id, ErrorCode::Cancel);
             }
-            if call.kind != MethodKind::Unary {
+            if call.route.kind != MethodKind::Unary {
                 handler.on_cancel(&mut call.ctx(id));
             }
         }
@@ -404,14 +407,15 @@ impl Server {
                 } else if stream_id > self.last_call {
                     self.last_call = stream_id;
                     match validate_request(&headers) {
-                        Ok(path) if handler.is_unknown_method(&path) => {
-                            // Nothing will serve this call: answer now
-                            // instead of waiting for the client to finish
-                            // sending.
-                            self.send_status(stream_id, end_stream, Err(unimplemented(&path)));
-                            return;
-                        }
                         Ok(path) => {
+                            // The call's route is resolved exactly once.
+                            let Some(route) = handler.route(&path) else {
+                                // Nothing will serve this call: answer now
+                                // instead of waiting for the client to finish
+                                // sending.
+                                self.send_status(stream_id, end_stream, Err(unimplemented(&path)));
+                                return;
+                            };
                             // A malformed timeout can't be honored, and
                             // ignoring it would silently run the call
                             // without the deadline the client asked for.
@@ -468,12 +472,11 @@ impl Server {
                                 .encoder_for(header(&headers, "grpc-accept-encoding"));
                             let mut inbound = Inbound::new(self.max_message_size);
                             inbound.set_codec(request_codec);
-                            let kind = handler.method_kind(&path).unwrap_or(MethodKind::Unary);
                             self.calls.insert(
                                 stream_id,
                                 Call {
                                     path,
-                                    kind,
+                                    route,
                                     deadline: timeout.map(|t| self.now.saturating_add(t)),
                                     inbound,
                                     half_closed: end_stream,
@@ -523,7 +526,7 @@ impl Server {
                 // their serialized output has been flushed. Draining records
                 // are retired by output_flushed, not protocol stream closure.
                 if let Some(mut call) = self.calls.remove(&stream_id)
-                    && call.kind != MethodKind::Unary
+                    && call.route.kind != MethodKind::Unary
                 {
                     handler.on_cancel(&mut call.ctx(stream_id));
                 }
@@ -548,7 +551,7 @@ impl Server {
         mut cx: Option<&mut Context<'_>>,
     ) {
         for _ in 0..CALL_QUANTUM {
-            let Some(kind) = self.calls.get(&id).map(|c| c.kind) else {
+            let Some(kind) = self.calls.get(&id).map(|c| c.route.kind) else {
                 return;
             };
             if self.is_expired(id) {
@@ -637,12 +640,9 @@ impl Server {
         }
         let truncated = call.inbound.finish();
         let message = call.inbound.next(&mut self.conn, id);
-        let path = call.path.clone();
         let mut ctx = call.ctx(id);
         let result = truncated.and_then(|()| match message {
-            Some(Ok(msg)) => handler
-                .call(&mut ctx, &msg)
-                .unwrap_or_else(|| Err(unimplemented(&path))),
+            Some(Ok(msg)) => handler.call(&mut ctx, &msg),
             Some(Err(e)) => Err(e),
             None => Err(Status::internal("missing request message")),
         });
@@ -683,7 +683,7 @@ impl Server {
             match call.inbound.next(&mut self.conn, id) {
                 Some(Ok(msg)) => {
                     delivered += 1;
-                    if call.kind == MethodKind::ServerStreaming && call.requests > 0 {
+                    if call.route.kind == MethodKind::ServerStreaming && call.requests > 0 {
                         self.abort(
                             id,
                             Status::internal(
@@ -711,7 +711,7 @@ impl Server {
                         self.abort(id, status, handler);
                         return true;
                     }
-                    if call.kind == MethodKind::ServerStreaming && call.requests == 0 {
+                    if call.route.kind == MethodKind::ServerStreaming && call.requests == 0 {
                         self.abort(id, Status::internal("missing request message"), handler);
                         return true;
                     }
@@ -736,7 +736,7 @@ impl Server {
         let Some(call) = self.calls.get(&id) else {
             return false;
         };
-        let kind = call.kind;
+        let kind = call.route.kind;
         if kind != MethodKind::BidiStreaming && !call.end_delivered {
             return false;
         }
@@ -804,7 +804,7 @@ impl Server {
                 if self
                     .calls
                     .get(&id)
-                    .is_some_and(|call| call.kind == MethodKind::Unary)
+                    .is_some_and(|call| call.route.kind == MethodKind::Unary)
                 {
                     self.finish(id, Err(status));
                 } else {
@@ -856,7 +856,7 @@ impl Server {
     /// Forget a call whose stream failed. Streaming handlers are told.
     fn teardown<H: Handler + ?Sized>(&mut self, id: StreamId, handler: &mut H) {
         if let Some(mut call) = self.calls.remove(&id)
-            && call.kind != MethodKind::Unary
+            && call.route.kind != MethodKind::Unary
         {
             handler.on_cancel(&mut call.ctx(id));
         }

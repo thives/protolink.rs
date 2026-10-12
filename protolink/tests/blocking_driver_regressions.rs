@@ -6,7 +6,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use embedded_io::{ErrorKind, ErrorType, Read, Write};
-use protolink::blocking::{Client, OutputTimeout, ReadTimeout};
+use protolink::blocking::{OutputTimeout, ReadTimeout};
 use protolink::grpc::FnHandler;
 use protolink::{CallOptions, ClientConfig, Clock, Code, ServerConfig};
 
@@ -157,7 +157,7 @@ fn failures_never_replay_or_reuse_the_transport() {
     ] {
         let io = Script::new(fault);
         let trace = io.trace.clone();
-        let mut client = Client::new(io, ClientConfig::default());
+        let mut client = protolink::blocking::client(io).without_deadlines().build();
         assert_eq!(
             client.unary("/t.T/Echo", b"x").unwrap_err().code,
             Code::Unavailable
@@ -177,7 +177,7 @@ fn failures_never_replay_or_reuse_the_transport() {
 fn streaming_send_after_failure_terminates_without_io() {
     let io = Script::new(Fault::Flush);
     let trace = io.trace.clone();
-    let client = Client::new(io, ClientConfig::default());
+    let client = protolink::blocking::client(io).without_deadlines().build();
     let mut call = client.streaming("/t.T/Chat").unwrap();
     call.send(b"one").unwrap();
     let count = trace.borrow().io;
@@ -193,7 +193,9 @@ fn read_budget_is_fresh_after_output() {
     io.write_cost = Duration::from_millis(80);
     let trace = io.trace.clone();
     let time = io.time.clone();
-    let mut client = Client::with_clock(io, ClientConfig::default(), time);
+    let mut client = protolink::blocking::client(io)
+        .with_deadline_clock(time)
+        .build();
     assert_eq!(
         client
             .unary_with("/t.T/Echo", b"x", CallOptions::timeout(BUDGET))
@@ -209,7 +211,9 @@ fn late_response_is_expired_before_recv() {
     let mut io = Script::new(Fault::None);
     io.read_cost = Duration::from_millis(101);
     let time = io.time.clone();
-    let mut client = Client::with_clock(io, ClientConfig::default(), time);
+    let mut client = protolink::blocking::client(io)
+        .with_deadline_clock(time)
+        .build();
     assert_eq!(
         client
             .unary_with("/t.T/Echo", b"x", CallOptions::timeout(BUDGET))
@@ -225,7 +229,9 @@ fn output_that_overruns_does_not_start_an_unbounded_read() {
     io.write_cost = Duration::from_millis(101);
     let trace = io.trace.clone();
     let time = io.time.clone();
-    let mut client = Client::with_clock(io, ClientConfig::default(), time);
+    let mut client = protolink::blocking::client(io)
+        .with_deadline_clock(time)
+        .build();
     assert_eq!(
         client
             .unary_with("/t.T/Echo", b"x", CallOptions::timeout(BUDGET))
@@ -242,7 +248,10 @@ fn write_and_flush_timeout_hooks_retire_the_connection() {
         let io = Script::new(fault);
         let trace = io.trace.clone();
         let time = io.time.clone();
-        let mut client = Client::with_io_timeouts(io, ClientConfig::default(), time);
+        let mut client = protolink::blocking::client(io)
+            .with_deadline_clock(time)
+            .with_output_timeouts()
+            .build();
         assert_eq!(
             client
                 .unary_with("/t.T/Echo", b"x", CallOptions::timeout(BUDGET))
@@ -334,15 +343,11 @@ struct Quiet {
     cancelled: usize,
 }
 impl protolink::Handler for Quiet {
-    fn call(
-        &mut self,
-        _: &mut protolink::CallContext<'_>,
-        _: &[u8],
-    ) -> Option<Result<Vec<u8>, protolink::Status>> {
-        None
-    }
-    fn method_kind(&self, _: &str) -> Option<protolink::MethodKind> {
-        Some(protolink::MethodKind::BidiStreaming)
+    fn route(&self, _: &str) -> Option<protolink::Route> {
+        Some(protolink::Route::new(
+            protolink::MethodKind::BidiStreaming,
+            0,
+        ))
     }
     fn on_message(
         &mut self,
@@ -370,7 +375,11 @@ fn server_read_budget_is_fresh_after_output() {
     let time = io.script.time.clone();
     let trace = io.script.trace.clone();
     let mut handler = Quiet::default();
-    protolink::blocking::serve_with_clock(io, &mut handler, ServerConfig::default(), time).unwrap();
+    protolink::blocking::server(io)
+        .with_deadline_clock(time)
+        .build()
+        .serve(&mut handler)
+        .unwrap();
     assert_eq!(
         trace.borrow().reads,
         [None, Some(Duration::from_millis(20))]
@@ -386,12 +395,11 @@ fn server_write_and_flush_timeout_capabilities_cancel_handlers() {
         let trace = io.script.trace.clone();
         let mut handler = Quiet::default();
         assert!(matches!(
-            protolink::blocking::serve_with_io_timeouts(
-                io,
-                &mut handler,
-                ServerConfig::default(),
-                time
-            ),
+            protolink::blocking::server(io)
+                .with_deadline_clock(time)
+                .with_output_timeouts()
+                .build()
+                .serve(&mut handler),
             Err(protolink::Error::Io(ErrorKind::TimedOut))
         ));
         assert_eq!(handler.cancelled, 1);
@@ -426,12 +434,11 @@ fn completed_unary_responses_keep_write_and_flush_timeout_budgets() {
             Some(Ok(req.to_vec()))
         });
         assert!(matches!(
-            protolink::blocking::serve_with_io_timeouts(
-                io,
-                &mut handler,
-                ServerConfig::default(),
-                time
-            ),
+            protolink::blocking::server(io)
+                .with_deadline_clock(time)
+                .with_output_timeouts()
+                .build()
+                .serve(&mut handler),
             Err(protolink::Error::Io(ErrorKind::TimedOut))
         ));
         assert_eq!(completed.get(), 1);
@@ -453,7 +460,11 @@ fn successful_server_flush_disarms_completed_unary_deadline() {
     let time = io.script.time.clone();
     let trace = io.script.trace.clone();
     let mut handler = FnHandler(|_: &str, req: &[u8]| Some(Ok(req.to_vec())));
-    protolink::blocking::serve_with_io_timeouts(io, &mut handler, ServerConfig::default(), time)
+    protolink::blocking::server(io)
+        .with_deadline_clock(time)
+        .with_output_timeouts()
+        .build()
+        .serve(&mut handler)
         .unwrap();
     assert_eq!(
         trace.borrow().flushes.last(),

@@ -100,6 +100,6 @@ impl Compression {
     /// Accept and send `gzip`, using [`GZIP`]. Needs the `miniz-oxide`
     /// feature.
     pub fn gzip() -> Self {
-        Self::new(&GZIP_ACCEPT).send(&GZIP)
+        Self::new(&GZIP_ACCEPT).with_send(&GZIP)
     }
 }

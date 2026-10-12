@@ -4,6 +4,9 @@
 //!
 //! - [`Server`]: turns HTTP/2 requests into calls on a [`Handler`] and encodes
 //!   responses, statuses and trailers, for unary and streaming RPCs.
+//! - [`Handler`] and [`Route`]: the routing contract. Generated
+//!   `<Service>Dispatch` wrappers implement it; [`Registry`] and
+//!   [`MultiDispatch`] serve several services on one connection.
 //! - [`Client`]: issues unary and streaming calls and maps responses and
 //!   trailers to messages and [`Status`]es.
 //! - [`lpm`]: incremental length-prefixed message framing.
@@ -77,6 +80,7 @@ extern crate std;
 mod client;
 pub mod codec;
 pub mod compression;
+mod dispatch;
 mod fields;
 mod handler;
 mod inbound;
@@ -90,7 +94,11 @@ pub use protolink_http2 as http2;
 
 pub use client::{CallOptions, Client, ClientConfig, Scheme};
 pub use compression::Compression;
-pub use handler::{CallContext, FnHandler, Handler, ResponseMetadata};
+pub use dispatch::{
+    Dispatcher, MultiDispatch, MultiDispatchBuilder, Registry, RegistryBuilder, RouteConflict,
+    ServiceList, ServiceMethods,
+};
+pub use handler::{CallContext, FnHandler, Handler, MethodDescriptor, ResponseMetadata, Route};
 pub use metadata::{InvalidMetadata, Metadata, MetadataValue};
 pub use server::{Server, ServerConfig};
 pub use status::{Code, Status};
@@ -351,6 +359,8 @@ mod tests_codec;
 mod tests_compression;
 #[cfg(test)]
 mod tests_deadline;
+#[cfg(test)]
+mod tests_dispatch;
 #[cfg(test)]
 mod tests_metadata;
 
