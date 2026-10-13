@@ -9,7 +9,7 @@ understands. It uses the same vocabulary as the rest of protolink (see [API.md](
 | Crate | Owns | Does not own |
 |---|---|---|
 | `protolink-i2c` | Mailbox encoding, controller transaction primitives, the target-driver trait | Queues, RPC, COBS/ARQ, executor tasks |
-| `protolink-adaptors` | `i2c_controller` / `i2c_target`, buffered ports, route storage, scheduling, runners | Board-specific peripheral setup |
+| `protolink-adaptors` | `i2c_controller` / `i2c_target` / `uart`, buffered ports, route storage, scheduling, runners | Board-specific peripheral setup |
 | `protolink` | RPC drivers, the reliable link, the ring and the DMA pump | Anything I2C specific |
 
 There is no new transport trait: a port implements `embedded_io_async::{Read, Write}`, which is what
@@ -190,11 +190,46 @@ controller read that is not exactly one mailbox ends `run`.
   state. The runner never resumes it; it disarms.
 - The error type is an associated `Error: Debug` and is preserved in `TargetError::Hardware`.
 
+## UART
+
+A UART is a full-duplex, point-to-point stream with no bus arbitration. The contract is in
+[UART.md](UART.md). Two paths exist, and the difference matters:
+
+| Path | Use it when | Assembly |
+|---|---|---|
+| **Direct** | the HAL driver is already cancel-safe, with a read that loses no bytes and a write that is all-or-nothing per poll | pass the driver to `protolink::link::reliable` (or `client`/`server`) |
+| **Buffered** | the RX and TX halves are split, and a transfer is aborted when its future is dropped (DMA) | `uart(rx, tx).with_storage(&mut state).build()` |
+
+A direct driver needs no adaptor, so there is nothing to build. The buffered path is a thin facade
+over `protolink::link::pump`: it provides the same vocabulary as I2C (`with_storage`, `build`, a
+`Binding`, a runner to drive), with its own buffer defaults. The compiled assembly, with reliability
+and the runner polled beside the server, is in
+[API.md](API.md#embedded-buffered-uart-port-and-runner-optional-reliability-separate-services).
+
+- `build` only borrows the storage: no peripheral I/O, no task spawned.
+- The port is the pump's `PumpHandle`, not the I2C `Port`.
+- Runner failure, cancellation and the error it returns are in
+  [UART.md](UART.md#shutdown-and-teardown).
+
+On Linux, `protolink_adaptors::uart::linux::LinuxUart` (feature `uart-linux`) wraps a configured
+`tokio-serial` port. It is nonblocking, and opening it is separate from `build`. Its `flush` is not
+wire-idle ([UART.md](UART.md#flush)). See [UART.md](UART.md#linux-wrapper) for the line settings,
+exclusivity, permissions and DTR.
+
+```rust,ignore
+let raw = LinuxUart::open("/dev/ttyUSB0", 115_200)?;
+let io = protolink::link::reliable(protolink::tokio::compat(raw)).build();
+```
+
 ## Features
 
 - `i2c` (default): the I2C adaptors.
+- `uart`: the buffered UART factory (`uart`, `UartState`, `UartBuilder`, `UartRunner`). It adds
+  no dependencies.
+- `uart-linux`: the Linux serial wrapper over `tokio-serial`. Compiled only for Linux targets, and
+  implies `uart`.
 - `portable-atomic`, `portable-atomic-critical-section`: forwarded to `protolink` for targets
   without native atomics (checked on `thumbv6m-none-eabi`).
 
-The crates are `no_std` and the adaptors need no heap. A UART adaptor is planned to follow the same
-conventions.
+The crates are `no_std` and the adaptors need no heap. The Linux wrapper is the only part that
+uses `std`, and it is compiled only with `uart-linux` on Linux.

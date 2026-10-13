@@ -9,16 +9,40 @@ description = "Embedded-style device telemetry and control over protolink gRPC."
 [dependencies]
 protolink = { path = "../../protolink", features = ["tokio", "blocking"] }
 micropb = { version = "0.6", features = ["alloc"] }
-tokio = { version = "1", features = ["rt", "macros", "net"] }
+tokio = { version = "1", features = ["rt", "macros", "net", "time"] }
+embedded-io-async = { version = "0.7", optional = true }
+protolink-adaptors = { path = "../../protolink-adaptors", optional = true }
 
 [build-dependencies]
 protolink-grpc-gen = { path = "../../protolink-grpc-gen" }
 micropb-gen = "0.6"
 
+[features]
+# The Linux serial binaries and `uart_link`. Compiled on Linux only.
+uart-linux = [
+    "dep:embedded-io-async",
+    "dep:protolink-adaptors",
+    "protolink-adaptors/uart-linux",
+]
+
+[[bin]]
+name = "embedded-device-uart-server"
+path = "src/bin/embedded-device-uart-server.rs"
+required-features = ["uart-linux"]
+
+[[bin]]
+name = "embedded-device-uart-client"
+path = "src/bin/embedded-device-uart-client.rs"
+required-features = ["uart-linux"]
+
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "macros", "io-util", "net", "time", "test-util"] }
+tokio = { version = "1", features = ["rt", "macros", "io-util", "net", "time", "test-util", "sync"] }
 embedded-io = "0.7"
 embedded-io-async = "0.7"
 embedded-hal-async = "1"
-protolink-adaptors = { path = "../../protolink-adaptors" }
+protolink-adaptors = { path = "../../protolink-adaptors", features = ["uart"] }
 embedded-io-adapters = { version = "0.7", features = ["tokio-1", "std"] }
+tokio-serial = { version = "5.5.0", default-features = false }
+arq-io-async = { version = "0.0.3", default-features = false }
+cobs-io-async = { version = "0.0.4", default-features = false }
+crc = "3.4"

@@ -14,12 +14,15 @@ default = []
 async = ["protolink/async", "dep:embedded-io-async"]
 blocking = ["protolink/blocking"]
 compression = ["protolink/miniz-oxide"]
+# The buffered UART facade and the reliable stack over it. Compile coverage only.
+uart = ["async", "dep:protolink-adaptors"]
 
 [dependencies]
 protolink = { path = "../../protolink", default-features = false, features = ["micropb", "portable-atomic-critical-section"] }
 micropb = { version = "0.6", default-features = false, features = ["alloc", "encode", "decode"] }
 embedded-io = { version = "0.7", default-features = false }
 embedded-io-async = { version = "0.7", default-features = false, optional = true }
+protolink-adaptors = { path = "../../protolink-adaptors", default-features = false, features = ["uart", "portable-atomic-critical-section"], optional = true }
 critical-section = { version = "1", default-features = false, features = ["restore-state-u32"] }
 
 [build-dependencies]

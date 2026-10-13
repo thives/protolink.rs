@@ -11,6 +11,10 @@ keywords = ["i2c", "embedded", "no_std", "async", "grpc"]
 edition = "2024"
 rust-version = "1.88"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio = { version = "1", default-features = false, optional = true }
+tokio-serial = { version = "5.5.0", default-features = false, optional = true }
+
 [dependencies]
 protolink = { version = "0", path = "../protolink", default-features = false, features = ["async"] }
 protolink-i2c = { version = "0", path = "../protolink-i2c", optional = true }
@@ -25,12 +29,18 @@ embedded-hal = "1"
 embedded-hal-async = "1"
 embedded-io-adapters = { version = "0.7", features = ["tokio-1"] }
 static_cell = "2"
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "io-util", "time", "sync"] }
 
 [features]
 default = ["i2c"]
 # `i2c_controller` and `i2c_target`.
 i2c = ["dep:protolink-i2c", "dep:embedded-hal-async"]
+# Buffered UART factory (`uart`) over the link pump, for any split HAL UART.
+# Adds no dependencies.
+uart = []
+# Linux serial port wrapper (`uart::linux::LinuxUart`) over `tokio-serial`.
+# Compiled only for Linux targets; other targets ignore the feature.
+uart-linux = ["uart", "dep:tokio", "dep:tokio-serial"]
 # Atomics for targets without native compare-and-swap (e.g. thumbv6m).
 portable-atomic = [
     "dep:portable-atomic",

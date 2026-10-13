@@ -34,6 +34,11 @@
 #[doc = include_str!("../../../docs/API.md")]
 pub struct ApiGuide;
 
+/// The same services over a Linux serial port: `embedded-device-uart-server`
+/// and `embedded-device-uart-client`.
+#[cfg(all(feature = "uart-linux", target_os = "linux"))]
+pub mod uart_link;
+
 pub mod proto {
     #![allow(
         clippy::all,

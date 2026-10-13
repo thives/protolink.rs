@@ -92,6 +92,9 @@ jobs:
             cargo check --release --target=${{matrix.target}} --no-default-features --features prost,async,blocking -p protolink
             cargo check --release --target=${{matrix.target}} --no-default-features -p protolink-i2c
             cargo check --release --target=${{matrix.target}} -p protolink-adaptors
+            cargo check --release --target=${{matrix.target}} --no-default-features --features uart -p protolink-adaptors
+            # Compiles to the facade alone off Linux; the serial wrapper is Linux-only.
+            cargo check --release --target=${{matrix.target}} --no-default-features --features uart-linux -p protolink-adaptors
 
   no-cas:
     name: no_std Cortex-M0 (${{ matrix.features }})
@@ -116,6 +119,9 @@ jobs:
         run: |
           cargo check --release --target thumbv6m-none-eabi --lib --no-default-features -p protolink-i2c
           cargo check --release --target thumbv6m-none-eabi --lib --features portable-atomic-critical-section -p protolink-adaptors
+      - name: Check the UART facade
+        if: matrix.features == 'portable-atomic-critical-section'
+        run: cargo check --release --target thumbv6m-none-eabi --lib --no-default-features --features uart,portable-atomic-critical-section -p protolink-adaptors
       # Separate invocations keep protolink's default micropb feature from
       # masking the sans-IO crates' codec-free feature combinations.
       - name: Check isolated sans-IO codec combinations
@@ -138,6 +144,8 @@ jobs:
           - async,compression
           - blocking,compression
           - async,blocking,compression
+          - uart
+          - async,blocking,uart
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

@@ -61,9 +61,19 @@
 //!
 //! They are not interchangeable.
 //!
+//! # UART
+//!
+//! [`uart()`] is the buffered factory for a split, full-duplex UART. It is a thin
+//! facade over [`protolink::link::pump`], and the runner drives both halves.
+//! Drivers that are already cancel-safe need no adaptor and are passed to
+//! protolink directly. See `docs/UART.md` for the contract.
+//!
 //! # Features
 //!
 //! - `i2c` (default): the I2C adaptors.
+//! - `uart`: the buffered UART factory, [`uart()`] and [`UartState`].
+//! - `uart-linux`: the Linux serial port wrapper, `uart::linux::LinuxUart`,
+//!   over `tokio-serial`. Compiled on Linux only; other targets ignore it.
 //! - `portable-atomic`, `portable-atomic-critical-section`: forwarded to
 //!   protolink, for targets without native atomics.
 #![no_std]
@@ -87,11 +97,22 @@ pub struct Binding<P, R> {
     pub runner: R,
 }
 
+/// Storage of a factory that has none attached yet; `build` needs it.
+///
+/// Shared by the I2C and UART factories.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NoStorage;
+
 #[cfg(feature = "i2c")]
 mod i2c;
 #[cfg(feature = "i2c")]
 pub use i2c::{
     AnyPeers, BuildError, Controller, ControllerBuilder, ControllerError, ControllerRunner,
-    ControllerState, NoStorage, SinglePeer, TargetBuilder, TargetError, TargetRunner, TargetState,
+    ControllerState, SinglePeer, TargetBuilder, TargetError, TargetRunner, TargetState,
     i2c_controller, i2c_target,
 };
+
+#[cfg(feature = "uart")]
+pub mod uart;
+#[cfg(feature = "uart")]
+pub use uart::{UartBuilder, UartRunner, UartState, uart};

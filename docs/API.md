@@ -48,6 +48,7 @@ The same words are used everywhere:
 | `protolink::Registry::builder()` | `with_service(dispatcher)` | `Registry` (fails on duplicate paths) | passed to `serve` |
 | `protolink::MultiDispatch::builder(app)` | `with_service(<Service>Methods)` | `MultiDispatch` (fails on duplicate paths) | passed to `serve` |
 | `i2c_controller(i2c, delay)`, `i2c_target(driver)` | `with_address`, `with_poll_interval`, `with_storage` | `Binding { port, runner }` | `runner.run().await` |
+| `uart(rx, tx)` | `with_storage` | `Binding { port, runner }` | `runner.run().await` |
 | `protolink_grpc_gen::Generator::{micropb, prost}()` | `with_*` | — | `compile_protos` |
 
 ## Decisions
@@ -273,6 +274,51 @@ where
 }
 ```
 
+## Embedded: buffered UART port and runner, optional reliability, separate services
+
+A UART with split, separately owned halves is assembled like the I²C port: the runner owns the
+halves, the port is the byte stream, and nothing is spawned. A UART whose driver is already
+cancel-safe needs no adaptor and is passed to `protolink::link::reliable` directly. See
+[UART.md](UART.md) for the contract and the flush meanings.
+
+```rust,no_run
+use embedded_device_example::{Device, ServiceDispatch};
+use embedded_io_async::{Read, Write};
+use protolink_adaptors::{Binding, UartState, uart};
+
+async fn device_over_uart<R, W, A, T>(uart_rx: R, uart_tx: W, arq_timer: A, deadline_timer: T)
+where
+    R: Read,
+    W: Write,
+    A: protolink::link::Timer,
+    T: protolink::Timer,
+{
+    // Caller-owned storage; a `static` (e.g. a `StaticCell`) on a device.
+    let mut state = UartState::new();
+    let Binding { port, runner } = uart(uart_rx, uart_tx)
+        .with_storage(&mut state)
+        .build();
+
+    let io = protolink::link::reliable(port)
+        .with_retransmission_timer(arq_timer)
+        .build();
+    let server = protolink::server(io).with_deadline_timer(deadline_timer).build();
+
+    let mut device = Device::default();
+    let mut services = ServiceDispatch::new(&mut device);
+
+    // Poll both: the runner moves the bytes, and returns only when a HAL half fails.
+    tokio::select! {
+        failed = runner.run() => {
+            let _uart_error = failed;
+        }
+        served = server.serve(&mut services) => {
+            let _connection_ended = served;
+        }
+    }
+}
+```
+
 ## Ownership and cancellation
 
 - `serve` consumes the driver and borrows the dispatcher for the whole connection. When the
@@ -283,6 +329,10 @@ where
 - A blocking `serve` that unwinds from a panicking handler attempts no cleanup.
 - Adaptor runners own the hardware; dropping `run()` tears the runner down and the ports fail with
   `PortError::Closed`.
+- A buffered UART runner owns both halves. When `run()` returns or is dropped, the port reads its
+  buffered bytes and then fails: `BrokenPipe` for a cancelled runner, or the HAL's error kind for
+  the direction that failed. The runner's error keeps the concrete RX or TX error. A failed session
+  is rebuilt, not restarted.
 
 ## Migration
 

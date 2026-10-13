@@ -50,7 +50,11 @@ cargo check --manifest-path examples/embedded-smoke/Cargo.toml \
 ```
 
 The CI consumer matrix independently checks `async`, `blocking`,
-`async,blocking`, and each combination with `compression`. Separately, the
+`async,blocking`, and each combination with `compression`. The `uart` feature
+adds the buffered UART facade and the reliable stack over it, and is checked
+alone and with `async,blocking`. This is compile coverage for the no_std target:
+the UART halves are stubs, so it shows that the code links, not that a UART
+works (see `docs/UART.md`). Separately, the
 runtime matrix checks `portable-atomic-critical-section` (which implies `async`)
 with all combinations of `blocking` and `miniz-oxide`, using only `--lib` (not tests,
 examples, or `--all-targets`, which could pull in std dev-dependencies). Separate

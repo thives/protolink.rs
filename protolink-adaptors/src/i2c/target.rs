@@ -3,9 +3,8 @@ use core::convert::Infallible;
 use protolink_i2c::mailbox::{self, MAILBOX_PAYLOAD_MAX, MAILBOX_SIZE};
 use protolink_i2c::target::{Command, I2cTarget, ReadStatus};
 
-use crate::Binding;
 use crate::channel::{Channel, DEFAULT_BUFFER_SIZE, Ends, Port, PortError};
-use crate::i2c::NoStorage;
+use crate::{Binding, NoStorage};
 
 /// Why a [`TargetRunner`] stopped.
 ///

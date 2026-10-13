@@ -103,6 +103,39 @@ read to answer duplicates after its final ACK was lost. `flush()` completes only
 when the peer has acknowledged everything written **and** every ACK owed to the
 peer has been written and flushed on the raw stream.
 
+## UART lines
+
+A UART is a raw stream like any other, so the requirements above apply. Which UART path to use
+depends on whether the driver is cancel-safe. [UART.md](UART.md) has the full contract.
+
+| Raw stream | Assembly |
+|---|---|
+| A driver whose read loses no bytes when dropped, and whose write is all-or-nothing per poll | `link::reliable(uart)` directly |
+| Split RX and TX halves, with a transfer that is aborted when its future is dropped (DMA) | `protolink_adaptors::uart(rx, tx).with_storage(..).build()`, and `link::reliable(port)` on its port |
+| Linux serial port (`tokio-serial`) | `link::reliable(protolink::tokio::compat(LinuxUart::open(path, baud)?))` |
+
+The Linux wrapper meets these requirements; see [UART.md](UART.md#operations).
+
+**Both ends of the line must use the same stack.** A UART has no framing or retransmission of its
+own. A peer that speaks COBS cannot read ARQ frames, and a raw peer cannot read either. Choose the
+stack explicitly on both ends, as the Linux examples do with `--transport raw|cobs|reliable`.
+
+### Flush at each layer
+
+A reliable `flush` is the only UART flush that tells you the peer has the bytes. It completes only
+after the peer has acknowledged everything written, and every ACK owed to the peer has been written
+through the raw stream. It does not mean the bytes are physically on the wire. The lower layers'
+`flush` is local progress toward that, not the end-to-end guarantee. Each layer's guarantee is in
+[UART.md](UART.md#flush).
+
+### Timers
+
+The reliable stack on a UART has two timers, and they are not interchangeable:
+
+- the ARQ retransmission timer, from `with_retransmission_timer`, or `StdTimer` on `std`;
+- the RPC deadline timer, from `with_deadline_timer` on the server and client, for example
+  `protolink::tokio::TokioTimer`.
+
 ## Failure semantics
 
 | Event | Result |

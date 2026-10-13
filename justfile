@@ -19,6 +19,7 @@ check:
 embedded:
   cargo build --target thumbv7em-none-eabihf --no-default-features {{no_std}}
   cargo build --target thumbv7em-none-eabihf --no-default-features --features async,blocking {{no_std}}
+  cargo build --target thumbv7em-none-eabihf --no-default-features --features uart -p protolink-adaptors
   # prost needs pointer-width atomics (via `bytes`), so not thumbv6m
   cargo build --target thumbv7em-none-eabihf --no-default-features --features prost -p protolink-grpc
   cargo build --target thumbv7em-none-eabihf --no-default-features --features prost,async,blocking -p protolink

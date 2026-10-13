@@ -10,8 +10,8 @@ use protolink_i2c::controller::{read_mailbox, write_payload};
 use protolink_i2c::mailbox::{self, MAILBOX_PAYLOAD_MAX, MAILBOX_SIZE, MailboxError};
 use protolink_i2c::{Address, InvalidAddress};
 
-use crate::Binding;
 use crate::channel::{Channel, DEFAULT_BUFFER_SIZE, Ends, Port, PortError};
+use crate::{Binding, NoStorage};
 
 /// Default pause when no route has work: one millisecond.
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(1);
@@ -185,10 +185,6 @@ pub fn i2c_controller<I: I2c, D: DelayNs>(i2c: I, delay: D) -> ControllerBuilder
         storage: NoStorage,
     }
 }
-
-/// Storage of a factory that has none attached yet; `build` needs it.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct NoStorage;
 
 /// Peers of a [`ControllerBuilder`] without an address: `build` returns a
 /// [`Controller`] to open peers on.

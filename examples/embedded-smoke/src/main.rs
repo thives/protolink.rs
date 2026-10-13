@@ -16,6 +16,8 @@ fn smoke_main() -> ! {
     let _ = core::hint::black_box(core::future::Future::poll(future.as_mut(), &mut cx));
     #[cfg(feature = "compression")]
     embedded_smoke::compression_smoke();
+    #[cfg(feature = "uart")]
+    embedded_smoke::uart_smoke();
     platform::halt()
 }
 

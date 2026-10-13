@@ -21,7 +21,7 @@ It is async first, `no_std + alloc`, with options for embedded-io, blocking I/O,
 | `protolink-grpc` | `protolink-grpc/` | Sans-IO gRPC server/client (unary and streaming), routing (`Handler`, `Registry`, `MultiDispatch`), status mapping, micropb and prost codecs (features) |
 | `protolink-http2` | `protolink-http2/` | Sans-IO HTTP/2 connection, built on `zerodds-http2` + `zerodds-hpack` |
 | `protolink-grpc-gen` | `protolink-grpc-gen/` | Code generator: service traits, dispatchers and clients for micropb or prost messages |
-| `protolink-adaptors` | `protolink-adaptors/` | Buffered ports and runners that turn a bus (I2C controller/target) into an `embedded-io-async` stream, see [docs/ADAPTORS.md](docs/ADAPTORS.md) |
+| `protolink-adaptors` | `protolink-adaptors/` | Buffered ports and runners that turn a bus (I2C controller/target) or a split UART into an `embedded-io-async` stream, and a Linux serial port wrapper; see [docs/ADAPTORS.md](docs/ADAPTORS.md) and [docs/UART.md](docs/UART.md) |
 | `protolink-i2c` | `protolink-i2c/` | The I2C mailbox protocol, controller transaction primitives and the target-driver trait |
 
 ```text
@@ -119,6 +119,41 @@ select(runner.run(), server.serve(&mut services)).await;
 
 Independent objects are registered with `protolink::Registry::builder().with_service(..)`; both
 `Registry` and `MultiDispatch` reject two services that serve the same path when built.
+
+### 4. UART: a buffered split HAL UART, or a serial port on Linux
+
+A split HAL UART is buffered by the same pump as the DMA path, with the adaptor vocabulary. The
+runner owns both halves and is polled next to the server. Nothing is spawned.
+
+```rust
+use protolink_adaptors::{Binding, UartState, uart};
+
+static UART: StaticCell<UartState> = StaticCell::new();
+let Binding { port, runner } = uart(uart_rx, uart_tx)     // no hardware touched yet
+    .with_storage(UART.init(UartState::new()))
+    .build();
+let io = protolink::link::reliable(port)                    // COBS + ARQ, explicitly
+    .with_retransmission_timer(arq_timer)
+    .build();
+let server = protolink::server(io).with_deadline_timer(deadline_timer).build();
+select(runner.run(), server.serve(&mut services)).await;     // runner returns only on failure
+```
+
+A UART whose driver is already cancel-safe needs no adaptor: pass it to `protolink::link::reliable`.
+On Linux, a configured serial port works the same way. Opening is separate from building:
+
+```rust
+use protolink_adaptors::uart::linux::LinuxUart;
+
+let raw = LinuxUart::open("/dev/ttyUSB0", 115_200)?;      // 8N1, raw, no flow control
+let io = protolink::link::reliable(protolink::tokio::compat(raw)).build();   // ARQ timer: StdTimer
+let client = protolink::client(io)
+    .with_deadline_timer(protolink::tokio::TokioTimer::new())
+    .build();
+```
+
+The Linux examples run the same services over `raw`, `cobs` or `reliable`, which both ends must
+choose the same way: see `examples/embedded-device` and [docs/UART.md](docs/UART.md).
 
 ## Code generation
 
@@ -424,3 +459,6 @@ and interrupt-driven UARTs are; one-shot DMA drivers are not (a dropped read los
 write is aborted part-way). `link::pump` is an optional lower layer for those: it owns the DMA
 halves, completes every transfer, and gives the link a cancel-safe `PumpHandle`. See the module
 docs for when to use it, its caveats, and a usage example.
+`protolink_adaptors::uart` is the buffered UART factory over this pump: it adds the `with_storage` /
+`build` vocabulary and buffer defaults, not a second buffer. The UART contract, including flush
+meanings for each layer, is in [docs/UART.md](docs/UART.md).

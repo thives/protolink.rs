@@ -9,6 +9,6 @@ mod target;
 
 pub use controller::{
     AnyPeers, BuildError, Controller, ControllerBuilder, ControllerError, ControllerRunner,
-    ControllerState, NoStorage, SinglePeer, i2c_controller,
+    ControllerState, SinglePeer, i2c_controller,
 };
 pub use target::{TargetBuilder, TargetError, TargetRunner, TargetState, i2c_target};

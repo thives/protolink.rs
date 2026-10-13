@@ -220,6 +220,50 @@ pub async fn async_smoke() {
     let _ = black_box(server.serve(&mut handler).await);
 }
 
+/// An ARQ retransmission timer that never expires. It links the reliable stack
+/// without a platform timer; nothing here runs a link long enough to need one.
+#[cfg(feature = "uart")]
+struct NeverTimer;
+
+#[cfg(feature = "uart")]
+impl protolink::link::Timer for NeverTimer {
+    fn start(&mut self, _timeout: core::time::Duration) {}
+
+    fn stop(&mut self) {}
+
+    fn poll_expired(&mut self, _cx: &mut Context<'_>) -> Poll<()> {
+        Poll::Pending
+    }
+}
+
+/// Monomorphize the buffered UART facade, its runner, and the reliable stack
+/// and server over its port.
+///
+/// The halves are stubs and nothing is transferred. This is compile coverage
+/// for the no_std targets. It is not evidence that a UART works: that needs a
+/// board and a HAL, see `docs/UART.md`.
+#[cfg(feature = "uart")]
+pub fn uart_smoke() {
+    use protolink_adaptors::{Binding, UartState, uart};
+
+    let mut state = UartState::new();
+    let Binding { port, runner } = uart(SmokeIo::new(), SmokeIo::new())
+        .with_storage(&mut state)
+        .build();
+    let mut runner = core::pin::pin!(runner.run());
+    let mut cx = Context::from_waker(core::task::Waker::noop());
+    // One poll: the receive half sees end of stream, and the transmit half has
+    // nothing to write. Nothing is awaited.
+    let _ = black_box(runner.as_mut().poll(&mut cx));
+
+    let link = protolink::link::reliable(port)
+        .with_retransmission_timer(NeverTimer)
+        .build();
+    let mut handler = SmokeDispatch::new(Echo);
+    let server = protolink::server(link).without_deadlines().build();
+    let _ = black_box(server.serve(&mut handler));
+}
+
 /// Keep the optional gzip backend in the linked image without a real peer.
 #[cfg(feature = "compression")]
 pub fn compression_smoke() {
