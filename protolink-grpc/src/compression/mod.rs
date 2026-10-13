@@ -15,8 +15,8 @@
 //!   implementation (for example miniz in a microcontroller's ROM) only
 //!   implements `Deflate`.
 //!
-//! The `miniz-oxide` feature adds the stock backend [`MinizOxide`] and the
-//! ready-made [`GZIP`] codec, see [`Compression::gzip`].
+//! The `miniz-oxide` feature adds the stock `MinizOxide` backend and the
+//! ready-made `GZIP` codec, configured with [`crate::Compression::gzip`].
 //!
 //! # Example
 //!

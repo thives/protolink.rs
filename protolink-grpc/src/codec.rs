@@ -2,7 +2,7 @@
 //! wrappers for streaming calls.
 //!
 //! Generated code names a backend explicitly: [`Micropb`] (feature `micropb`)
-//! or [`Prost`] (feature `prost`). Both implement [`Encode`] and [`Decode`], so
+//! or `Prost` (feature `prost`). Both implement [`Encode`] and [`Decode`], so
 //! the helpers and streaming wrappers below are shared.
 
 use alloc::vec::Vec;

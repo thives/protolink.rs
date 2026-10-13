@@ -55,8 +55,8 @@
 //!
 //! ## Usage from `build.rs`
 //!
-//! Choose the message backend with [`Generator::micropb`] or
-//! [`Generator::prost`], configure it with consuming `with_*` methods, then
+//! Choose the message backend with `Generator::micropb()` or
+//! `Generator::prost()`, configure it with consuming `with_*` methods, then
 //! compile:
 //!
 //! ```no_run
@@ -83,7 +83,7 @@
 //!
 //! ## Prost
 //!
-//! With the `prost` feature, [`Generator::prost`]'s `compile_protos` hands the
+//! With the `prost` feature, `Generator::prost()`'s `compile_protos` hands the
 //! parsed descriptors to a `prost_build::Config` and generates the messages and
 //! the bindings together (no `protoc` needed). prost resolves the type names, and
 //! the bindings of service `Name` land in module `name_grpc` of the package
@@ -162,8 +162,8 @@ impl From<io::Error> for Error {
 
 /// Code generator configuration, for the message backend `B`.
 ///
-/// Created by [`Generator::micropb`] or, with the `prost` feature,
-/// [`Generator::prost`], and configured with consuming `with_*` methods.
+/// Created by `Generator::micropb()` or, with the `prost` feature,
+/// `Generator::prost()`, and configured with consuming `with_*` methods.
 /// Settings that only one backend understands exist only on that backend's
 /// generator:
 ///
