@@ -11,7 +11,6 @@ fn check_with_target(fixture_dir: &str, features: Option<&str>, target_env: &str
     let mut cargo = Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
     cargo
         .arg("check")
-        .arg("--locked")
         .arg("--color=never")
         .arg("--manifest-path")
         .arg(fixture.join("Cargo.toml"))
@@ -86,7 +85,7 @@ fn prost_generated_bindings_compile_in_no_std_consumer() {
 fn prost_only_consumer_does_not_depend_on_micropb() {
     let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/compile-fixture-prost");
     let output = Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
-        .args(["tree", "--locked", "--prefix", "none", "--edges", "all"])
+        .args(["tree", "--prefix", "none", "--edges", "all"])
         .arg("--manifest-path")
         .arg(fixture.join("Cargo.toml"))
         .env_remove("CARGO_BUILD_TARGET")

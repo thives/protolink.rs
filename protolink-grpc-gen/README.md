@@ -169,13 +169,13 @@ mapping are tested in `protolink-grpc` (`tests_codec`).
 From the repository root:
 
 ```sh
-cargo test -p protolink-grpc-gen --locked
-PROTOLINK_GRPC_GEN_TEST_TARGET=thumbv6m-none-eabi cargo test -p protolink-grpc-gen --test compilation --locked
-PROTOLINK_GRPC_GEN_TEST_TARGET=thumbv7em-none-eabihf cargo test -p protolink-grpc-gen --test compilation --locked
-cargo test -p protolink-grpc-gen --features prost --locked
+cargo test -p protolink-grpc-gen
+PROTOLINK_GRPC_GEN_TEST_TARGET=thumbv6m-none-eabi cargo test -p protolink-grpc-gen --test compilation
+PROTOLINK_GRPC_GEN_TEST_TARGET=thumbv7em-none-eabihf cargo test -p protolink-grpc-gen --test compilation
+cargo test -p protolink-grpc-gen --features prost
 ```
 
 Cross-compilation requires the named Rust target to be installed. The fixture
-has its own lockfile and target directory; no parent workspace, configuration,
-or CI changes are needed. Cargo may download fixture dependencies on the first
-run; `CARGO_NET_OFFLINE=true` can be used when they are already cached.
+is an isolated workspace with its own target directory; no parent workspace,
+configuration, or CI changes are needed. Cargo may download fixture dependencies
+on the first run; `CARGO_NET_OFFLINE=true` can be used when they are already cached.
