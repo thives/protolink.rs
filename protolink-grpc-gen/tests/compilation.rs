@@ -44,12 +44,12 @@ fn check_with_target(fixture_dir: &str, features: Option<&str>, target_env: &str
 fn generated_bindings_compile_in_no_std_consumer() {
     // Suffixed and unsuffixed packages, each in every generation mode.
     for features in [
+        // The fixture's default features are the combined generation mode.
         None,
         Some(""),
         Some("server"),
         Some("async-client"),
         Some("blocking-client"),
-        Some("server,async-client,blocking-client"),
         Some("unsuffixed-packages"),
         Some("server,unsuffixed-packages"),
         Some("async-client,unsuffixed-packages"),

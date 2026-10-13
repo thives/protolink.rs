@@ -61,46 +61,40 @@ pub trait ServiceMethods<S: ?Sized> {
     /// See [`Handler::call`].
     fn call(
         &self,
-        service: &mut S,
+        _service: &mut S,
         ctx: &mut CallContext<'_>,
-        request: &[u8],
+        _request: &[u8],
     ) -> Result<Vec<u8>, Status> {
-        let _ = (service, request);
         Err(unimplemented(ctx.path))
     }
 
     /// See [`Handler::on_message`].
     fn on_message(
         &self,
-        service: &mut S,
+        _service: &mut S,
         ctx: &mut CallContext<'_>,
-        message: &[u8],
+        _message: &[u8],
     ) -> Result<(), Status> {
-        let _ = (service, message);
         Err(unimplemented(ctx.path))
     }
 
     /// See [`Handler::on_half_close`].
-    fn on_half_close(&self, service: &mut S, ctx: &mut CallContext<'_>) -> Result<(), Status> {
-        let _ = (service, ctx);
+    fn on_half_close(&self, _service: &mut S, _ctx: &mut CallContext<'_>) -> Result<(), Status> {
         Ok(())
     }
 
     /// See [`Handler::poll_response`].
     fn poll_response(
         &self,
-        service: &mut S,
+        _service: &mut S,
         ctx: &mut CallContext<'_>,
-        cx: &mut Context<'_>,
+        _cx: &mut Context<'_>,
     ) -> Poll<Next<Vec<u8>>> {
-        let _ = (service, cx);
         Poll::Ready(Next::Done(Err(unimplemented(ctx.path))))
     }
 
     /// See [`Handler::on_cancel`].
-    fn on_cancel(&self, service: &mut S, ctx: &mut CallContext<'_>) {
-        let _ = (service, ctx);
-    }
+    fn on_cancel(&self, _service: &mut S, _ctx: &mut CallContext<'_>) {}
 }
 
 /// Two services of a [`Registry`] or [`MultiDispatch`] serve the same path.

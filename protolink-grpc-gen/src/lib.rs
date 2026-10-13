@@ -1708,11 +1708,12 @@ service Service {
     }
 
     #[test]
-    fn generates_service() {
+    fn generates_service_and_streaming_dispatch() {
         let src = generate(&Generator::micropb());
         assert!(src.contains(
             "pub const METHOD_COMMAND: &::core::primitive::str = \"/a.b.Service/Command\";"
         ));
+
         // The method table: path, shape and identifier (its index).
         for line in [
             "__rt::MethodDescriptor::new(METHOD_COMMAND, __rt::MethodKind::Unary, 0),",
@@ -1723,6 +1724,32 @@ service Service {
         ] {
             assert!(src.contains(line), "missing `{line}`");
         }
+
+        // The service trait. Streaming methods default to UNIMPLEMENTED; unary
+        // ones are required.
+        let service_trait = &src[src.find("pub trait Service {").unwrap()..];
+        let service_trait = &service_trait[..service_trait.find("\n    }\n").unwrap()];
+        assert!(
+            service_trait
+                .contains("Err(__rt::Status::unimplemented(\"`Upload` is not implemented\"))")
+        );
+        assert!(service_trait.contains("fn command(&mut self, ctx: &mut __rt::CallContext<'_>, request: super::a_::b_::Command) -> ::core::result::Result<super::a_::b_::Reply, __rt::Status>;"));
+        // Only bidirectional calls have an end-of-requests hook.
+        assert!(src.contains("fn end_chat("));
+        assert!(!src.contains("fn end_upload("));
+        assert!(!src.contains("fn end_event_subscribe("));
+
+        // Every method, required or not, is forwarded for `&mut S`.
+        for line in [
+            "<S as self::Service>::command(&mut **self, ctx, request)",
+            "<S as self::Service>::upload(&mut **self, ctx, request)",
+            "<S as self::Service>::poll_chat(&mut **self, ctx, cx)",
+            "<S as self::Service>::end_chat(&mut **self, ctx)",
+            "<S as self::Service>::cancel_event_subscribe(&mut **self, ctx)",
+        ] {
+            assert!(src.contains(line), "missing `{line}`");
+        }
+
         // The call context, with the deadline, reaches the service method.
         assert!(src.contains(
             "0 => __rt::codec::unary::<__rt::codec::Micropb, _, _>(request, |req| <S as self::Service>::command(service, ctx, req)),"
@@ -1741,38 +1768,8 @@ service Service {
             assert!(src.contains(line), "missing `{line}`");
         }
         assert!(!src.contains("Server<S>"));
-    }
 
-    #[test]
-    fn generates_streaming_service_methods() {
-        let src = generate(&Generator::micropb());
-        // Streaming methods default to UNIMPLEMENTED; unary ones are required.
-        let service_trait = &src[src.find("pub trait Service {").unwrap()..];
-        let service_trait = &service_trait[..service_trait.find("\n    }\n").unwrap()];
-        assert!(
-            service_trait
-                .contains("Err(__rt::Status::unimplemented(\"`Upload` is not implemented\"))")
-        );
-        assert!(service_trait.contains("fn command(&mut self, ctx: &mut __rt::CallContext<'_>, request: super::a_::b_::Command) -> ::core::result::Result<super::a_::b_::Reply, __rt::Status>;"));
-        // Every method, required or not, is forwarded for `&mut S`.
-        for line in [
-            "<S as self::Service>::command(&mut **self, ctx, request)",
-            "<S as self::Service>::upload(&mut **self, ctx, request)",
-            "<S as self::Service>::poll_chat(&mut **self, ctx, cx)",
-            "<S as self::Service>::end_chat(&mut **self, ctx)",
-            "<S as self::Service>::cancel_event_subscribe(&mut **self, ctx)",
-        ] {
-            assert!(src.contains(line), "missing `{line}`");
-        }
-        // Only bidirectional calls have an end-of-requests hook.
-        assert!(src.contains("fn end_chat("));
-        assert!(!src.contains("fn end_upload("));
-        assert!(!src.contains("fn end_event_subscribe("));
-    }
-
-    #[test]
-    fn generates_streaming_routing() {
-        let src = generate(&Generator::micropb());
+        // Each method shape reaches its own entry point.
         for line in [
             "1 => __rt::codec::unary::<__rt::codec::Micropb, _, _>(request, |req| <S as self::Service>::nested(service, ctx, req)),",
             "3 => __rt::codec::message::<__rt::codec::Micropb, _>(message, |req| <S as self::Service>::upload(service, ctx, req)),",
@@ -1789,15 +1786,21 @@ service Service {
         assert!(!src.contains("::end_upload(service"));
         // Unary methods are not routed to the streaming entry points, nor
         // streaming methods to the unary one.
-        assert!(!src.contains("0 => __rt::codec::message"));
-        assert!(!src.contains("2 => __rt::codec::unary"));
+        assert!(
+            !src.contains("0 => __rt::codec::message"),
+            "a unary method is routed to a streaming entry point"
+        );
+        assert!(
+            !src.contains("2 => __rt::codec::unary"),
+            "a streaming method is routed to the unary entry point"
+        );
         // Routing is the method table; there is no other routing authority.
         assert!(!src.contains("method_kind"));
         assert!(!src.contains("is_unknown_method"));
     }
 
     #[test]
-    fn generates_streaming_clients() {
+    fn generates_unary_and_streaming_clients() {
         let src = generate(&Generator::micropb());
         for line in [
             // Each shape returns its own wrapper type.
@@ -1812,15 +1815,7 @@ service Service {
             "__rt::StreamingTransport::start(&self.transport, METHOD_CHAT, options).await?",
             "__rt::BlockingStreamingTransport::start(&self.transport, METHOD_CHAT, options)?",
             "self.chat_with_options(__rt::CallOptions::default()).await",
-        ] {
-            assert!(src.contains(line), "missing `{line}`");
-        }
-    }
-
-    #[test]
-    fn generates_unary_clients_with_options() {
-        let src = generate(&Generator::micropb());
-        for line in [
+            // Unary calls take per-call options and return the response metadata.
             "self.command_with_options(request, __rt::CallOptions::default()).await",
             "__rt::UnaryTransport::unary(&mut self.transport, METHOD_COMMAND, &request, options).await?",
             "__rt::BlockingUnaryTransport::unary(&mut self.transport, METHOD_COMMAND, &request, options)?",

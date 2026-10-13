@@ -8,6 +8,7 @@ use std::future::{Future, poll_fn};
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
+use std::time::Duration;
 
 use embedded_hal::i2c::{ErrorKind, ErrorType, Operation};
 use embedded_hal_async::delay::DelayNs;
@@ -26,6 +27,13 @@ impl embedded_hal::i2c::Error for BusFault {
     fn kind(&self) -> ErrorKind {
         ErrorKind::Bus
     }
+}
+
+/// Fails the test if `f` takes longer than ten seconds.
+pub async fn with_timeout<F: Future>(f: F) -> F::Output {
+    tokio::time::timeout(Duration::from_secs(10), f)
+        .await
+        .expect("test timed out")
 }
 
 /// A future that is pending once and wakes itself, so other tasks run.

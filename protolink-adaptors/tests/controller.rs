@@ -2,7 +2,7 @@
 
 mod common;
 
-use std::future::{Future, poll_fn};
+use std::future::Future;
 use std::pin::pin;
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
@@ -12,12 +12,6 @@ use embedded_io_async::{Read, Write};
 use protolink_adaptors::{Binding, ControllerError, ControllerState, PortError, i2c_controller};
 use protolink_i2c::mailbox::MAILBOX_PAYLOAD_MAX;
 use protolink_i2c::mailbox::MailboxError;
-
-async fn with_timeout<F: Future>(f: F) -> F::Output {
-    tokio::time::timeout(Duration::from_secs(10), f)
-        .await
-        .expect("test timed out")
-}
 
 /// Polls a future once and drops it if it is pending, as ARQ does.
 fn poll_once<F: Future>(fut: F) -> Option<F::Output> {
@@ -354,10 +348,4 @@ async fn write_accepts_a_prefix_when_space_is_short() {
             .unwrap();
     assert_eq!(port.write(&[1u8; 20]).await, Ok(8));
     drop(runner);
-}
-
-// Keep the helper used even if a future test drops it.
-#[allow(dead_code)]
-async fn _poll_fn_is_available() {
-    poll_fn(|_| Poll::Ready(())).await;
 }

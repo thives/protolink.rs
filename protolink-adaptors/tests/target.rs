@@ -2,21 +2,12 @@
 
 mod common;
 
-use std::future::Future;
-use std::time::Duration;
-
 use common::*;
 use embedded_hal_async::i2c::I2c;
 use embedded_io_async::{Read, Write};
 use protolink_adaptors::{Binding, PortError, TargetError, TargetState, i2c_target};
 use protolink_i2c::mailbox::{MAILBOX_SIZE, decode_response};
 use protolink_i2c::target::{Command, I2cTarget, ReadStatus};
-
-async fn with_timeout<F: Future>(f: F) -> F::Output {
-    tokio::time::timeout(Duration::from_secs(10), f)
-        .await
-        .expect("test timed out")
-}
 
 async fn read_frame(controller: &mut SimController) -> [u8; MAILBOX_SIZE] {
     let mut frame = [0u8; MAILBOX_SIZE];

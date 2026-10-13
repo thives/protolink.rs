@@ -258,20 +258,17 @@ pub trait Handler {
     fn route(&self, path: &str) -> Option<Route>;
 
     /// Handle the unary call `ctx.path` with the encoded `request` message.
-    fn call(&mut self, ctx: &mut CallContext<'_>, request: &[u8]) -> Result<Vec<u8>, Status> {
-        let _ = request;
+    fn call(&mut self, ctx: &mut CallContext<'_>, _request: &[u8]) -> Result<Vec<u8>, Status> {
         Err(unimplemented(ctx.path))
     }
 
     /// One request message of the streaming call `ctx.id` on `ctx.path`.
-    fn on_message(&mut self, ctx: &mut CallContext<'_>, message: &[u8]) -> Result<(), Status> {
-        let _ = message;
+    fn on_message(&mut self, ctx: &mut CallContext<'_>, _message: &[u8]) -> Result<(), Status> {
         Err(unimplemented(ctx.path))
     }
 
     /// The client half-closed the streaming call: no more request messages.
-    fn on_half_close(&mut self, ctx: &mut CallContext<'_>) -> Result<(), Status> {
-        let _ = ctx;
+    fn on_half_close(&mut self, _ctx: &mut CallContext<'_>) -> Result<(), Status> {
         Ok(())
     }
 
@@ -279,16 +276,13 @@ pub trait Handler {
     fn poll_response(
         &mut self,
         ctx: &mut CallContext<'_>,
-        cx: &mut Context<'_>,
+        _cx: &mut Context<'_>,
     ) -> Poll<Next<Vec<u8>>> {
-        let _ = cx;
         Poll::Ready(Next::Done(Err(unimplemented(ctx.path))))
     }
 
     /// The streaming call ended without the handler finishing it.
-    fn on_cancel(&mut self, ctx: &mut CallContext<'_>) {
-        let _ = ctx;
-    }
+    fn on_cancel(&mut self, _ctx: &mut CallContext<'_>) {}
 }
 
 pub(crate) fn unimplemented(path: &str) -> Status {

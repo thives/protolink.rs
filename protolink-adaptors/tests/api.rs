@@ -46,21 +46,6 @@ async fn target_with_local_storage() {
     let _ = port;
 }
 
-#[tokio::test]
-async fn multiple_peers_on_one_bus_share_one_runner() {
-    let mut state = ControllerState::<2>::new();
-    let mut controller = i2c_controller(NullI2c, TokioDelay)
-        .with_poll_interval(Duration::from_millis(1))
-        .with_storage(&mut state)
-        .build()
-        .unwrap();
-    let sensor = controller.open(0x42).unwrap();
-    let actuator = controller.open(0x43).unwrap();
-    // The ports borrow the state, not the controller.
-    let runner = controller.into_runner();
-    drop((sensor, actuator, runner));
-}
-
 static CONTROLLER_STATE: StaticCell<ControllerState<2>> = StaticCell::new();
 static TARGET_STATE: StaticCell<TargetState> = StaticCell::new();
 

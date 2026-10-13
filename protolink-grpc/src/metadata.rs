@@ -433,11 +433,7 @@ mod tests {
         assert_eq!(md.insert("te", "x"), Err(InvalidMetadata::ReservedKey));
         assert!(md.insert("x-a_b.c-1", "x").is_ok());
         assert_eq!(md.len(), 1);
-    }
-
-    #[test]
-    fn user_agent_is_not_reserved() {
-        let mut md = Metadata::new();
+        // `user-agent` is not reserved, unlike the keys above.
         md.insert("user-agent", "mine/1").unwrap();
         assert_eq!(md.get("user-agent"), Some("mine/1"));
     }
