@@ -23,7 +23,7 @@ use protolink_http2::{Connection, Event, HeaderField};
 
 /// Run-length codec: `(count, byte)` pairs. Shrinks runs, doubles anything else.
 #[derive(Debug)]
-struct Rle {
+pub(crate) struct Rle {
     honor_limit: bool,
 }
 
@@ -62,10 +62,10 @@ impl Codec for Rle {
     }
 }
 
-static RLE: Rle = Rle { honor_limit: true };
+pub(crate) static RLE: Rle = Rle { honor_limit: true };
 /// A broken codec that does not enforce the limit it is given.
 static RLE_NO_LIMIT: Rle = Rle { honor_limit: false };
-static ACCEPT_RLE: [&dyn Codec; 1] = [&RLE];
+pub(crate) static ACCEPT_RLE: [&dyn Codec; 1] = [&RLE];
 
 /// Accept and send `rle`; compress everything from 8 bytes.
 fn rle() -> Compression {

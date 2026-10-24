@@ -3,10 +3,18 @@
 extern crate std;
 
 use super::*;
+use crate::compression::Codec;
+use crate::fields::{field, header};
+use crate::local::CALL_QUANTUM;
+use crate::lpm;
+use crate::{CallContext, MethodKind, Next, Status};
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
+use alloc::vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
+use core::task::Poll;
 use core::task::Waker;
+use protolink_http2::{Connection, ErrorCode, Event};
 use std::task::Wake;
 
 #[derive(Default)]
@@ -261,7 +269,7 @@ fn invalid_terminal_metadata_resets_immediately_even_with_zero_window_or_open_re
                     None,
                     "rejected trailers must discard blocked DATA"
                 );
-                assert!(!server.conn.has_stream(id));
+                assert!(!server.core.conn().has_stream(id));
                 conn.recv(&server.take_output()).unwrap();
                 let events: Vec<_> = core::iter::from_fn(|| conn.poll_event()).collect();
                 let resets: Vec<_> = events
@@ -284,7 +292,7 @@ fn invalid_terminal_metadata_resets_immediately_even_with_zero_window_or_open_re
                         }
                 )));
                 assert_eq!(conn.stream_count(), 0);
-                assert!(server.draining.is_empty());
+                assert!(server.core.draining().is_empty());
                 assert_eq!(server.next_deadline(), None);
             }
         }
@@ -344,8 +352,8 @@ fn invalid_response_metadata_completes_the_client_with_error_and_other_streams_s
                     b"valid"
                 );
                 assert_eq!(server.active_calls(), 0);
-                assert!(server.draining.is_empty());
-                assert_eq!(server.conn.stream_count(), 0);
+                assert!(server.core.draining().is_empty());
+                assert_eq!(server.core.conn().stream_count(), 0);
                 assert_eq!(server.next_deadline(), None);
                 assert!(
                     !server.is_closed(),
@@ -373,7 +381,7 @@ fn active_expiry_delivers_timeout_trailers_best_effort_without_the_old_output_de
             .tick(Duration::from_millis(100), &mut peer.handler);
         assert_eq!(peer.server.active_calls(), 0);
         assert!(peer.server.has_output(), "timeout trailers await delivery");
-        assert_eq!(peer.server.draining.get(&id), Some(&None));
+        assert_eq!(peer.server.core.draining().get(&id), Some(&None));
         assert_eq!(peer.server.next_deadline(), None);
         if path == "/test/Unary" {
             assert!(peer.handler.cancelled.is_empty());
@@ -391,7 +399,7 @@ fn active_expiry_delivers_timeout_trailers_best_effort_without_the_old_output_de
         peer.server.recv(&[], &mut peer.handler).unwrap();
         peer.server
             .tick(Duration::from_millis(200), &mut peer.handler);
-        assert_eq!(peer.server.draining.get(&id), Some(&None));
+        assert_eq!(peer.server.core.draining().get(&id), Some(&None));
         assert_eq!(peer.server.next_deadline(), None);
         let output = peer.server.pending_output().to_vec();
         peer.conn.recv(&output).unwrap();
@@ -402,10 +410,10 @@ fn active_expiry_delivers_timeout_trailers_best_effort_without_the_old_output_de
                 if *stream_id == id && header(headers, "grpc-status") == Some("4"))));
         assert_eq!(peer.data_len(id), 0);
         peer.server.consume_output(output.len());
-        assert_eq!(peer.server.draining.get(&id), Some(&None));
+        assert_eq!(peer.server.core.draining().get(&id), Some(&None));
         assert_eq!(peer.server.next_deadline(), None);
         peer.server.output_flushed();
-        assert!(!peer.server.draining.contains_key(&id));
+        assert!(!peer.server.core.draining().contains_key(&id));
         assert_eq!(
             peer.handler.cancelled.len(),
             usize::from(path != "/test/Unary")
@@ -421,9 +429,9 @@ fn active_expiry_clears_only_its_new_timeout_trailers_deadline() {
     peer.server
         .tick(Duration::from_millis(100), &mut peer.handler);
     assert_eq!(peer.server.active_calls(), 0);
-    assert_eq!(peer.server.draining.get(&expired), Some(&None));
+    assert_eq!(peer.server.core.draining().get(&expired), Some(&None));
     assert_eq!(
-        peer.server.draining.get(&success),
+        peer.server.core.draining().get(&success),
         Some(&Some(Duration::from_millis(100)))
     );
     assert_eq!(
@@ -455,9 +463,9 @@ fn fully_serialized_response(path: &str) -> (Peer, StreamId) {
     peer.poll();
     assert_eq!(peer.server.active_calls(), 0);
     assert_eq!(peer.server.queued_response_bytes(id), None);
-    assert!(!peer.server.conn.has_stream(id));
+    assert!(!peer.server.core.conn().has_stream(id));
     assert!(peer.server.pending_output().len() > 130);
-    assert_eq!(peer.server.draining.len(), 1);
+    assert_eq!(peer.server.core.draining().len(), 1);
     assert_eq!(
         peer.server.next_deadline(),
         Some(Duration::from_millis(100))
@@ -488,7 +496,7 @@ fn assert_serialized_deadline_survives_stalled_write_and_flush(path: &str) {
             .tick(Duration::from_millis(now), &mut peer.handler);
         peer.poll();
         peer.server.recv(&[], &mut peer.handler).unwrap();
-        assert_eq!(peer.server.draining.len(), 1);
+        assert_eq!(peer.server.core.draining().len(), 1);
         assert_eq!(
             peer.server.next_deadline(),
             Some(Duration::from_millis(100))
@@ -501,7 +509,7 @@ fn assert_serialized_deadline_survives_stalled_write_and_flush(path: &str) {
     }
     assert!(peer.handler.cancelled.is_empty());
     peer.server.output_flushed();
-    assert_eq!(peer.server.draining.len(), 0);
+    assert_eq!(peer.server.core.draining().len(), 0);
     assert_eq!(peer.server.next_deadline(), None);
 }
 
@@ -521,7 +529,7 @@ fn successful_flush_acknowledgment_retires_serialized_unary_and_finite_responses
         let (mut peer, _) = fully_serialized_response(path);
         peer.server.output_flushed();
         assert_eq!(
-            peer.server.draining.len(),
+            peer.server.core.draining().len(),
             1,
             "unwritten output cannot be acknowledged"
         );
@@ -534,7 +542,7 @@ fn successful_flush_acknowledgment_retires_serialized_unary_and_finite_responses
             Some(Duration::from_millis(100))
         );
         peer.server.output_flushed();
-        assert_eq!(peer.server.draining.len(), 0);
+        assert_eq!(peer.server.core.draining().len(), 0);
         assert_eq!(peer.server.next_deadline(), None);
         peer.server.tick(Duration::MAX, &mut peer.handler);
         assert!(!peer.server.has_output());
@@ -549,7 +557,7 @@ fn taking_serialized_output_transfers_its_delivery_obligation() {
         peer.recv_responses();
         assert_eq!(peer.data_len(id), lpm::HEADER_LEN + 130);
         assert!(peer.has_trailers(id));
-        assert_eq!(peer.server.draining.len(), 0);
+        assert_eq!(peer.server.core.draining().len(), 0);
         assert_eq!(peer.server.next_deadline(), None);
     }
 }
@@ -561,7 +569,7 @@ fn connection_cancellation_retires_fully_serialized_unacknowledged_responses() {
         let bytes = peer.server.pending_output().len();
         peer.server.consume_output(bytes);
         peer.server.cancel_all(&mut peer.handler);
-        assert_eq!(peer.server.draining.len(), 0);
+        assert_eq!(peer.server.core.draining().len(), 0);
         assert_eq!(peer.server.next_deadline(), None);
         assert!(peer.handler.cancelled.is_empty());
     }
@@ -575,7 +583,7 @@ fn unblocked_response_keeps_its_deadline_until_the_serialized_remainder_is_flush
     assert_eq!(peer.server.queued_response_bytes(id), Some(18));
     peer.server.output_flushed();
     assert_eq!(
-        peer.server.draining.len(),
+        peer.server.core.draining().len(),
         1,
         "a flush cannot retire blocked DATA"
     );
@@ -590,7 +598,7 @@ fn unblocked_response_keeps_its_deadline_until_the_serialized_remainder_is_flush
     );
     peer.server
         .tick(Duration::from_millis(100), &mut peer.handler);
-    assert_eq!(peer.server.draining.len(), 1);
+    assert_eq!(peer.server.core.draining().len(), 1);
     assert_eq!(
         peer.server.next_deadline(),
         Some(Duration::from_millis(100))
@@ -612,12 +620,12 @@ fn local_deferred_reset_and_graceful_shutdown_do_not_acknowledge_transport_deliv
         .unwrap();
     // The local NO_ERROR reset event is processed by recv, but its bytes are
     // merely serialized, not transport-flushed.
-    assert!(!peer.server.conn.has_stream(id));
-    assert_eq!(peer.server.draining.len(), 1);
+    assert!(!peer.server.core.conn().has_stream(id));
+    assert_eq!(peer.server.core.draining().len(), 1);
     peer.server.shutdown();
     assert!(peer.server.is_closed());
     peer.server.recv(&[], &mut peer.handler).unwrap();
-    assert_eq!(peer.server.draining.len(), 1);
+    assert_eq!(peer.server.core.draining().len(), 1);
     assert_eq!(
         peer.server.next_deadline(),
         Some(Duration::from_millis(100))
@@ -650,7 +658,7 @@ fn completed_unary_and_client_streaming_responses_keep_their_draining_deadlines(
             let id = peer.open(path, &[7; 20], true, true);
             peer.exchange();
             assert_eq!(peer.server.active_calls(), 0, "{path}, window {window}");
-            assert_eq!(peer.server.draining.len(), 1);
+            assert_eq!(peer.server.core.draining().len(), 1);
             assert_eq!(
                 peer.server.next_deadline(),
                 Some(Duration::from_millis(100))
@@ -664,10 +672,10 @@ fn completed_unary_and_client_streaming_responses_keep_their_draining_deadlines(
 
             peer.server
                 .tick(Duration::from_millis(99), &mut peer.handler);
-            assert_eq!(peer.server.draining.len(), 1);
+            assert_eq!(peer.server.core.draining().len(), 1);
             peer.server
                 .tick(Duration::from_millis(100), &mut peer.handler);
-            assert_eq!(peer.server.draining.len(), 0);
+            assert_eq!(peer.server.core.draining().len(), 0);
             assert_eq!(peer.server.next_deadline(), None);
             assert_eq!(peer.server.queued_response_bytes(id), None);
             peer.recv_responses();
@@ -731,9 +739,9 @@ fn connection_cancellation_reclaims_draining_streams_without_duplicate_callbacks
     let client = peer.open("/test/Client", b"queued", true, true);
     let active = peer.open("/test/Infinite", b"queued", true, true);
     peer.exchange();
-    assert_eq!(peer.server.draining.len(), 2);
+    assert_eq!(peer.server.core.draining().len(), 2);
     peer.server.cancel_all(&mut peer.handler);
-    assert_eq!(peer.server.draining.len(), 0);
+    assert_eq!(peer.server.core.draining().len(), 0);
     assert_eq!(peer.server.active_calls(), 0);
     assert_eq!(peer.server.next_deadline(), None);
     for id in [unary, client, active] {
@@ -750,7 +758,7 @@ fn draining_records_disappear_when_window_updates_finish_the_response() {
     let mut peer = Peer::new(7, 1024);
     let id = peer.open("/test/Client", b"request", true, true);
     peer.exchange();
-    assert_eq!(peer.server.draining.len(), 1);
+    assert_eq!(peer.server.core.draining().len(), 1);
     for _ in 0..4 {
         let held = peer.conn.unreleased_recv_bytes(id).unwrap_or(0);
         peer.conn.release_capacity(id, held);
@@ -758,7 +766,7 @@ fn draining_records_disappear_when_window_updates_finish_the_response() {
     }
     assert_eq!(peer.data_len(id), 25);
     assert!(peer.has_trailers(id));
-    assert_eq!(peer.server.draining.len(), 0);
+    assert_eq!(peer.server.core.draining().len(), 0);
     assert_eq!(peer.server.next_deadline(), None);
     peer.server.tick(Duration::MAX, &mut peer.handler);
     assert!(!peer.server.has_output());
@@ -773,7 +781,7 @@ fn completed_early_response_drains_then_expires_without_a_second_handler_callbac
     // A handler can terminate with an error during request delivery. Its
     // terminal status and deferred NO_ERROR reset must not hide its deadline.
     peer.server.finish(id, Err(Status::aborted("finished")));
-    assert_eq!(peer.server.draining.len(), 1);
+    assert_eq!(peer.server.core.draining().len(), 1);
     assert_eq!(
         peer.server.next_deadline(),
         Some(Duration::from_millis(100))
@@ -781,7 +789,7 @@ fn completed_early_response_drains_then_expires_without_a_second_handler_callbac
     peer.server
         .tick(Duration::from_millis(100), &mut peer.handler);
     assert_eq!(peer.server.queued_response_bytes(id), None);
-    assert_eq!(peer.server.draining.len(), 0);
+    assert_eq!(peer.server.core.draining().len(), 0);
     peer.recv_responses();
     assert!(!peer.has_trailers(id));
     assert!(peer.events.iter().any(|event| matches!(event,
@@ -795,11 +803,11 @@ fn connection_failure_cancels_active_and_draining_streams() {
     let draining = peer.open("/test/Client", b"queued", true, true);
     let active = peer.open("/test/Infinite", b"queued", true, true);
     peer.exchange();
-    assert_eq!(peer.server.draining.len(), 1);
+    assert_eq!(peer.server.core.draining().len(), 1);
     // DATA on stream zero is a fatal HTTP/2 protocol error.
     assert!(peer.server.recv(&[0; 9], &mut peer.handler).is_err());
     assert!(peer.server.is_closed());
-    assert_eq!(peer.server.draining.len(), 0);
+    assert_eq!(peer.server.core.draining().len(), 0);
     assert_eq!(peer.server.active_calls(), 0);
     assert_eq!(peer.server.next_deadline(), None);
     assert_eq!(peer.server.queued_response_bytes(draining), None);
@@ -812,16 +820,16 @@ fn peer_reset_reclaims_a_completed_draining_stream() {
     let mut peer = Peer::new(0, 1024);
     let id = peer.open("/test/Client", b"queued", true, true);
     peer.exchange();
-    assert_eq!(peer.server.draining.len(), 1);
+    assert_eq!(peer.server.core.draining().len(), 1);
     peer.conn.reset_stream(id, ErrorCode::Cancel).unwrap();
     peer.recv_requests();
-    assert_eq!(peer.server.draining.len(), 1);
+    assert_eq!(peer.server.core.draining().len(), 1);
     assert_eq!(
         peer.server.next_deadline(),
         Some(Duration::from_millis(100))
     );
     peer.recv_responses();
-    assert_eq!(peer.server.draining.len(), 0);
+    assert_eq!(peer.server.core.draining().len(), 0);
     assert_eq!(peer.server.next_deadline(), None);
     assert_eq!(peer.server.queued_response_bytes(id), None);
     assert!(peer.handler.cancelled.is_empty());
@@ -959,15 +967,25 @@ impl Codec for NoCompression {
 #[test]
 fn output_budget_boundaries_saturate_without_large_allocations() {
     static CODEC: NoCompression = NoCompression;
-    let mut exact = Server::new(ServerConfig::default());
-    let settings_bytes = exact.pending_output().len();
-    exact.max_message_size = settings_bytes - lpm::HEADER_LEN;
+    let settings_bytes = Server::new(ServerConfig::default()).pending_output().len();
+    let with_limit = |max_message_size| {
+        Server::new(ServerConfig {
+            max_message_size,
+            ..ServerConfig::default()
+        })
+    };
     assert!(
-        !exact.backed_up(1),
+        with_limit(settings_bytes - lpm::HEADER_LEN)
+            .core
+            .can_send(1),
         "exact output budget should still permit a pull"
     );
-    exact.max_message_size -= 1;
-    assert!(exact.backed_up(1), "one byte over budget must stop pulling");
+    assert!(
+        !with_limit(settings_bytes - lpm::HEADER_LEN - 1)
+            .core
+            .can_send(1),
+        "one byte over budget must stop pulling"
+    );
     for limit in [
         0,
         1,
@@ -984,11 +1002,44 @@ fn output_budget_boundaries_saturate_without_large_allocations() {
                 },
                 ..ServerConfig::default()
             });
+            let max_wire = if send.is_some() {
+                lpm::wire_limit(limit)
+            } else {
+                limit
+            };
             // Only SETTINGS are allocated, even for a usize::MAX size limit.
-            let budget = server.max_wire_message().saturating_add(lpm::HEADER_LEN);
-            assert_eq!(server.backed_up(1), server.pending_output().len() > budget);
+            let budget = max_wire.saturating_add(lpm::HEADER_LEN);
+            assert_eq!(
+                !server.core.can_send(1),
+                server.pending_output().len() > budget
+            );
             server.take_output();
-            assert!(!server.backed_up(1));
+            assert!(server.core.can_send(1));
         }
     }
+}
+
+#[test]
+fn reset_in_the_same_read_as_a_request_cancels_before_delivery() {
+    // The request message and the reset arrive in one read. The call is
+    // cancelled as a whole: its handler is told about the cancellation, and the
+    // message is not delivered to it.
+    let mut conn = Connection::client(Default::default());
+    let headers = vec![
+        field(":method", "POST"),
+        field(":scheme", "http"),
+        field(":path", "/test/Bidi"),
+        field("content-type", "application/grpc"),
+    ];
+    let id = conn.open_stream(headers, false).unwrap();
+    conn.send_data(id, lpm::encode(b"m").unwrap(), false)
+        .unwrap();
+    conn.reset_stream(id, ErrorCode::Cancel).unwrap();
+    let bytes = conn.take_output();
+    let mut server = Server::new(ServerConfig::default());
+    let mut handler = HandlerState::default();
+    server.recv(&bytes, &mut handler).unwrap();
+    assert!(handler.requests.is_empty());
+    assert_eq!(handler.cancelled, vec![id]);
+    assert_eq!(server.active_calls(), 0);
 }

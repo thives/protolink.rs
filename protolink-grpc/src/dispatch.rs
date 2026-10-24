@@ -114,7 +114,7 @@ impl core::error::Error for RouteConflict {}
 
 /// The merged method table of a composite dispatcher.
 #[derive(Debug, Default)]
-struct RouteTable {
+pub(crate) struct RouteTable {
     /// Every method, with its index as the composite route's method.
     methods: Vec<MethodDescriptor>,
     /// For each method: the member that serves it, and the member's route.
@@ -124,7 +124,7 @@ struct RouteTable {
 }
 
 impl RouteTable {
-    fn add(&mut self, member: usize, methods: &[MethodDescriptor]) {
+    pub(crate) fn add(&mut self, member: usize, methods: &[MethodDescriptor]) {
         for descriptor in methods {
             let method = u32::try_from(self.methods.len()).expect("fewer than 2^32 methods");
             self.methods.push(MethodDescriptor::new(
@@ -136,7 +136,7 @@ impl RouteTable {
         }
     }
 
-    fn finish(mut self) -> Result<Self, RouteConflict> {
+    pub(crate) fn finish(mut self) -> Result<Self, RouteConflict> {
         let methods = &self.methods;
         self.by_path = (0..methods.len() as u32).collect();
         self.by_path.sort_by_key(|&i| methods[i as usize].path);
@@ -149,7 +149,7 @@ impl RouteTable {
         Ok(self)
     }
 
-    fn route(&self, path: &str) -> Option<Route> {
+    pub(crate) fn route(&self, path: &str) -> Option<Route> {
         let i = self
             .by_path
             .binary_search_by(|&i| self.methods[i as usize].path.cmp(path))
@@ -157,7 +157,7 @@ impl RouteTable {
         Some(self.methods[self.by_path[i] as usize].route())
     }
 
-    fn target(&self, route: Route) -> Option<(usize, Route)> {
+    pub(crate) fn target(&self, route: Route) -> Option<(usize, Route)> {
         self.targets.get(route.method as usize).copied()
     }
 }

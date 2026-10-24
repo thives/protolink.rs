@@ -155,6 +155,59 @@ async fn serve_one_object(stream: tokio::net::TcpStream) -> Result<(), Box<dyn s
 }
 ```
 
+## A gateway: local services and forwarded calls
+
+A router serves one caller connection. Some methods are served by local services, and the rest are
+forwarded to a downstream connection and relayed back. Both are registered on the same builder, and
+duplicate paths fail the build. The local services are owned by the router, so the device is moved
+into them rather than borrowed.
+
+```rust,no_run
+use embedded_device_example::proto::diagnostics::METHODS as DIAGNOSTICS;
+use embedded_device_example::{Device, ServiceMethods};
+
+async fn serve_gateway(
+    caller: tokio::net::TcpStream,
+    downstream: tokio::net::TcpStream,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let local = protolink::MultiDispatch::builder(Device::default())
+        .with_service(ServiceMethods)
+        .build()?;
+    let mut router = protolink::grpc::Router::builder()
+        .with_service(local)
+        .with_route(
+            DIAGNOSTICS,
+            protolink::grpc::Client::new(protolink::grpc::ClientConfig::default()),
+        )
+        .build()?;
+    let mut downstreams = [protolink::tokio::compat(downstream)];
+    protolink::tokio::server(caller)
+        .build()
+        .serve_router(&mut router, &mut downstreams)
+        .await?;
+    Ok(())
+}
+```
+
+`serve_router` takes one transport per downstream, in the order the routes were added. A
+downstream whose transport fails is marked failed: its calls end `UNAVAILABLE`, and the caller's
+other calls carry on. Several downstreams that serve the same service can be pooled with
+`with_pool`, see [the routing design](ROUTING.md).
+
+The tested guarantees of the driver:
+
+- A write or flush that stays pending on one downstream does not hold up the other downstreams,
+  the local services or the deadlines. A transport still runs one operation at a time, so its
+  reads wait while its own writes are pending. Its `read` must be cancel-safe, because it is dropped
+  when that transport has output to write.
+- Output blocked past the deadline of a downstream's own calls retires that downstream only. The
+  gateway's deadline is its own calls' deadline, and a downstream's deadline does not retire the
+  gateway.
+- Once `Router::shutdown` has been called, `serve_router` returns when the gateway's output has
+  been delivered and nothing is left to write. It does not wait for the caller to hang up.
+- The future is `Send` when the transports are, so it can be spawned on tokio. It panics if the
+  number of downstream transports differs from the router's downstream connections.
+
 ## Tokio
 
 ```rust,no_run

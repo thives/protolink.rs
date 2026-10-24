@@ -1,16 +1,19 @@
 //! Async drivers over `embedded_io_async`.
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::future::{Future, poll_fn};
-use core::pin::pin;
-use core::task::{Poll, Waker};
+use core::pin::{Pin, pin};
+use core::task::{Context, Poll, Waker};
+use core::time::Duration;
 
 use embedded_io_async::{Read, Write};
 
 use crate::builder::{DeadlinesUnspecified, client_config_methods, server_config_methods};
+use crate::driver;
 use crate::grpc::{
-    self, CallId, CallOptions, ClientConfig, Handler, Metadata, Next, Response, ServerConfig,
-    Status, StreamingCall, StreamingTransport, UnaryTransport,
+    self, CallId, CallOptions, ClientConfig, Handler, Metadata, Next, Response, Router,
+    ServerConfig, Status, StreamingCall, StreamingTransport, UnaryTransport,
 };
 use crate::shared::Shared;
 use crate::timer::{NoTimer, Timer};
@@ -156,6 +159,547 @@ impl<IO: Read + Write, T: Timer> Server<IO, T> {
             handler: services,
         };
         serve_connection(&mut io, &mut serving.server, &mut *serving.handler, &timer).await
+    }
+
+    /// Serve gRPC on this connection with `router`, which serves its local
+    /// services and forwards the rest to `downstream` connections.
+    ///
+    /// Downstream `i` is `downstream[i]`, in the order the router's routes
+    /// were added with [`with_route`](grpc::RouterBuilder::with_route). The
+    /// gateway connection and every downstream are driven by this one future.
+    /// Each transport has its own operations: a write or flush that stays
+    /// pending on one of them does not hold up the others, the local services,
+    /// or the deadlines. A transport still runs one operation at a time, so its
+    /// read is dropped when that transport has output to write, and reads must
+    /// be cancel-safe as for [`serve`](Self::serve). Deadlines come from the
+    /// timer of this server, and from the router's calls.
+    ///
+    /// A downstream whose transport fails (read, write, flush or protocol error),
+    /// or whose output stays blocked past the deadline of its calls, is marked
+    /// failed: its calls end with `UNAVAILABLE`, and calls routed to it
+    /// afterwards do too. The gateway connection keeps serving the others. A
+    /// failure of the gateway connection, or output blocked past the deadline
+    /// of its calls, ends this future, as for `serve`. Once the router is shut
+    /// down, the future completes when the gateway's output has been delivered,
+    /// without waiting for the caller to hang up.
+    ///
+    /// When the future completes or is dropped, the router cancels every call:
+    /// its forwarded calls cancel their downstream calls, which are written only
+    /// if the connection is still up at that point (a dropped future writes
+    /// nothing).
+    ///
+    /// The router's own [`ServerConfig`] applies to the gateway connection;
+    /// the message limits of this server's builder are not used.
+    ///
+    /// # Panics
+    ///
+    /// If `downstream` does not have one transport per downstream connection of
+    /// `router`: a route without its transport would never be driven.
+    pub async fn serve_router<B>(
+        self,
+        router: &mut Router,
+        downstream: &mut [B],
+    ) -> Result<(), Error<IO::Error>>
+    where
+        B: Read + Write<Error = IO::Error>,
+    {
+        assert_eq!(
+            router.backend_count(),
+            downstream.len(),
+            "serve_router needs one transport per downstream of the router"
+        );
+        let Self { mut io, timer, .. } = self;
+        let mut routing = Routing { router, downstream };
+        serve_router_connection(&mut io, &mut routing, &timer).await
+    }
+}
+
+/// The router and its downstream transports for one `serve_router`. Dropping
+/// it cancels every call.
+struct Routing<'a, B> {
+    router: &'a mut Router,
+    downstream: &'a mut [B],
+}
+
+impl<B> Drop for Routing<'_, B> {
+    fn drop(&mut self) {
+        self.router.cancel_all();
+    }
+}
+
+/// Output of one connection: the gateway's router or a downstream client.
+trait Outbound {
+    fn pending_output(&self) -> &[u8];
+    fn consume_output(&mut self, n: usize);
+    fn has_output(&self) -> bool;
+    /// When output still blocked at this time retires the connection: the
+    /// deadline of its own calls and of output awaiting delivery.
+    fn output_deadline(&self) -> Option<Duration>;
+    /// Called after a successful flush. Clients keep no flush state.
+    fn output_flushed(&mut self);
+}
+
+impl Outbound for Router {
+    fn pending_output(&self) -> &[u8] {
+        Router::pending_output(self)
+    }
+
+    fn consume_output(&mut self, n: usize) {
+        Router::consume_output(self, n);
+    }
+
+    fn has_output(&self) -> bool {
+        Router::has_output(self)
+    }
+
+    fn output_deadline(&self) -> Option<Duration> {
+        Router::gateway_next_deadline(self)
+    }
+
+    fn output_flushed(&mut self) {
+        Router::output_flushed(self);
+    }
+}
+
+impl Outbound for grpc::Client {
+    fn pending_output(&self) -> &[u8] {
+        grpc::Client::pending_output(self)
+    }
+
+    fn consume_output(&mut self, n: usize) {
+        grpc::Client::consume_output(self, n);
+    }
+
+    fn has_output(&self) -> bool {
+        grpc::Client::has_output(self)
+    }
+
+    fn output_deadline(&self) -> Option<Duration> {
+        grpc::Client::next_deadline(self)
+    }
+
+    fn output_flushed(&mut self) {}
+}
+
+/// Write everything `out` has pending, then flush, as `serve_connection` does.
+/// An output deadline or a failed write is an error for this connection.
+async fn write_pending<S: Write, O: Outbound, T: Timer>(
+    io: &mut S,
+    out: &mut O,
+    timer: &T,
+) -> Result<(), Error<S::Error>> {
+    while out.has_output() {
+        let n = output_until(timer, out.output_deadline(), io.write(out.pending_output()))
+            .await
+            .ok_or(Error::OutputDeadline)?
+            .map_err(Error::Io)?;
+        if n == 0 {
+            return Err(Error::WriteZero);
+        }
+        out.consume_output(n);
+    }
+    output_until(timer, out.output_deadline(), io.flush())
+        .await
+        .ok_or(Error::OutputDeadline)?
+        .map_err(Error::Io)?;
+    out.output_flushed();
+    Ok(())
+}
+
+/// What went wrong with one transport operation.
+enum Failure<E> {
+    Io(E),
+    WriteZero,
+}
+
+/// The operation a lane has in flight.
+#[derive(Clone, Copy)]
+struct Op {
+    /// Bytes requested by a write; `0` for a flush.
+    len: usize,
+    /// The earliest deadline of the connection's output seen while the operation
+    /// is in flight. It only moves earlier, so the operation stays armed after the
+    /// call that caused it has ended.
+    deadline: Option<Duration>,
+}
+
+/// The coordinator's side of one transport: the port its worker reports
+/// through, the worker, and the operation in flight.
+struct Lane<'p, F, E> {
+    port: &'p Shared<driver::Port<E>>,
+    /// `None` once the transport has been retired. Its worker is dropped then,
+    /// so nothing is written to it again.
+    worker: Option<Pin<Box<F>>>,
+    op: Option<Op>,
+    /// Bytes were written since the transport was last flushed.
+    unflushed: bool,
+}
+
+impl<'p, F: Future<Output = ()>, E> Lane<'p, F, E> {
+    fn new(port: &'p Shared<driver::Port<E>>, worker: Pin<Box<F>>) -> Self {
+        Self {
+            port,
+            worker: Some(worker),
+            op: None,
+            unflushed: false,
+        }
+    }
+
+    fn live(&self) -> bool {
+        self.worker.is_some()
+    }
+
+    /// Poll the worker, which never completes: polling it lets it make progress.
+    fn poll_worker(&mut self, cx: &mut Context<'_>) {
+        if let Some(worker) = self.worker.as_mut() {
+            let _ = worker.as_mut().poll(cx);
+        }
+    }
+
+    /// Whether a reply or input is waiting to be taken.
+    fn has_event(&self) -> bool {
+        self.live() && self.port.with(|p| p.has_event())
+    }
+
+    /// Whether [`issue`](Self::issue) would start an operation.
+    fn wants_issue<O: Outbound>(&self, out: &O) -> bool {
+        self.live() && self.op.is_none() && (out.has_output() || self.unflushed)
+    }
+
+    /// Start a write of the output, or a flush once the output is all written.
+    /// The bytes are copied now; the core keeps them until the reply says how
+    /// many were accepted.
+    fn issue<O: Outbound>(&mut self, out: &O) {
+        if !self.wants_issue(out) {
+            return;
+        }
+        let len = if out.has_output() {
+            self.port.with(|p| p.request_write(out.pending_output()))
+        } else {
+            self.port.with(|p| p.request_flush());
+            0
+        };
+        self.op = Some(Op {
+            len,
+            deadline: out.output_deadline(),
+        });
+    }
+
+    /// Take the reply of the operation, if it has come back, and apply it to
+    /// `out`. Returns the failure if the operation failed.
+    fn reap<O: Outbound>(&mut self, out: &mut O) -> Option<Failure<E>> {
+        let op = self.op?;
+        let reply = self.port.with(|p| p.take_reply())?;
+        self.op = None;
+        match reply {
+            driver::Reply::Written(Ok(n)) => match n.min(op.len) {
+                0 => Some(Failure::WriteZero),
+                n => {
+                    out.consume_output(n);
+                    self.unflushed = true;
+                    None
+                }
+            },
+            driver::Reply::Flushed(Ok(())) => {
+                out.output_flushed();
+                self.unflushed = false;
+                None
+            }
+            driver::Reply::Written(Err(e)) | driver::Reply::Flushed(Err(e)) => Some(Failure::Io(e)),
+        }
+    }
+
+    /// Take the outcome of the last read, if it has come back. For `Ok(n)` the
+    /// bytes are in the port's inbox, until the next read starts.
+    fn take_input(&mut self) -> Option<Result<usize, E>> {
+        self.port.with(|p| p.take_read())
+    }
+
+    /// Run `f` on the bytes of the last read, `n` of them.
+    fn with_input<R>(&self, n: usize, f: impl FnOnce(&[u8]) -> R) -> R {
+        self.port.with(|p| f(&p.inbox()[..n]))
+    }
+
+    /// Keep the operation's deadline no later than the connection's current one.
+    fn arm<O: Outbound>(&mut self, out: &O) {
+        if let Some(op) = self.op.as_mut() {
+            op.deadline = earliest([op.deadline, out.output_deadline()]);
+        }
+    }
+
+    /// The deadline of the operation in flight.
+    fn deadline(&self) -> Option<Duration> {
+        self.op.and_then(|op| op.deadline)
+    }
+
+    /// Whether the operation in flight has passed its deadline.
+    fn overdue(&self, now: Duration) -> bool {
+        self.deadline().is_some_and(|d| now >= d)
+    }
+
+    /// Drop the worker, abandoning any operation it has in flight.
+    fn retire(&mut self) {
+        self.worker = None;
+        self.op = None;
+        self.unflushed = false;
+    }
+}
+
+/// The earliest of the deadlines that are set.
+fn earliest(deadlines: impl IntoIterator<Item = Option<Duration>>) -> Option<Duration> {
+    deadlines.into_iter().flatten().min()
+}
+
+/// Retire downstream `backend`: its transport can no longer be used, and its
+/// calls end with `status`. Only that downstream is affected.
+fn retire_backend<F, E>(
+    lane: &mut Lane<'_, F, E>,
+    router: &mut Router,
+    backend: usize,
+    status: Status,
+) where
+    F: Future<Output = ()>,
+{
+    lane.retire();
+    router.backend_failed(backend, status);
+}
+
+/// Why [`drive_router`] stopped with an error.
+enum Halt<E> {
+    /// Reported to the caller as it is.
+    Error(Error<E>),
+    /// The gateway received bytes that break the protocol. `goaway` says whether
+    /// the gateway's output is in a state that allows a GOAWAY to be written.
+    Protocol {
+        error: grpc::http2::Error,
+        goaway: bool,
+    },
+}
+
+/// Serve a router's connection. A protocol error on the gateway is the one failure
+/// answered on the wire, and only as far as [`Halt::Protocol`] allows: the GOAWAY
+/// is best effort, and is written only when no output operation of the gateway was
+/// in flight. Failures of the transports, and deadlines, never write again.
+async fn serve_router_connection<IO, B, T>(
+    io: &mut IO,
+    routing: &mut Routing<'_, B>,
+    timer: &T,
+) -> Result<(), Error<IO::Error>>
+where
+    IO: Read + Write,
+    B: Read + Write<Error = IO::Error>,
+    T: Timer,
+{
+    match drive_router(&mut *io, routing, timer).await {
+        Ok(()) => Ok(()),
+        Err(Halt::Error(error)) => Err(error),
+        Err(Halt::Protocol { error, goaway }) => {
+            if goaway {
+                // The gateway's worker has been dropped, so nothing else is writing.
+                let _ = write_pending(io, &mut *routing.router, timer).await;
+            }
+            Err(Error::Protocol(error))
+        }
+    }
+}
+
+/// Drive a router's connections: the gateway's transport and each downstream
+/// transport, all through one future.
+///
+/// The coordinator (this function) owns the router, the handlers and the clock.
+/// Each transport has a worker that borrows it and performs one write, flush or
+/// read at a time; the coordinator asks for operations and collects their
+/// results through the transport's port. A slow transport therefore delays only
+/// its own operations. Reads of a transport are dropped only when its output
+/// needs the transport, and writes are never restarted.
+///
+/// Deadlines come before progress. Each pass reads the clock once, keeps the
+/// deadline of every output in flight, and ticks the router with that reading;
+/// output still past its deadline then retires its connection, before any worker
+/// is polled again. The wait ends as soon as a deadline is due, before the router
+/// or a worker is polled, so no handler runs on a clock that has passed the
+/// deadline of its call.
+async fn drive_router<IO, B, T>(
+    io: &mut IO,
+    routing: &mut Routing<'_, B>,
+    timer: &T,
+) -> Result<(), Halt<IO::Error>>
+where
+    IO: Read + Write,
+    B: Read + Write<Error = IO::Error>,
+    T: Timer,
+{
+    let router = &mut *routing.router;
+    let downstream = &mut *routing.downstream;
+    let count = downstream.len();
+    let gateway_port = Shared::new(driver::Port::new());
+    let ports: Vec<Shared<driver::Port<IO::Error>>> = (0..count)
+        .map(|_| Shared::new(driver::Port::new()))
+        .collect();
+    let mut gateway = Lane::new(&gateway_port, Box::pin(driver::run(io, &gateway_port)));
+    let mut lanes: Vec<_> = downstream
+        .iter_mut()
+        .zip(&ports)
+        .map(|(transport, port)| Lane::new(port, Box::pin(driver::run(transport, port))))
+        .collect();
+    // The downstream lanes are visited in turn, from a rotating start.
+    let mut turn = 0;
+    loop {
+        // One reading of the clock decides the whole pass, and the router is
+        // ticked with that same reading.
+        let now = timer.now();
+        // Output in flight keeps the deadline it was issued with, even when the
+        // tick below ends the call that caused it.
+        gateway.arm(router);
+        for (backend, lane) in lanes.iter_mut().enumerate() {
+            if let Some(client) = router.backend(backend) {
+                lane.arm(&*client);
+            }
+        }
+        // Calls that are due end first, with their own status, so that retiring
+        // the output they were waiting on does not replace it.
+        router.tick(now);
+        // Output that is still in flight past its deadline retires its
+        // connection. For a downstream only that downstream is failed.
+        if gateway.overdue(now) {
+            return Err(Halt::Error(Error::OutputDeadline));
+        }
+        for step in 0..count {
+            let backend = (turn + step) % count;
+            if lanes[backend].overdue(now) {
+                retire_backend(
+                    &mut lanes[backend],
+                    router,
+                    backend,
+                    Status::unavailable("downstream output deadline exceeded"),
+                );
+            }
+        }
+
+        // Replies to the operations in flight.
+        if let Some(failure) = gateway.reap(router) {
+            return Err(Halt::Error(match failure {
+                Failure::Io(e) => Error::Io(e),
+                Failure::WriteZero => Error::WriteZero,
+            }));
+        }
+        for step in 0..count {
+            let backend = (turn + step) % count;
+            let lane = &mut lanes[backend];
+            if !lane.live() {
+                continue;
+            }
+            let client = router.backend(backend).expect("a lane per downstream");
+            if lane.reap(client).is_some() {
+                retire_backend(
+                    lane,
+                    router,
+                    backend,
+                    Status::unavailable("downstream write failed"),
+                );
+            }
+        }
+
+        // Input. A read that ended the transport retires it; the gateway's
+        // ends the serving.
+        match gateway.take_input() {
+            Some(Err(e)) => return Err(Halt::Error(Error::Io(e))),
+            Some(Ok(0)) => return Ok(()),
+            Some(Ok(n)) => {
+                if let Err(error) = gateway.with_input(n, |bytes| router.recv(bytes)) {
+                    // The reply of any operation has been taken above. One still
+                    // outstanding (queued, pending or partly performed) leaves
+                    // its bytes unknown, so it is not written on.
+                    let goaway = gateway.op.is_none();
+                    return Err(Halt::Protocol { error, goaway });
+                }
+            }
+            None => {}
+        }
+        for step in 0..count {
+            let backend = (turn + step) % count;
+            let lane = &mut lanes[backend];
+            let Some(read) = lane.take_input() else {
+                continue;
+            };
+            let delivered = match read {
+                Ok(0) => Err("downstream closed"),
+                Ok(n) => lane
+                    .with_input(n, |bytes| router.backend_recv(backend, bytes))
+                    .map_err(|_| "downstream protocol error"),
+                Err(_) => Err("downstream read failed"),
+            };
+            if let Err(reason) = delivered {
+                retire_backend(lane, router, backend, Status::unavailable(reason));
+            }
+        }
+
+        // Output: start what each idle transport needs.
+        gateway.issue(router);
+        for step in 0..count {
+            let backend = (turn + step) % count;
+            if let Some(client) = router.backend(backend) {
+                lanes[backend].issue(&*client);
+            }
+        }
+        turn = (turn + 1) % count.max(1);
+
+        // Closed, with everything delivered: the gateway is finished. Its
+        // peer's hang-up or any downstream's output does not matter.
+        if router.is_closed() && gateway.op.is_none() && !gateway.unflushed && !router.has_output()
+        {
+            return Ok(());
+        }
+
+        // Wait until a worker has a result, a transport can take output, or a
+        // deadline is due.
+        gateway.arm(router);
+        for (backend, lane) in lanes.iter_mut().enumerate() {
+            if let Some(client) = router.backend(backend) {
+                lane.arm(&*client);
+            }
+        }
+        let wake = earliest(
+            core::iter::once(router.next_deadline())
+                .chain(core::iter::once(gateway.deadline()))
+                .chain(lanes.iter().map(Lane::deadline)),
+        );
+        let mut sleep = pin!(wake.map(|d| timer.sleep_until(d)));
+        let due = || wake.is_some_and(|d| timer.now() >= d);
+        poll_fn(|cx| {
+            // A due deadline returns to the loop before anything is polled. The
+            // loop ticks the router with the clock, so a handler is never polled
+            // with a clock that has passed its call's deadline.
+            if due() {
+                return Poll::Ready(());
+            }
+            if let Some(sleep) = sleep.as_mut().as_pin_mut()
+                && sleep.poll(cx).is_ready()
+            {
+                return Poll::Ready(());
+            }
+            router.poll(cx);
+            // Handlers run synchronously, and may have moved the clock on.
+            if due() {
+                return Poll::Ready(());
+            }
+            gateway.poll_worker(cx);
+            for lane in lanes.iter_mut() {
+                lane.poll_worker(cx);
+            }
+            let output = gateway.wants_issue(router)
+                || (0..count).any(|backend| {
+                    router
+                        .backend(backend)
+                        .is_some_and(|client| lanes[backend].wants_issue(&*client))
+                });
+            let event = gateway.has_event() || lanes.iter().any(Lane::has_event);
+            if output || event {
+                return Poll::Ready(());
+            }
+            Poll::Pending
+        })
+        .await;
     }
 }
 
@@ -1074,13 +1618,13 @@ mod tests {
     use core::cell::RefCell;
     use core::convert::Infallible;
     use core::pin::{Pin, pin};
-    use core::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
     use core::task::Context;
 
     use embedded_io_async::ErrorType;
 
     use super::*;
-    use crate::grpc::{CallContext, MethodKind, Route};
+    use crate::grpc::{CallContext, Dispatcher, MethodDescriptor, MethodKind, Route};
 
     const GATE: &str = "/t.T/Gate";
     const OPEN: &str = "/t.T/Open";
@@ -2120,5 +2664,450 @@ mod tests {
             assert_eq!(late_polls.get(), 0);
         }
         assert_eq!(cancellations.get(), 1);
+    }
+
+    // ---------------------------------------------------------------------
+    // The router's coordinator: deadlines before progress, and output safety
+    // ---------------------------------------------------------------------
+
+    const GATE_PATH: &str = "/t.R/Gate";
+    const QUICK_PATH: &str = "/t.R/Quick";
+    const ROUTED: &[MethodDescriptor] = &[
+        MethodDescriptor::new(GATE_PATH, MethodKind::BidiStreaming, 0),
+        MethodDescriptor::new(QUICK_PATH, MethodKind::BidiStreaming, 1),
+    ];
+
+    /// Not a connection preface, so the gateway refuses it as a protocol error.
+    const GARBAGE: &[u8] = b"GET / HTTP/1.1\r\nHost: gateway.test\r\n\r\n";
+
+    /// The gateway's local service. `Quick` answers at once. `Gate` answers once
+    /// `open` is set, so the test decides exactly when its handler is ready.
+    #[derive(Clone, Default)]
+    struct Local {
+        open: Arc<AtomicBool>,
+        /// Polls of `Gate` that found it open.
+        open_polls: Arc<AtomicUsize>,
+        cancelled: Arc<AtomicUsize>,
+        answered: BTreeSet<CallId>,
+    }
+
+    impl Handler for Local {
+        fn route(&self, path: &str) -> Option<Route> {
+            Route::find(ROUTED, path)
+        }
+
+        fn on_message(&mut self, _: &mut CallContext<'_>, _: &[u8]) -> Result<(), Status> {
+            Ok(())
+        }
+
+        fn poll_response(
+            &mut self,
+            ctx: &mut CallContext<'_>,
+            _: &mut Context<'_>,
+        ) -> Poll<Next<Vec<u8>>> {
+            if ctx.path == GATE_PATH {
+                if !self.open.load(SeqCst) {
+                    return Poll::Pending;
+                }
+                self.open_polls.fetch_add(1, SeqCst);
+            }
+            if self.answered.insert(ctx.id) {
+                Poll::Ready(Next::Message(b"answer".to_vec()))
+            } else {
+                Poll::Ready(Next::Done(Ok(())))
+            }
+        }
+
+        fn on_cancel(&mut self, _: &mut CallContext<'_>) {
+            self.cancelled.fetch_add(1, SeqCst);
+        }
+    }
+
+    impl Dispatcher for Local {
+        fn methods(&self) -> &[MethodDescriptor] {
+            ROUTED
+        }
+    }
+
+    /// The scripted gateway transport, and the state the test sees through it.
+    #[derive(Default)]
+    struct Wire {
+        /// The caller's bytes, read in order.
+        inbound: VecDeque<u8>,
+        /// Reads return nothing until this many polls of reads have been made.
+        read_ready_after: usize,
+        read_polls: usize,
+        /// Bytes accepted by completed writes, in order.
+        written: Vec<u8>,
+        /// Largest number of bytes one write accepts; `0` for no limit.
+        max_write: usize,
+        /// While set, a write accepts its first `emit` bytes and then stays
+        /// pending. Such a write is never released in these tests.
+        stall_writes: bool,
+        emit: usize,
+        /// While set, a flush stays pending.
+        stall_flushes: bool,
+        /// Writes and flushes started, and polls of writes.
+        writes: usize,
+        flushes: usize,
+        write_polls: usize,
+        /// Writes and flushes dropped before they completed.
+        cancelled: usize,
+    }
+
+    /// The gateway's transport. The test keeps a clone to script it.
+    #[derive(Clone, Default)]
+    struct GatewayIo(Rc<RefCell<Wire>>);
+
+    impl GatewayIo {
+        fn with_inbound(bytes: &[u8]) -> Self {
+            let io = Self::default();
+            io.0.borrow_mut().inbound.extend(bytes);
+            io
+        }
+    }
+
+    /// Counts an operation as cancelled when it is dropped before it completes.
+    struct Unfinished(Option<Rc<RefCell<Wire>>>);
+
+    impl Unfinished {
+        fn finish(mut self) {
+            self.0 = None;
+        }
+    }
+
+    impl Drop for Unfinished {
+        fn drop(&mut self) {
+            if let Some(wire) = self.0.take() {
+                wire.borrow_mut().cancelled += 1;
+            }
+        }
+    }
+
+    impl ErrorType for GatewayIo {
+        type Error = Infallible;
+    }
+
+    impl Read for GatewayIo {
+        async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Infallible> {
+            let wire = self.0.clone();
+            poll_fn(|_| {
+                let mut w = wire.borrow_mut();
+                w.read_polls += 1;
+                if w.read_polls <= w.read_ready_after || w.inbound.is_empty() {
+                    return Poll::Pending;
+                }
+                let n = buf.len().min(w.inbound.len());
+                let bytes: Vec<u8> = w.inbound.drain(..n).collect();
+                buf[..n].copy_from_slice(&bytes);
+                Poll::Ready(Ok(n))
+            })
+            .await
+        }
+    }
+
+    impl Write for GatewayIo {
+        async fn write(&mut self, buf: &[u8]) -> Result<usize, Infallible> {
+            let wire = self.0.clone();
+            wire.borrow_mut().writes += 1;
+            let op = Unfinished(Some(wire.clone()));
+            let mut emitted = false;
+            let n = poll_fn(|_| {
+                let mut w = wire.borrow_mut();
+                w.write_polls += 1;
+                if w.stall_writes {
+                    if !emitted {
+                        emitted = true;
+                        let n = w.emit.min(buf.len());
+                        w.written.extend_from_slice(&buf[..n]);
+                    }
+                    return Poll::Pending;
+                }
+                let n = match w.max_write {
+                    0 => buf.len(),
+                    limit => buf.len().min(limit),
+                };
+                w.written.extend_from_slice(&buf[..n]);
+                Poll::Ready(n)
+            })
+            .await;
+            op.finish();
+            Ok(n)
+        }
+
+        async fn flush(&mut self) -> Result<(), Infallible> {
+            let wire = self.0.clone();
+            wire.borrow_mut().flushes += 1;
+            let op = Unfinished(Some(wire.clone()));
+            poll_fn(|_| {
+                if wire.borrow().stall_flushes {
+                    Poll::Pending
+                } else {
+                    Poll::Ready(())
+                }
+            })
+            .await;
+            op.finish();
+            Ok(())
+        }
+    }
+
+    /// Serve `router` over `io` on the manual clock, with no downstream.
+    fn serve_router_alone<'a>(
+        io: GatewayIo,
+        clock: &ManualTimer,
+        router: &'a mut Router,
+    ) -> impl Future<Output = Result<(), Error<Infallible>>> + 'a {
+        let none: &'a mut [GatewayIo] = &mut [];
+        server(io)
+            .with_deadline_timer(clock.clone())
+            .build()
+            .serve_router(router, none)
+    }
+
+    /// Start a call on `caller`, with one request message and `timeout`.
+    fn start_call(
+        caller: &mut grpc::Client,
+        path: &str,
+        timeout: Option<core::time::Duration>,
+    ) -> CallId {
+        let options = timeout.map_or_else(CallOptions::default, CallOptions::timeout);
+        let id = caller.start_streaming_with(path, &options).unwrap();
+        caller.send_message(id, b"request").unwrap();
+        id
+    }
+
+    /// Feed the gateway's output so far to `caller`, and return what call `id`
+    /// has received.
+    fn received(caller: &mut grpc::Client, id: CallId, io: &GatewayIo) -> Vec<Next<Vec<u8>>> {
+        let bytes = core::mem::take(&mut io.0.borrow_mut().written);
+        caller.recv(&bytes).unwrap();
+        core::iter::from_fn(|| caller.try_next(id)).collect()
+    }
+
+    /// The gateway's output before any input, and the output once `GARBAGE` is
+    /// refused: the GOAWAY is what follows the first.
+    fn output_around_protocol_error() -> (Vec<u8>, Vec<u8>) {
+        let mut reference = Router::builder()
+            .with_service(Local::default())
+            .build()
+            .unwrap();
+        let before = reference.take_output();
+        assert!(reference.recv(GARBAGE).is_err());
+        (before, reference.take_output())
+    }
+
+    #[test]
+    fn gateway_expires_a_call_before_polling_a_handler_made_ready_at_its_deadline() {
+        use core::time::Duration;
+        for millis in [100, 101] {
+            let clock = ManualTimer(Rc::new(core::cell::Cell::new(Duration::ZERO)));
+            let service = Local::default();
+            let mut router = Router::builder()
+                .with_service(service.clone())
+                .build()
+                .unwrap();
+            let mut caller = grpc::Client::new(ClientConfig::default());
+            let id = start_call(&mut caller, GATE_PATH, Some(Duration::from_millis(100)));
+            let io = GatewayIo::with_inbound(&caller.take_output());
+            let mut serving = pin!(serve_router_alone(io.clone(), &clock, &mut router));
+            assert!(poll_once(serving.as_mut(), Waker::noop()).is_pending());
+
+            // The handler becomes ready in the same step as the deadline.
+            service.open.store(true, SeqCst);
+            clock.0.set(Duration::from_millis(millis));
+            assert!(poll_once(serving.as_mut(), Waker::noop()).is_pending());
+            assert_eq!(
+                service.open_polls.load(SeqCst),
+                0,
+                "an expired handler was polled at {millis}ms"
+            );
+            assert_eq!(service.cancelled.load(SeqCst), 1);
+            let events = received(&mut caller, id, &io);
+            assert!(
+                matches!(events.as_slice(), [Next::Done(Err(status))] if status.code == grpc::Code::DeadlineExceeded),
+                "the expired call was not ended with DEADLINE_EXCEEDED at {millis}ms"
+            );
+        }
+    }
+
+    #[test]
+    fn gateway_answers_a_handler_made_ready_before_its_deadline() {
+        use core::time::Duration;
+        let clock = ManualTimer(Rc::new(core::cell::Cell::new(Duration::ZERO)));
+        let service = Local::default();
+        let mut router = Router::builder()
+            .with_service(service.clone())
+            .build()
+            .unwrap();
+        let mut caller = grpc::Client::new(ClientConfig::default());
+        let id = start_call(&mut caller, GATE_PATH, Some(Duration::from_millis(100)));
+        let io = GatewayIo::with_inbound(&caller.take_output());
+        let mut serving = pin!(serve_router_alone(io.clone(), &clock, &mut router));
+        assert!(poll_once(serving.as_mut(), Waker::noop()).is_pending());
+
+        service.open.store(true, SeqCst);
+        clock.0.set(Duration::from_millis(99));
+        assert!(poll_once(serving.as_mut(), Waker::noop()).is_pending());
+        let events = received(&mut caller, id, &io);
+        assert!(
+            matches!(events.as_slice(), [Next::Message(m), Next::Done(Ok(()))] if m == b"answer"),
+            "the call was not answered"
+        );
+        assert_eq!(service.cancelled.load(SeqCst), 0);
+    }
+
+    #[test]
+    fn gateway_keeps_serving_calls_after_one_expires() {
+        use core::time::Duration;
+        let clock = ManualTimer(Rc::new(core::cell::Cell::new(Duration::ZERO)));
+        let service = Local::default();
+        let mut router = Router::builder()
+            .with_service(service.clone())
+            .build()
+            .unwrap();
+        let mut caller = grpc::Client::new(ClientConfig::default());
+        let gate = start_call(&mut caller, GATE_PATH, Some(Duration::from_millis(100)));
+        let io = GatewayIo::with_inbound(&caller.take_output());
+        let mut serving = pin!(serve_router_alone(io.clone(), &clock, &mut router));
+        assert!(poll_once(serving.as_mut(), Waker::noop()).is_pending());
+        service.open.store(true, SeqCst);
+        clock.0.set(Duration::from_millis(101));
+        assert!(poll_once(serving.as_mut(), Waker::noop()).is_pending());
+        let events = received(&mut caller, gate, &io);
+        assert!(matches!(events.as_slice(), [Next::Done(Err(_))]));
+
+        let quick = start_call(&mut caller, QUICK_PATH, None);
+        io.0.borrow_mut().inbound.extend(caller.take_output());
+        assert!(poll_once(serving.as_mut(), Waker::noop()).is_pending());
+        let events = received(&mut caller, quick, &io);
+        assert!(
+            matches!(events.as_slice(), [Next::Message(m), Next::Done(Ok(()))] if m == b"answer"),
+            "the gateway stopped serving after a call expired"
+        );
+    }
+
+    #[test]
+    fn overdue_output_retires_the_gateway_without_polling_its_worker() {
+        use core::time::Duration;
+        let clock = ManualTimer(Rc::new(core::cell::Cell::new(Duration::ZERO)));
+        let mut router = Router::builder()
+            .with_service(Local::default())
+            .build()
+            .unwrap();
+        let mut caller = grpc::Client::new(ClientConfig::default());
+        start_call(&mut caller, GATE_PATH, Some(Duration::from_millis(100)));
+        let io = GatewayIo::with_inbound(&caller.take_output());
+        io.0.borrow_mut().stall_writes = true;
+        let mut serving = pin!(serve_router_alone(io.clone(), &clock, &mut router));
+        assert!(poll_once(serving.as_mut(), Waker::noop()).is_pending());
+        let polls = io.0.borrow().write_polls;
+
+        // The write is released in the same step as its deadline passes.
+        io.0.borrow_mut().stall_writes = false;
+        clock.0.set(Duration::from_millis(100));
+        assert!(matches!(
+            poll_once(serving.as_mut(), Waker::noop()),
+            Poll::Ready(Err(Error::OutputDeadline))
+        ));
+        assert_eq!(
+            io.0.borrow().write_polls,
+            polls,
+            "overdue output was polled before its transport was retired"
+        );
+    }
+
+    #[test]
+    fn protocol_error_during_a_pending_write_writes_nothing_more() {
+        let (before, _) = output_around_protocol_error();
+        // The first write accepts three bytes, then stays pending. The input is
+        // read first, so the protocol error arrives while that write is in flight.
+        let io = GatewayIo::with_inbound(GARBAGE);
+        {
+            let mut wire = io.0.borrow_mut();
+            wire.stall_writes = true;
+            wire.emit = 3;
+        }
+        let clock = ManualTimer(Rc::new(core::cell::Cell::new(core::time::Duration::ZERO)));
+        let mut router = Router::builder()
+            .with_service(Local::default())
+            .build()
+            .unwrap();
+        let mut serving = pin!(serve_router_alone(io.clone(), &clock, &mut router));
+        assert!(matches!(
+            poll_once(serving.as_mut(), Waker::noop()),
+            Poll::Ready(Err(Error::Protocol(_)))
+        ));
+        let wire = io.0.borrow();
+        assert_eq!(wire.written, before[..3]);
+        assert_eq!((wire.writes, wire.flushes, wire.cancelled), (1, 0, 1));
+    }
+
+    #[test]
+    fn protocol_error_during_a_pending_flush_writes_nothing_more() {
+        let (before, _) = output_around_protocol_error();
+        let io = GatewayIo::with_inbound(GARBAGE);
+        {
+            let mut wire = io.0.borrow_mut();
+            // The worker polls a read before each request it takes, and a read
+            // dropped for a request is polled again after it. The input becomes
+            // readable on the third poll, which is the one that starts the flush
+            // the coordinator asks for once the write is reaped.
+            wire.read_ready_after = 2;
+            wire.stall_flushes = true;
+        }
+        let clock = ManualTimer(Rc::new(core::cell::Cell::new(core::time::Duration::ZERO)));
+        let mut router = Router::builder()
+            .with_service(Local::default())
+            .build()
+            .unwrap();
+        let mut serving = pin!(serve_router_alone(io.clone(), &clock, &mut router));
+        assert!(matches!(
+            poll_once(serving.as_mut(), Waker::noop()),
+            Poll::Ready(Err(Error::Protocol(_)))
+        ));
+        let wire = io.0.borrow();
+        assert_eq!(wire.written, before);
+        assert_eq!((wire.writes, wire.flushes, wire.cancelled), (1, 1, 1));
+    }
+
+    #[test]
+    fn protocol_error_after_a_short_write_sends_only_the_rest_and_the_goaway() {
+        let (before, goaway) = output_around_protocol_error();
+        let io = GatewayIo::with_inbound(GARBAGE);
+        io.0.borrow_mut().max_write = 1;
+        let clock = ManualTimer(Rc::new(core::cell::Cell::new(core::time::Duration::ZERO)));
+        let mut router = Router::builder()
+            .with_service(Local::default())
+            .build()
+            .unwrap();
+        let mut serving = pin!(serve_router_alone(io.clone(), &clock, &mut router));
+        assert!(matches!(
+            poll_once(serving.as_mut(), Waker::noop()),
+            Poll::Ready(Err(Error::Protocol(_)))
+        ));
+        assert_eq!(io.0.borrow().written, [&before[..], &goaway[..]].concat());
+    }
+
+    #[test]
+    fn goaway_is_written_on_a_protocol_error_with_no_output_in_flight() {
+        let (before, goaway) = output_around_protocol_error();
+        let io = GatewayIo::default();
+        let clock = ManualTimer(Rc::new(core::cell::Cell::new(core::time::Duration::ZERO)));
+        let mut router = Router::builder()
+            .with_service(Local::default())
+            .build()
+            .unwrap();
+        let mut serving = pin!(serve_router_alone(io.clone(), &clock, &mut router));
+        // The initial output is written and flushed, and a read is left pending.
+        assert!(poll_once(serving.as_mut(), Waker::noop()).is_pending());
+        assert_eq!(io.0.borrow().written, before);
+
+        io.0.borrow_mut().inbound.extend(GARBAGE);
+        assert!(matches!(
+            poll_once(serving.as_mut(), Waker::noop()),
+            Poll::Ready(Err(Error::Protocol(_)))
+        ));
+        assert_eq!(io.0.borrow().written, [&before[..], &goaway[..]].concat());
     }
 }

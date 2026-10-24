@@ -7,6 +7,11 @@
 //! - [`Handler`] and [`Route`]: the routing contract. Generated
 //!   `<Service>Dispatch` wrappers implement it; [`Registry`] and
 //!   [`MultiDispatch`] serve several services on one connection.
+//! - [`Router`]: serves one connection from local services and from forwarded
+//!   routes, with round-robin pools of downstream clients. Built on
+//!   [`lifecycle`] (the sans-IO call protocol, with call events and explicit
+//!   commands) and [`relay`] (one forwarded call, between a lifecycle call and a
+//!   [`Client`] call). See `docs/ROUTING.md` in the repository.
 //! - [`Client`]: issues unary and streaming calls and maps responses and
 //!   trailers to messages and [`Status`]es.
 //! - [`lpm`]: incremental length-prefixed message framing.
@@ -84,8 +89,12 @@ mod dispatch;
 mod fields;
 mod handler;
 mod inbound;
+pub mod lifecycle;
+mod local;
 pub mod lpm;
 mod metadata;
+pub mod relay;
+mod router;
 mod server;
 pub mod status;
 mod timeout;
@@ -100,6 +109,7 @@ pub use dispatch::{
 };
 pub use handler::{CallContext, FnHandler, Handler, MethodDescriptor, ResponseMetadata, Route};
 pub use metadata::{InvalidMetadata, Metadata, MetadataValue};
+pub use router::{Router, RouterBuilder};
 pub use server::{Server, ServerConfig};
 pub use status::{Code, Status};
 
@@ -362,7 +372,13 @@ mod tests_deadline;
 #[cfg(test)]
 mod tests_dispatch;
 #[cfg(test)]
+mod tests_lifecycle;
+#[cfg(test)]
 mod tests_metadata;
 
+#[cfg(test)]
+mod tests_relay;
+#[cfg(test)]
+mod tests_router;
 #[cfg(test)]
 mod tests_streaming;

@@ -132,6 +132,8 @@ mod asynch;
 #[cfg(feature = "async")]
 pub use asynch::{Call, Client, ClientBuilder, Server, ServerBuilder, client, server};
 #[cfg(feature = "async")]
+mod driver;
+#[cfg(feature = "async")]
 mod shared;
 
 #[cfg(feature = "async")]
