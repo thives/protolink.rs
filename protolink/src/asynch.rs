@@ -300,7 +300,7 @@ where
 /// [`Server::serve`] with streaming handlers). It only matters when more than one call
 /// is active; a client with one call never drops a read. For transports
 /// without a cancel-safe `read` (for example a one-shot DMA UART), put them
-/// behind [`link::pump`](crate::link::pump) or keep to one call at a time.
+/// behind the `pump` module of `protolink-adaptors` or keep to one call at a time.
 ///
 /// Without a deadline a blocked transport `write` or `flush` stops progress.
 /// With a timer, expiry during output retires the whole connection because

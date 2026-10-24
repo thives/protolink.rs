@@ -179,18 +179,13 @@ pub fn blocking_smoke() {
     let _ = black_box(server.serve(&mut handler));
 }
 
-/// Monomorphize all generated async RPC shapes, server, and CAS-backed wakers.
+/// Monomorphize all generated async RPC shapes and the async server.
 #[cfg(feature = "async")]
 pub async fn async_smoke() {
     use proto::smoke::SmokeClient;
-    use protolink::link::ring::RingBuffer;
 
-    let mut ring = RingBuffer::<u8, 4>::new();
-    let (mut tx, mut rx) = ring.split();
-    let mut cx = Context::from_waker(core::task::Waker::noop());
-    let _ = black_box(rx.poll_readable(&mut cx));
-    tx.push(black_box(7)).await;
-    black_box(rx.pop().await);
+    #[cfg(feature = "uart")]
+    ring_smoke().await;
 
     let request = request();
     let mut client = SmokeClient::new(
@@ -218,6 +213,20 @@ pub async fn async_smoke() {
         .without_deadlines()
         .build();
     let _ = black_box(server.serve(&mut handler).await);
+}
+
+/// Monomorphize the async halves of the ring buffer that the UART facade is
+/// built on. Only the adaptor-enabled configuration links the adaptors.
+#[cfg(feature = "uart")]
+async fn ring_smoke() {
+    use protolink_adaptors::ring::RingBuffer;
+
+    let mut ring = RingBuffer::<u8, 4>::new();
+    let (mut tx, mut rx) = ring.split();
+    let mut cx = Context::from_waker(core::task::Waker::noop());
+    let _ = black_box(rx.poll_readable(&mut cx));
+    tx.push(black_box(7)).await;
+    black_box(rx.pop().await);
 }
 
 /// An ARQ retransmission timer that never expires. It links the reliable stack

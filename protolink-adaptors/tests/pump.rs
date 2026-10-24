@@ -4,7 +4,6 @@
 //! `read`/`write` future and is lost (receive) or aborted part-way (transmit)
 //! when the future is dropped before it completes. That is exactly what ARQ's
 //! poll-once-and-drop behaviour would do to a real DMA driver.
-#![cfg(feature = "tokio")]
 
 use std::collections::VecDeque;
 use std::convert::Infallible;
@@ -16,8 +15,10 @@ use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use embedded_io_async::{Error as _, ErrorKind, ErrorType, Read, Write};
-use protolink::link::pump::{DefaultPumpState, PumpError, PumpFailure, PumpState, run};
-use protolink::link::{LinkError, StdTimer, reliable};
+use protolink::link::{StdTimer, reliable};
+use protolink_adaptors::pump::{
+    CHUNK_SIZE, DefaultPumpState, PumpError, PumpFailure, PumpState, RING_SIZE, WriteError, run,
+};
 
 async fn with_timeout<F: Future>(f: F) -> F::Output {
     tokio::time::timeout(Duration::from_secs(10), f)
@@ -497,7 +498,7 @@ async fn transmit_failure_fails_the_handle() {
 
     assert_eq!(poll_once(handle.write(b"x")), Some(Ok(1)));
     let err = with_timeout(tx_pump.run()).await.unwrap_err();
-    assert_eq!(err, LinkError::Io(HalError));
+    assert_eq!(err, WriteError::Io(HalError));
 
     let err = poll_once(handle.write(b"y")).unwrap().unwrap_err();
     assert_eq!(err.kind(), ErrorKind::ConnectionReset);
@@ -511,9 +512,30 @@ async fn transmit_accepting_no_bytes_is_write_zero() {
     let (mut handle, _rx_pump, mut tx_pump) = state.split(IdleRx, ZeroTx);
     assert_eq!(poll_once(handle.write(b"x")), Some(Ok(1)));
     let err = with_timeout(tx_pump.run()).await.unwrap_err();
-    assert_eq!(err, LinkError::WriteZero);
+    assert_eq!(err, WriteError::WriteZero);
     let err = poll_once(handle.write(b"y")).unwrap().unwrap_err();
     assert_eq!(err.kind(), ErrorKind::WriteZero);
+}
+
+#[test]
+fn transmit_errors_keep_the_kind_of_their_cause() {
+    assert_eq!(
+        WriteError::Io(ErrorKind::ConnectionReset).kind(),
+        ErrorKind::ConnectionReset
+    );
+    assert_eq!(
+        WriteError::<ErrorKind>::WriteZero.kind(),
+        ErrorKind::WriteZero
+    );
+}
+
+#[test]
+fn default_buffer_sizes_are_unchanged() {
+    // Pinned to the sizes used before the pump moved out of protolink. Changing
+    // them changes RAM use and how much data the buffers hold.
+    assert_eq!(RING_SIZE, 520);
+    assert_eq!(CHUNK_SIZE, 64);
+    let _: PumpState<520, 520, 64> = DefaultPumpState::new();
 }
 
 #[tokio::test]
@@ -560,7 +582,7 @@ async fn run_reports_which_half_failed() {
     let (mut handle, mut rx_pump, mut tx_pump) = state.split(IdleRx, FailingTx);
     assert_eq!(poll_once(handle.write(b"x")), Some(Ok(1)));
     match with_timeout(run(&mut rx_pump, &mut tx_pump)).await {
-        Err(PumpFailure::Tx(LinkError::Io(HalError))) => {}
+        Err(PumpFailure::Tx(WriteError::Io(HalError))) => {}
         other => panic!("unexpected result: {other:?}"),
     }
     drop((rx_pump, tx_pump));

@@ -456,7 +456,7 @@ pass it to `with_retransmission_timer`; without `std` there is no default and `b
 
 `CobsTransport` drops its raw futures after every poll (ARQ polls by hand), so the raw stream must be cancel-safe. Buffered
 and interrupt-driven UARTs are; one-shot DMA drivers are not (a dropped read loses bytes, a dropped
-write is aborted part-way). `link::pump` is an optional lower layer for those: it owns the DMA
+write is aborted part-way). `protolink_adaptors::pump` is an optional lower layer for those: it owns the DMA
 halves, completes every transfer, and gives the link a cancel-safe `PumpHandle`. See the module
 docs for when to use it, its caveats, and a usage example.
 `protolink_adaptors::uart` is the buffered UART factory over this pump: it adds the `with_storage` /

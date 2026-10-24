@@ -9,8 +9,8 @@ understands. It uses the same vocabulary as the rest of protolink (see [API.md](
 | Crate | Owns | Does not own |
 |---|---|---|
 | `protolink-i2c` | Mailbox encoding, controller transaction primitives, the target-driver trait | Queues, RPC, COBS/ARQ, executor tasks |
-| `protolink-adaptors` | `i2c_controller` / `i2c_target` / `uart`, buffered ports, route storage, scheduling, runners | Board-specific peripheral setup |
-| `protolink` | RPC drivers, the reliable link, the ring and the DMA pump | Anything I2C specific |
+| `protolink-adaptors` | `i2c_controller` / `i2c_target` / `uart`, buffered ports, route storage, scheduling, runners, the ring buffer and the DMA pump | Board-specific peripheral setup |
+| `protolink` | RPC drivers and the reliable link | Anything I2C specific, buffers and the DMA pump |
 
 There is no new transport trait: a port implements `embedded_io_async::{Read, Write}`, which is what
 `protolink::client`, `protolink::server` and `protolink::link::reliable` already take.
@@ -201,7 +201,7 @@ A UART is a full-duplex, point-to-point stream with no bus arbitration. The cont
 | **Buffered** | the RX and TX halves are split, and a transfer is aborted when its future is dropped (DMA) | `uart(rx, tx).with_storage(&mut state).build()` |
 
 A direct driver needs no adaptor, so there is nothing to build. The buffered path is a thin facade
-over `protolink::link::pump`: it provides the same vocabulary as I2C (`with_storage`, `build`, a
+over the `pump` module of this crate: it provides the same vocabulary as I2C (`with_storage`, `build`, a
 `Binding`, a runner to drive), with its own buffer defaults. The compiled assembly, with reliability
 and the runner polled beside the server, is in
 [API.md](API.md#embedded-buffered-uart-port-and-runner-optional-reliability-separate-services).
@@ -228,8 +228,9 @@ let io = protolink::link::reliable(protolink::tokio::compat(raw)).build();
   no dependencies.
 - `uart-linux`: the Linux serial wrapper over `tokio-serial`. Compiled only for Linux targets, and
   implies `uart`.
-- `portable-atomic`, `portable-atomic-critical-section`: forwarded to `protolink` for targets
-  without native atomics (checked on `thumbv6m-none-eabi`).
+- `portable-atomic`, `portable-atomic-critical-section`: atomics for targets without native
+  compare-and-swap (checked on `thumbv6m-none-eabi`). The second also needs a platform
+  critical-section implementation.
 
 The crates are `no_std` and the adaptors need no heap. The Linux wrapper is the only part that
 uses `std`, and it is compiled only with `uart-linux` on Linux.

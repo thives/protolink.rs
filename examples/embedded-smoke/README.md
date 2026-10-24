@@ -16,18 +16,18 @@ on-device memory/stack usage is claimed.
 - `src/lib.rs` is unconditionally `#![no_std]`. It implements the generated
   server trait and monomorphizes both real server drivers, generated clients,
   and their typed streaming operations against EOF/error-only stub I/O.
-- The async path also uses the ring buffer and registers a waker, retaining
-  portable-atomic/CAS integration in the linked image. The optional compression
-  path retains gzip decoding; it does not run the memory-heavy compressor.
+- With `uart`, the ring buffer under the UART facade is monomorphized and
+  registers a waker. That retains `protolink-adaptors`' portable-atomic/CAS
+  integration in the linked image. Without `uart` the fixture links no adaptor
+  and no CAS emulation. The optional compression path retains gzip decoding; it
+  does not run the memory-heavy compressor.
 - All target dependencies disable default features. The fixture has its own
   nested `[workspace]` and no dev-dependencies, so root tests and the Tokio
   example cannot unify `std` into its target graph. Host build dependencies
   intentionally use `std`; resolver 3 keeps them separate from target features.
 - The generated async and blocking clients are independently selected by the
-  fixture features. `portable-atomic-critical-section` is always supplied to
-  the runtime and currently implies the runtime's `async` feature even for a
-  blocking-only generated-client check. Thus that check does **not** claim an
-  async-free runtime dependency graph.
+  fixture features. The runtime enables `async` only when a fixture feature asks
+  for it, so a blocking-only check has no async crates in its runtime graph.
 
 The root `Cargo.toml` explicitly excludes this standalone workspace. Use
 `--manifest-path`; do not add this fixture as a member, which would defeat
@@ -54,12 +54,12 @@ The CI consumer matrix independently checks `async`, `blocking`,
 adds the buffered UART facade and the reliable stack over it, and is checked
 alone and with `async,blocking`. This is compile coverage for the no_std target:
 the UART halves are stubs, so it shows that the code links, not that a UART
-works (see `docs/UART.md`). Separately, the
-runtime matrix checks `portable-atomic-critical-section` (which implies `async`)
-with all combinations of `blocking` and `miniz-oxide`, using only `--lib` (not tests,
-examples, or `--all-targets`, which could pull in std dev-dependencies). Separate
-sans-I/O checks cover no codec, micropb, miniz-oxide, and both codecs without
-`protolink`'s `micropb` feature unifying their features.
+works (see `docs/UART.md`). Separately, the core crate's Cortex-M0 checks cover
+`async` with all combinations of `blocking` and `miniz-oxide`, using only `--lib`
+(not tests, examples, or `--all-targets`, which could pull in std
+dev-dependencies). Separate sans-I/O checks cover no codec, micropb,
+miniz-oxide, and both codecs without `protolink`'s `micropb` feature unifying
+their features.
 
 Build the **linked binary**, not just metadata:
 
@@ -70,6 +70,9 @@ cargo build --manifest-path examples/embedded-smoke/Cargo.toml \
 cargo build --manifest-path examples/embedded-smoke/Cargo.toml \
   --release --target thumbv6m-none-eabi --bin embedded-smoke \
   --no-default-features --features async,blocking,compression
+cargo build --manifest-path examples/embedded-smoke/Cargo.toml \
+  --release --target thumbv6m-none-eabi --bin embedded-smoke \
+  --no-default-features --features async,blocking,uart
 ```
 
 The ELF is at
@@ -93,8 +96,9 @@ cargo fmt --manifest-path examples/embedded-smoke/Cargo.toml --all -- --check
 The target-only tree should contain no `std` or Tokio features. The image should
 have ARM/soft-float attributes, a vector table with an aligned RAM stack pointer
 and Thumb reset address, the allocator, and `_critical_section_1_0_acquire` /
-`_critical_section_1_0_release` definitions. Existing Miri jobs remain unchanged;
-this cross-build does not replace their concurrency checks.
+`_critical_section_1_0_release` definitions. The Miri jobs in CI cover the ring
+buffer and the client; this cross-build does not replace their concurrency
+checks.
 
 ## Platform limits
 

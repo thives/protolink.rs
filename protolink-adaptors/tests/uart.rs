@@ -16,8 +16,8 @@ use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use embedded_io_async::{Error as _, ErrorKind, ErrorType, Read, Write};
-use protolink::link::pump::PumpFailure;
-use protolink::link::{LinkError, reliable};
+use protolink::link::reliable;
+use protolink_adaptors::pump::{PumpFailure, WriteError};
 use protolink_adaptors::{Binding, UartState, uart};
 use static_cell::StaticCell;
 
@@ -536,7 +536,7 @@ async fn failing_hal_flush_fails_the_port_flush_and_the_runner() {
     assert_eq!(err.kind(), ErrorKind::ConnectionReset);
     assert_eq!(
         failure.expect_err("the runner ends with the HAL failure"),
-        PumpFailure::Tx(LinkError::Io(HalError::Failed(ErrorKind::ConnectionReset)))
+        PumpFailure::Tx(WriteError::Io(HalError::Failed(ErrorKind::ConnectionReset)))
     );
 }
 
@@ -567,7 +567,7 @@ async fn transmit_failure_wakes_a_pending_write_and_fails_receive() {
     );
     assert_eq!(
         failure.expect_err("the runner fails on its first transfer"),
-        PumpFailure::Tx(LinkError::Io(HalError::Failed(
+        PumpFailure::Tx(WriteError::Io(HalError::Failed(
             ErrorKind::ConnectionAborted
         )))
     );
@@ -856,4 +856,11 @@ async fn reliable_link_over_buffered_uart() {
         assert_eq!(got_b, data_ab);
     })
     .await;
+}
+
+#[test]
+fn default_state_keeps_the_pump_buffer_sizes() {
+    // The defaults of `UartState` are the pump's: 520-byte rings and a 64-byte
+    // staging buffer. A change here changes RAM use.
+    let _: UartState<520, 520, 64> = UartState::new();
 }

@@ -41,9 +41,9 @@ test:
   cargo test --workspace --doc --all-features
 
 miri:
-  cargo +nightly miri test --features portable-atomic --lib link::ring
-  cargo +nightly miri test --features portable-atomic --lib asynch::tests
-  cargo +nightly miri test --features portable-atomic,std --lib asynch::tests
+  cargo +nightly miri test -p protolink-adaptors --features portable-atomic --lib ring::tests
+  cargo +nightly miri test -p protolink --features async --lib asynch::tests
+  cargo +nightly miri test -p protolink --features async,std --lib asynch::tests
 
 # Repeat the concurrency tests to catch rare hangs
 stress:

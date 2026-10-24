@@ -49,8 +49,7 @@
 //! ## Features
 //!
 //! - `async` / `embedded-io`: [`server`] and [`client`] over
-//!   `embedded_io_async::{Read, Write}`, and the [`link`] module (including the
-//!   optional [`link::pump`] lower layer for DMA UARTs).
+//!   `embedded_io_async::{Read, Write}`, and the [`link`] module.
 //! - `blocking`: [`blocking::server`] and [`blocking::client`] over
 //!   `embedded_io::{Read, Write}`. A blocking server built
 //!   [`with_wakeable_reads`](blocking::ServerBuilder::with_wakeable_reads)
@@ -58,10 +57,6 @@
 //!   handlers that were `Pending` progress as soon as they are woken, without
 //!   relying on read timeouts.
 //! - `tokio`: [`tokio`] factories adapting tokio I/O to the async drivers.
-//! - `portable-atomic`: use [`portable-atomic`](https://docs.rs/portable-atomic) for link and
-//!   ARQ atomics on targets that need a portable implementation. On targets without native
-//!   compare-and-swap, also enable `portable-atomic-critical-section` and link a platform-provided
-//!   critical-section implementation.
 //! - Deadlines: [`Timer`] / [`Clock`] let the drivers enforce `grpc-timeout`;
 //!   see below.
 //! - `std`: `std` support in dependencies, including a default ARQ
@@ -109,9 +104,7 @@
 //! can check [`CallContext::remaining`]. [`Timer`] is unrelated to
 //! `link::Timer`, the ARQ retransmission timer.
 #![cfg_attr(not(feature = "std"), no_std)]
-// `deny` rather than `forbid` so that `link::ring`, the only module that needs
-// `unsafe`, can opt in locally.
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 extern crate alloc;

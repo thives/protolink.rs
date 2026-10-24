@@ -64,7 +64,7 @@
 //! # UART
 //!
 //! [`uart()`] is the buffered factory for a split, full-duplex UART. It is a thin
-//! facade over [`protolink::link::pump`], and the runner drives both halves.
+//! facade over the [`pump`] module, and the runner drives both halves.
 //! Drivers that are already cancel-safe need no adaptor and are passed to
 //! protolink directly. See `docs/UART.md` for the contract.
 //!
@@ -74,16 +74,22 @@
 //! - `uart`: the buffered UART factory, [`uart()`] and [`UartState`].
 //! - `uart-linux`: the Linux serial port wrapper, `uart::linux::LinuxUart`,
 //!   over `tokio-serial`. Compiled on Linux only; other targets ignore it.
-//! - `portable-atomic`, `portable-atomic-critical-section`: forwarded to
-//!   protolink, for targets without native atomics.
+//! - `portable-atomic`, `portable-atomic-critical-section`: atomics for targets
+//!   without native compare-and-swap, such as thumbv6m. The second also needs a
+//!   platform-provided critical-section implementation.
 #![no_std]
 #![warn(missing_docs)]
-#![forbid(unsafe_code)]
+// `deny` rather than `forbid` so that `ring`, the only module that needs
+// `unsafe`, can opt in locally.
+#![deny(unsafe_code)]
 
 // Without a bus feature nothing constructs a channel.
 #[cfg_attr(not(feature = "i2c"), allow(dead_code))]
 mod channel;
 pub use channel::{DEFAULT_BUFFER_SIZE, Port, PortError, PortReader, PortWriter};
+
+pub mod pump;
+pub mod ring;
 
 /// A port and the runner that drives it, as returned by `build`.
 ///

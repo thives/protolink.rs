@@ -220,7 +220,7 @@ The private `inbound.rs` wraps the decoder with manual flow control. Credit is w
 
 ## Known limitations
 
-- **Concurrent calls need a cancel-safe `read` (async client).** Calls on one connection share the transport; a pending read is dropped when another call must write. tokio streams, `CobsFramed` and the `link` stack are cancel-safe. A transport that loses data when a `read` is dropped (for example a one-shot DMA UART) must go behind `link::pump`, or be used with one call at a time.
+- **Concurrent calls need a cancel-safe `read` (async client).** Calls on one connection share the transport; a pending read is dropped when another call must write. tokio streams, `CobsFramed` and the `link` stack are cancel-safe. A transport that loses data when a `read` is dropped (for example a one-shot DMA UART) must go behind `protolink_adaptors::pump`, or be used with one call at a time.
 - **The blocking client can't interrupt a read.** A `message()` blocks until its own call has something to return. Send on every call the peer waits for before blocking on a response.
 - **Unary calls and streaming calls don't overlap.** Unary calls take `&mut self`, so they can't run while a `Call` exists.
 - **The drivers don't read while a transport write is blocked.** On a transport that buffers less than the data in flight, a bidi call that sends many requests without reading responses can block both peers in `write`. This affects tiny pipes or UART buffers without a reader task. HTTP/2 flow control bounds memory but not transport-level write blocking. The workaround is to interleave `message` with `send`, or give the transport enough buffering. This is documented on `Call`, and the e2e COBS test uses a 4 KiB pipe for this reason.

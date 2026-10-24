@@ -16,7 +16,8 @@ use portable_atomic::{AtomicU8, Ordering};
 
 use atomic_waker::AtomicWaker;
 use embedded_io_async::{Error as IoError, ErrorKind, ErrorType, Read, Write};
-use protolink::link::ring::{RingBuffer, RingRx, RingTx};
+
+use crate::ring::{RingBuffer, RingRx, RingTx};
 
 /// Default size, in bytes, of each of a port's two buffers.
 pub const DEFAULT_BUFFER_SIZE: usize = 64;
@@ -214,9 +215,9 @@ impl<const RX: usize, const TX: usize> Drop for Ends<'_, RX, TX> {
 /// The application's end of a bus route: a buffered byte stream.
 ///
 /// It implements [`embedded_io_async::Read`] and [`Write`], so it plugs into
-/// [`protolink::link::reliable`], [`protolink::client`] and
-/// [`protolink::server`] like any other stream. Reliability is never added
-/// implicitly: layer it with `protolink::link::reliable(port)` when wanted. It only moves bytes in and out
+/// `protolink::link::reliable`, `protolink::client` and `protolink::server`
+/// like any other stream. Reliability is never added implicitly: layer it with
+/// `protolink::link::reliable(port)` when wanted. It only moves bytes in and out
 /// of two ring buffers; the bus is driven by the runner, which must be polled
 /// concurrently.
 ///

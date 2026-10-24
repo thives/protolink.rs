@@ -10,7 +10,7 @@
 //! | Buffered embedded UART | the RX and TX halves are split, and a transfer may be aborted when its future is dropped (DMA) | `uart(rx, tx).with_storage(&mut state).build()` |
 //! | Linux UART | a configured serial device under Tokio | `LinuxUart::open(path, baud)` |
 //!
-//! The buffered path is a facade over [`protolink::link::pump`]: it adds the
+//! The buffered path is a facade over the [`pump`](crate::pump) module: it adds the
 //! construction pattern and buffer defaults, not a second buffer
 //! implementation. The UART contract (reads, writes, cancellation, errors,
 //! flush meanings) is in `docs/UART.md`.
@@ -34,5 +34,5 @@ mod buffered;
 #[cfg(all(feature = "uart-linux", target_os = "linux"))]
 pub mod linux;
 
+pub use crate::pump::PumpFailure;
 pub use buffered::{UartBuilder, UartRunner, UartState, uart};
-pub use protolink::link::pump::PumpFailure;

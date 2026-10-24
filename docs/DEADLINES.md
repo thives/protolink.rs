@@ -107,7 +107,7 @@ transport/protocol failures and reject new calls without replaying queued output
 - **Waiting for a deadline drops a pending read.** With a timer, the transport `read` must be cancel-safe
   even for a unary-only server or a client with one call (see "Known limitations" in
   `STREAMING_GAP.md`). tokio streams, `CobsFramed` and the `link` stack are. A one-shot DMA UART goes
-  behind `link::pump`.
+  behind `protolink_adaptors::pump`.
 - **Deadlines are only noticed while the driver is running.** An async `Client` expires calls while one of
   its operations is polled. The reset of an expired call is written by the next operation on the client.
 - **Blocking reads need a timeout hook.** A deadline clock requires `ReadTimeout` (or

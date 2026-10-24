@@ -16,7 +16,7 @@
 //! ```
 //! # #[tokio::main(flavor = "current_thread")]
 //! # async fn main() {
-//! use protolink::link::ring::RingBuffer;
+//! use protolink_adaptors::ring::RingBuffer;
 //!
 //! let mut ring = RingBuffer::<u32, 4>::new();
 //! let (mut tx, mut rx) = ring.split();

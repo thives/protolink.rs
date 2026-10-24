@@ -71,7 +71,7 @@ operation.
 
 ## Buffered facade
 
-`protolink_adaptors::uart` is a thin facade over `protolink::link::pump`. It reuses the pump's
+`protolink_adaptors::uart` is a thin facade over the `pump` module of `protolink-adaptors`. It reuses the pump's
 rings, staging buffer, flush protocol, and error propagation; it does not add a second buffer
 implementation.
 

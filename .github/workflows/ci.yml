@@ -65,9 +65,9 @@ jobs:
           components: miri
       # The client's shared state differs with and without `std`.
       - run: |
-            cargo miri test --features portable-atomic --lib link::ring
-            cargo miri test --features portable-atomic --lib asynch::tests
-            cargo miri test --features portable-atomic,std --lib asynch::tests
+            cargo miri test -p protolink-adaptors --features portable-atomic --lib ring::tests
+            cargo miri test -p protolink --features async --lib asynch::tests
+            cargo miri test -p protolink --features async,std --lib asynch::tests
 
   cross-check:
     name: Check Cross-Compilation
@@ -102,30 +102,31 @@ jobs:
     strategy:
       matrix:
         features:
-          - portable-atomic-critical-section
-          - portable-atomic-critical-section,blocking
-          - portable-atomic-critical-section,miniz-oxide
-          - portable-atomic-critical-section,blocking,miniz-oxide
+          - async
+          - async,blocking
+          - async,miniz-oxide
+          - async,blocking,miniz-oxide
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: thumbv6m-none-eabi
       # Only libraries: dev-dependencies must not unify in std/Tokio features.
-      # portable-atomic-critical-section currently also enables async itself.
+      # `async` is named explicitly so the async drivers stay checked on M0.
       - run: cargo check --release --target thumbv6m-none-eabi --lib --no-default-features --features "${{ matrix.features }}" -p protolink
+      # The adaptors are checked once, on the `async` entry.
       - name: Check the bus adaptors
-        if: matrix.features == 'portable-atomic-critical-section'
+        if: matrix.features == 'async'
         run: |
           cargo check --release --target thumbv6m-none-eabi --lib --no-default-features -p protolink-i2c
           cargo check --release --target thumbv6m-none-eabi --lib --features portable-atomic-critical-section -p protolink-adaptors
       - name: Check the UART facade
-        if: matrix.features == 'portable-atomic-critical-section'
+        if: matrix.features == 'async'
         run: cargo check --release --target thumbv6m-none-eabi --lib --no-default-features --features uart,portable-atomic-critical-section -p protolink-adaptors
       # Separate invocations keep protolink's default micropb feature from
       # masking the sans-IO crates' codec-free feature combinations.
       - name: Check isolated sans-IO codec combinations
-        if: matrix.features == 'portable-atomic-critical-section'
+        if: matrix.features == 'async'
         run: |
           cargo check --release --target thumbv6m-none-eabi --lib --no-default-features -p protolink-grpc -p protolink-http2
           cargo check --release --target thumbv6m-none-eabi --lib --no-default-features --features micropb -p protolink-grpc

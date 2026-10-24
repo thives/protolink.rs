@@ -90,7 +90,7 @@ it once, and drops it if pending. Framing state survives that, and cancellation
 between fragmented reads and writes. Dropping an upper `read`, `write` or
 `flush` future loses nothing, since ARQ keeps all protocol state in the link.
 Transport errors are propagated, not treated as corrupt frames. Use
-`link::pump` for drivers whose pending operations cannot safely be cancelled;
+`protolink_adaptors::pump` for drivers whose pending operations cannot safely be cancelled;
 future recreation now happens in `CobsTransport`, not in an upstream adapter.
 The `protolink-adaptors` ports (I2C) are cancel-safe by construction, so they need no pump:
 they only move bytes in and out of rings, while a runner owns the bus. See
@@ -161,7 +161,7 @@ partial/pending raw writes and flushes, oversized frames, ordered delivery,
 absence of duplicate delivery, eventual flush, cancelled upper reads, the
 terminal timeout with buffered data, owed-ACK flushes and lower EOF. Its raw
 ARQ test uses an in-memory framed transport fixture. `protolink/tests/std_timer.rs`
-and `link::timer`'s unit tests cover `StdTimer`; `protolink/tests/pump.rs` covers
+and `link::timer`'s unit tests cover `StdTimer`; `protolink-adaptors/tests/pump.rs` covers
 the DMA pump.
 
 The test fixtures write full 251-byte blocks, because ARQ coalesces smaller

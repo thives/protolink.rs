@@ -47,9 +47,9 @@
 //!
 //! Interrupt-driven or ring-buffered drivers (for example a buffered UART)
 //! meet these requirements. Drivers that start a DMA transfer inside the
-//! future and abort it on drop do not; put them behind the [`pump`] module,
-//! which owns the driver, completes every transfer, and hands the link a
-//! cancel-safe stream.
+//! future and abort it on drop do not. Put them behind the `pump` module of
+//! `protolink-adaptors`, which owns the driver, completes every transfer, and
+//! hands the link a cancel-safe stream.
 //!
 //! Errors from the raw stream are returned to the caller as-is. An overrun or
 //! framing error reported by a HAL therefore ends the operation; a HAL wrapper
@@ -92,8 +92,6 @@
 //! Over transports that are already reliable and ordered (TCP, USB bulk), use
 //! the drivers directly without this module.
 
-pub mod pump;
-pub mod ring;
 #[cfg(feature = "std")]
 mod timer;
 
@@ -367,7 +365,7 @@ impl<S: Write> Write for CobsFramed<S> {
 /// the [`CobsFramed`], polls it once, and drops it if it is pending. All
 /// progress lives in the [`CobsFramed`], so nothing is lost, but the raw
 /// stream must be cancel-safe (see the [module docs](self)); put DMA drivers
-/// behind [`pump`].
+/// behind the `pump` module of `protolink-adaptors`.
 ///
 /// - `poll_read` returns one whole frame, or `0` once the raw stream ended.
 /// - `poll_write` accepts a whole frame of at most [`MAX_FRAME_PAYLOAD`]

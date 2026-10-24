@@ -10,13 +10,13 @@
 //! # Why
 //!
 //! ARQ polls its lower layer by hand. On every poll protolink's
-//! [`CobsTransport`](super::CobsTransport) creates a fresh `read_frame`,
-//! `write` or `flush` future on [`CobsFramed`](super::CobsFramed), which drives
-//! the raw stream, polls it once, and drops it if it is pending (see
-//! [the requirements](super#requirements-on-the-raw-stream)). That is harmless
-//! for a driver backed by a buffer that is filled and drained in the background
-//! (an interrupt-driven or ring-buffered UART). It breaks a driver that starts a
-//! DMA transfer *inside* the future and aborts it when the future is dropped:
+//! `CobsTransport` creates a fresh `read_frame`, `write` or `flush` future on
+//! `CobsFramed`, which drives the raw stream, polls it once, and drops it if it
+//! is pending (see "Requirements on the raw stream" in the `protolink::link`
+//! module docs). That is harmless for a driver backed by a buffer that is
+//! filled and drained in the background (an interrupt-driven or ring-buffered
+//! UART). It breaks a driver that starts a DMA transfer *inside* the future and
+//! aborts it when the future is dropped:
 //!
 //! - a dropped `read` loses the bytes the transfer had already captured;
 //! - a dropped `write` is aborted part-way, so a truncated frame is sent, and
@@ -53,8 +53,8 @@
 //!
 //! ```no_run
 //! use embedded_io_async::{Read, Write};
-//! use protolink::link::pump::{DefaultPumpState, run};
 //! use protolink::link::{Timer, reliable};
+//! use protolink_adaptors::pump::{DefaultPumpState, run};
 //!
 //! # async fn demo<R: Read, W: Write, T: Timer>(uart_rx: R, uart_tx: W, timer: T) {
 //! let mut state = DefaultPumpState::new();
@@ -104,7 +104,8 @@
 //!   corrupt frames are already dropped by COBS and retransmitted by ARQ.
 //! - **Restarting:** `run` may be called again after it returns an error, once
 //!   the HAL has recovered. A transmit chunk that failed is still in the ring
-//!   and is written again.
+//!   and is written again, which can repeat bytes the HAL already sent (see
+//!   the caveats).
 //!
 //! # Caveats
 //!
@@ -117,11 +118,13 @@
 //!   A HAL `read` that waits to fill the *whole* buffer delays everything by up
 //!   to `CHUNK` bytes, so wrap such a driver so that it returns on idle-line, or
 //!   choose a small `CHUNK`.
-//! - **Dropping a `run` future.** Dropping it while a transfer is in flight is
-//!   handled by the HAL like any dropped future: an interrupted receive loses
-//!   at most one chunk, and an interrupted transmit is written again from the
-//!   start of its chunk when `run` is next polled, so part of it may be sent
-//!   twice. ARQ recovers, but do not do this in normal operation.
+//! - **Cancelling a `run` future.** Handle operations (`read`, `write`, `flush`)
+//!   are cancel-safe; the runners are not. Dropping a `run` future while a
+//!   transfer is in flight is handled by the HAL like any dropped future: an
+//!   interrupted receive loses at most one chunk, and an interrupted transmit is
+//!   written again from the start of its chunk when `run` is next polled, so
+//!   part of it may be sent twice. ARQ recovers, but do not do this in normal
+//!   operation.
 //!
 //! # Memory
 //!
@@ -144,11 +147,14 @@ use portable_atomic::{AtomicU8, AtomicUsize, Ordering};
 use atomic_waker::AtomicWaker;
 use embedded_io_async::{Error as IoError, ErrorKind, ErrorType, Read, Write};
 
-use super::ring::{RingBuffer, RingRx, RingTx};
-use super::{ENCODED_FRAME, LinkError};
+use crate::ring::{RingBuffer, RingRx, RingTx};
 
-/// Default size of each ring buffer: two encoded COBS frames.
-pub const RING_SIZE: usize = 2 * ENCODED_FRAME;
+/// Default size of each ring buffer, in bytes: room for two encoded COBS frames
+/// of the reliable link stack (260 bytes each).
+///
+/// This is a default capacity, not a protocol requirement. Any non-zero size
+/// works; a larger ring absorbs more jitter at the cost of RAM.
+pub const RING_SIZE: usize = 520;
 
 /// Default size of the receive staging buffer, which is also the largest
 /// single HAL transfer.
@@ -184,13 +190,42 @@ impl IoError for PumpError {
     }
 }
 
+/// Error of the transmit half of a pump: the HAL failed, or accepted no bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteError<E> {
+    /// The HAL's transmit half failed.
+    Io(E),
+    /// The HAL's transmit half accepted zero bytes.
+    WriteZero,
+}
+
+impl<E: core::fmt::Debug> core::fmt::Display for WriteError<E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "transmit i/o error: {e:?}"),
+            Self::WriteZero => f.write_str("transmit accepted zero bytes"),
+        }
+    }
+}
+
+impl<E: core::fmt::Debug> core::error::Error for WriteError<E> {}
+
+impl<E: IoError> IoError for WriteError<E> {
+    fn kind(&self) -> ErrorKind {
+        match self {
+            Self::Io(e) => e.kind(),
+            Self::WriteZero => ErrorKind::WriteZero,
+        }
+    }
+}
+
 /// Why [`run`] returned: the failure of one of the two HAL halves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PumpFailure<RE, WE> {
     /// The receive half failed.
     Rx(RE),
     /// The transmit half failed.
-    Tx(LinkError<WE>),
+    Tx(WriteError<WE>),
 }
 
 impl<RE: core::fmt::Debug, WE: core::fmt::Debug> core::fmt::Display for PumpFailure<RE, WE> {
@@ -400,8 +435,7 @@ impl<const RX: usize, const TX: usize, const CHUNK: usize> Default for PumpState
 ///
 /// Implements `embedded_io_async::{Read, Write}` with operations that are
 /// cancel-safe: they only move bytes to or from the ring buffers. Give it to
-/// [`reliable`](super::reliable) or
-/// [`CobsFramed::new`](super::CobsFramed::new).
+/// `protolink::link::reliable` or `protolink::link::CobsFramed::new`.
 pub struct PumpHandle<'a, const RX: usize, const TX: usize> {
     rx: RingRx<'a, u8, RX>,
     tx: RingTx<'a, u8, TX>,
@@ -583,8 +617,8 @@ impl<W: Write, const TX: usize, const CHUNK: usize> TxPump<'_, W, TX, CHUNK> {
     /// handle asks for it.
     ///
     /// Never returns `Ok`; it ends with the HAL's error, or
-    /// [`LinkError::WriteZero`] if the HAL accepts no bytes.
-    pub async fn run(&mut self) -> Result<Infallible, LinkError<W::Error>> {
+    /// [`WriteError::WriteZero`] if the HAL accepts no bytes.
+    pub async fn run(&mut self) -> Result<Infallible, WriteError<W::Error>> {
         self.ctl.tx_end.set(None);
         loop {
             let ctl = self.ctl;
@@ -610,19 +644,19 @@ impl<W: Write, const TX: usize, const CHUNK: usize> TxPump<'_, W, TX, CHUNK> {
                     let (chunk, _) = self.ring.as_slices();
                     let chunk = &chunk[..chunk.len().min(CHUNK)];
                     match self.raw.write(chunk).await {
-                        Ok(0) => return Err(self.fail(LinkError::WriteZero)),
+                        Ok(0) => return Err(self.fail(WriteError::WriteZero)),
                         // The bytes leave the ring only now that they are
                         // written, which frees space for the handle.
                         Ok(n) => {
                             let n = n.min(chunk.len());
                             self.ring.consume(n);
                         }
-                        Err(e) => return Err(self.fail(LinkError::Io(e))),
+                        Err(e) => return Err(self.fail(WriteError::Io(e))),
                     }
                 }
                 Work::Flush(req) => {
                     if let Err(e) = self.raw.flush().await {
-                        return Err(self.fail(LinkError::Io(e)));
+                        return Err(self.fail(WriteError::Io(e)));
                     }
                     self.ctl.flushed.store(req, Ordering::Release);
                     self.ctl.write_waker.wake();
@@ -631,7 +665,7 @@ impl<W: Write, const TX: usize, const CHUNK: usize> TxPump<'_, W, TX, CHUNK> {
         }
     }
 
-    fn fail(&self, err: LinkError<W::Error>) -> LinkError<W::Error> {
+    fn fail(&self, err: WriteError<W::Error>) -> WriteError<W::Error> {
         self.ctl.tx_end.set(Some(End::Error(err.kind())));
         self.ctl.write_waker.wake();
         err

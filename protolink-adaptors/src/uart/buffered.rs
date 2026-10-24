@@ -2,18 +2,18 @@
 //! halves.
 //!
 //! The facade adds no buffering of its own. The rings, the staging buffer, the
-//! flush protocol and the error propagation are all [`protolink::link::pump`];
-//! this module provides the adaptor vocabulary (`uart(..).with_storage(..)
+//! flush protocol and the error propagation are all in [`crate::pump`]; this
+//! module provides the adaptor vocabulary (`uart(..).with_storage(..)
 //! .build()`), buffer defaults sized for the pump, and a runner that owns both
 //! halves.
 
 use core::convert::Infallible;
 
 use embedded_io_async::{Read, Write};
-use protolink::link::pump::{
+
+use crate::pump::{
     self, CHUNK_SIZE, PumpFailure, PumpHandle, PumpState, RING_SIZE, RxPump, TxPump,
 };
-
 use crate::{Binding, NoStorage};
 
 /// Storage for a buffered UART: the receive and transmit rings and the receive
