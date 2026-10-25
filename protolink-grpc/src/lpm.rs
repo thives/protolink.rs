@@ -145,6 +145,10 @@ fn check_prefix(prefix: &[u8], max_size: usize, has_codec: bool) -> Result<usize
 /// is trimmed when it exceeds twice the live bytes or a 1024-byte reuse allowance
 /// (whichever is larger), capped by the single-partial-message wire budget.
 ///
+/// A single uncompressed message that exactly fills an exactly sized buffer is
+/// returned in that allocation, without a copy. Its prefix is removed in place,
+/// so the returned vector keeps the five prefix bytes as spare capacity.
+///
 /// Compressed messages stay compressed in the buffer and are decompressed by
 /// `next`, with the decompressed size limited to `max_size`. A message that
 /// fails to decompress ends the stream: `next` returns the error, and the
@@ -231,6 +235,11 @@ impl Decoder {
     /// Like [`next`](Self::next), and the number of bytes the message took
     /// on the wire, prefix included: the amount of flow-control credit it
     /// accounts for.
+    ///
+    /// An uncompressed message that is the only content of an exactly sized
+    /// buffer is returned as that buffer, with its prefix removed in place.
+    /// Otherwise the message is copied (or decompressed) and the buffer is
+    /// compacted as before.
     pub(crate) fn next_framed(&mut self) -> Option<Result<(Vec<u8>, usize), Status>> {
         if self.count == 0 {
             return self.error.clone().map(Err);
@@ -248,6 +257,9 @@ impl Decoder {
                 return Some(Err(status));
             }
         };
+        if !compressed && self.can_take_buffer(wire_len) {
+            return Some(Ok((self.take_buffer(), wire_len)));
+        }
         let payload = &p[HEADER_LEN..wire_len];
         let message = if compressed {
             decompress(self.codec, payload, self.max_size)
@@ -271,6 +283,31 @@ impl Decoder {
                 Some(Err(status))
             }
         }
+    }
+
+    /// Whether the single buffered message (validated, `wire_len` bytes) is the
+    /// whole buffer, and the buffer is exactly its size. Such a message can be
+    /// returned without copying. A pending error does not prevent this: it is
+    /// kept for later calls, as the buffered message precedes it.
+    fn can_take_buffer(&self, wire_len: usize) -> bool {
+        wire_len > HEADER_LEN
+            && self.start == 0
+            && self.count == 1
+            && self.complete == self.buf.len()
+            && wire_len == self.buf.len()
+            && self.buf.capacity() == wire_len
+    }
+
+    /// Return the buffered message in its own allocation, after removing its
+    /// prefix in place. The decoder keeps its configuration and error state,
+    /// and holds no storage afterwards.
+    fn take_buffer(&mut self) -> Vec<u8> {
+        let mut message = core::mem::take(&mut self.buf);
+        message.drain(..HEADER_LEN);
+        self.start = 0;
+        self.complete = 0;
+        self.count = 0;
+        message
     }
 
     fn compact(&mut self) {
@@ -568,5 +605,334 @@ mod boundary_tests {
         } else {
             assert!(decoder.next().is_none());
         }
+    }
+
+    /// Deterministic payload whose bytes identify their position.
+    fn pattern(len: usize) -> Vec<u8> {
+        (0..len).map(|i| i as u8).collect()
+    }
+
+    /// A buffer holding exactly `framed`, with `spare` bytes of unused capacity.
+    fn buffer(framed: &[u8], spare: usize) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(framed.len() + spare);
+        buf.extend_from_slice(framed);
+        assert_eq!(buf.capacity(), framed.len() + spare);
+        buf
+    }
+
+    /// A decoder whose input is `buf`, as if its bytes had arrived in one push.
+    fn decoder_over(buf: Vec<u8>, max_size: usize, codec: Option<&'static dyn Codec>) -> Decoder {
+        let mut decoder = Decoder::new(max_size);
+        decoder.set_codec(codec);
+        decoder.buf = buf;
+        decoder.scan();
+        decoder
+    }
+
+    /// The decoder retains no input storage and no message positions.
+    fn assert_released(decoder: &Decoder) {
+        assert_eq!(decoder.buf.capacity(), 0);
+        assert_eq!((decoder.start, decoder.complete, decoder.count), (0, 0, 0));
+        assert_eq!(decoder.buffered(), 0);
+    }
+
+    #[test]
+    fn eligible_message_transfers_its_buffer_without_a_copy() {
+        for payload_len in [8, 1024, 4096, 65_536] {
+            let payload = pattern(payload_len);
+            let framed = encode(&payload).unwrap();
+            let mut decoder = Decoder::new(payload_len);
+            decoder.push(&framed);
+            assert_eq!(decoder.buf.capacity(), framed.len());
+            let buffer = decoder.buf.as_ptr();
+
+            let (message, wire_len) = decoder.next_framed().unwrap().unwrap();
+            assert_eq!(message, payload);
+            assert_eq!(wire_len, framed.len());
+            assert_eq!(message.as_ptr(), buffer);
+            assert_eq!(message.capacity(), framed.len());
+            assert_released(&decoder);
+            assert_eq!(decoder.max_size, payload_len);
+            assert_eq!(decoder.finish(), Ok(()));
+            assert!(decoder.next().is_none());
+        }
+    }
+
+    #[test]
+    fn transferred_message_leaves_a_reusable_decoder_with_its_configuration() {
+        let mut decoder = Decoder::new(4096);
+        decoder.set_codec(Some(&TEST_CODEC));
+        decoder.push(&encode(&pattern(1024)).unwrap());
+        assert_eq!(decoder.next(), Some(Ok(pattern(1024))));
+        assert_released(&decoder);
+        assert_eq!(decoder.max_size, 4096);
+        assert_eq!(decoder.codec.unwrap().name(), "test");
+
+        decoder.push(&encode(b"plain").unwrap());
+        assert_eq!(decoder.next(), Some(Ok(b"plain".to_vec())));
+        assert_released(&decoder);
+
+        let mut compressed = encode(b"packed").unwrap();
+        compressed[0] = 1;
+        decoder.push(&compressed);
+        assert_eq!(decoder.next(), Some(Ok(b"packed".to_vec())));
+        assert_released(&decoder);
+        assert_eq!(decoder.finish(), Ok(()));
+    }
+
+    #[test]
+    fn empty_messages_return_unallocated_vectors() {
+        for max_size in [0, 4096] {
+            let mut decoder = Decoder::new(max_size);
+            decoder.push(&encode(b"").unwrap());
+            let (message, wire_len) = decoder.next_framed().unwrap().unwrap();
+            assert!(message.is_empty());
+            assert_eq!(message.capacity(), 0);
+            assert_eq!(wire_len, HEADER_LEN);
+            assert_released(&decoder);
+            assert_eq!(decoder.finish(), Ok(()));
+        }
+    }
+
+    #[test]
+    fn exact_capacity_gate_transfers_only_buffers_sized_to_the_frame() {
+        for payload_len in [8, 100, 4096] {
+            let payload = pattern(payload_len);
+            let framed = encode(&payload).unwrap();
+
+            let buf = buffer(&framed, 0);
+            let buffer_ptr = buf.as_ptr();
+            let mut decoder = decoder_over(buf, payload_len, None);
+            let (message, wire_len) = decoder.next_framed().unwrap().unwrap();
+            assert_eq!(message, payload);
+            assert_eq!(wire_len, framed.len());
+            assert_eq!(message.as_ptr(), buffer_ptr);
+            assert_eq!(message.capacity(), framed.len());
+
+            // Any spare capacity falls back: the copy is exactly sized, and the
+            // oversized buffer is freed rather than handed to the application.
+            for spare in [1, 1 << 20] {
+                let mut decoder = decoder_over(buffer(&framed, spare), payload_len, None);
+                let (message, wire_len) = decoder.next_framed().unwrap().unwrap();
+                assert_eq!(message, payload);
+                assert_eq!(wire_len, framed.len());
+                assert_eq!(message.capacity(), payload_len);
+                assert_released(&decoder);
+            }
+        }
+    }
+
+    #[test]
+    fn batched_messages_are_copied_one_at_a_time_in_order() {
+        let first = pattern(100);
+        let second = vec![9; 300];
+        let first_framed = encode(&first).unwrap();
+        let second_framed = encode(&second).unwrap();
+        let mut framed = first_framed.clone();
+        framed.extend_from_slice(&second_framed);
+        let mut decoder = decoder_over(buffer(&framed, 0), 4096, None);
+        assert_eq!(decoder.message_count(), 2);
+
+        let (message, wire_len) = decoder.next_framed().unwrap().unwrap();
+        assert_eq!(message, first);
+        assert_eq!(wire_len, first_framed.len());
+        assert_eq!(message.capacity(), first.len());
+        assert_eq!(decoder.message_count(), 1);
+        assert_eq!(decoder.buffered(), second_framed.len());
+
+        let (message, wire_len) = decoder.next_framed().unwrap().unwrap();
+        assert_eq!(message, second);
+        assert_eq!(wire_len, second_framed.len());
+        assert_released(&decoder);
+        assert_eq!(decoder.finish(), Ok(()));
+    }
+
+    #[test]
+    fn partial_tail_after_a_complete_message_is_kept_and_finishes_later() {
+        let first = pattern(40);
+        let second = pattern(300);
+        let first_framed = encode(&first).unwrap();
+        let second_framed = encode(&second).unwrap();
+        for tail in [1, HEADER_LEN - 1, HEADER_LEN + 1, second_framed.len() - 1] {
+            let mut framed = first_framed.clone();
+            framed.extend_from_slice(&second_framed[..tail]);
+            let mut decoder = decoder_over(buffer(&framed, 0), 4096, None);
+
+            let (message, wire_len) = decoder.next_framed().unwrap().unwrap();
+            assert_eq!(message, first);
+            assert_eq!(wire_len, first_framed.len());
+            assert_eq!(message.capacity(), first.len());
+            assert_eq!(decoder.buf, second_framed[..tail]);
+            assert_eq!((decoder.start, decoder.complete), (0, 0));
+            assert!(decoder.buf.capacity() <= 1024usize.max(2 * tail));
+            assert!(decoder.next().is_none());
+            assert_eq!(decoder.finish().unwrap_err().code, Code::Internal);
+
+            decoder.push(&second_framed[tail..]);
+            assert_eq!(decoder.next(), Some(Ok(second.clone())));
+            assert_released(&decoder);
+            assert_eq!(decoder.finish(), Ok(()));
+        }
+    }
+
+    #[test]
+    fn consumed_leading_bytes_prevent_transfer() {
+        let payload = pattern(100);
+        let framed = encode(&payload).unwrap();
+        let mut buf = Vec::with_capacity(HEADER_LEN + framed.len());
+        buf.extend_from_slice(&[0xee; HEADER_LEN]);
+        buf.extend_from_slice(&framed);
+        assert_eq!(buf.capacity(), buf.len());
+        let mut decoder = Decoder::new(4096);
+        decoder.start = HEADER_LEN;
+        decoder.complete = buf.len();
+        decoder.count = 1;
+        decoder.buf = buf;
+
+        let (message, wire_len) = decoder.next_framed().unwrap().unwrap();
+        assert_eq!(message, payload);
+        assert_eq!(wire_len, framed.len());
+        assert_eq!(message.capacity(), payload.len());
+        assert_released(&decoder);
+    }
+
+    /// Deliver `payload` in two pushes split at `split`. Returns whether the
+    /// final buffer was exactly sized, which is the case that must transfer.
+    fn split_arrival(payload: &[u8], split: usize) -> bool {
+        let framed = encode(payload).unwrap();
+        let mut decoder = Decoder::new(payload.len());
+        decoder.push(&framed[..split]);
+        decoder.push(&framed[split..]);
+        let exact = decoder.buf.capacity() == framed.len();
+        let buffer = decoder.buf.as_ptr();
+
+        let (message, wire_len) = decoder.next_framed().unwrap().unwrap();
+        assert_eq!(message, payload, "split {split}");
+        assert_eq!(wire_len, framed.len(), "split {split}");
+        if exact {
+            assert_eq!(message.as_ptr(), buffer, "split {split}");
+            assert_eq!(message.capacity(), framed.len(), "split {split}");
+        } else {
+            assert_eq!(message.capacity(), payload.len(), "split {split}");
+        }
+        assert_released(&decoder);
+        exact
+    }
+
+    #[test]
+    fn fragmented_arrivals_transfer_only_when_the_final_capacity_is_exact() {
+        let (mut exact, mut excess) = (0, 0);
+        let payload = pattern(40);
+        for split in 1..payload.len() + HEADER_LEN {
+            if split_arrival(&payload, split) {
+                exact += 1;
+            } else {
+                excess += 1;
+            }
+        }
+        // Small splits keep the first allocation's exact capacity; splits past the
+        // midpoint double it. Both paths must be exercised.
+        assert!(exact > 0 && excess > 0);
+
+        let payload = pattern(4096);
+        for split in [1, HEADER_LEN, 2048, payload.len() + HEADER_LEN - 1] {
+            split_arrival(&payload, split);
+        }
+    }
+
+    #[test]
+    fn valid_message_before_an_invalid_prefix_is_delivered_before_the_error() {
+        let payload = pattern(12);
+        let mut framed = encode(&payload).unwrap();
+        framed.extend_from_slice(&[2, 0, 0, 0, 1]);
+        let mut decoder = Decoder::new(4096);
+        decoder.push(&framed);
+
+        let (message, wire_len) = decoder.next_framed().unwrap().unwrap();
+        assert_eq!(message, payload);
+        assert_eq!(wire_len, payload.len() + HEADER_LEN);
+        assert_eq!(decoder.next().unwrap().unwrap_err().code, Code::Internal);
+        assert_eq!(decoder.finish().unwrap_err().code, Code::Internal);
+
+        decoder.push(&encode(b"after").unwrap());
+        assert_eq!(decoder.buffered(), 0);
+        assert_eq!(decoder.next().unwrap().unwrap_err().code, Code::Internal);
+        assert_released(&decoder);
+    }
+
+    #[test]
+    fn transfer_keeps_a_pending_error_for_later_calls() {
+        let payload = pattern(100);
+        let framed = encode(&payload).unwrap();
+        let buf = buffer(&framed, 0);
+        let buffer_ptr = buf.as_ptr();
+        let mut decoder = decoder_over(buf, 4096, None);
+        // The state scan leaves behind when a later prefix is invalid.
+        decoder.error = Some(Status::resource_exhausted("later prefix"));
+
+        let (message, wire_len) = decoder.next_framed().unwrap().unwrap();
+        assert_eq!(message, payload);
+        assert_eq!(message.as_ptr(), buffer_ptr);
+        assert_eq!(message.capacity(), framed.len());
+        assert_eq!(wire_len, framed.len());
+        assert_released(&decoder);
+        assert_eq!(
+            decoder.error().map(|e| e.code),
+            Some(Code::ResourceExhausted)
+        );
+
+        decoder.push(&encode(b"ignored").unwrap());
+        assert_eq!(decoder.buffered(), 0);
+        assert_eq!(decoder.finish().unwrap_err().code, Code::ResourceExhausted);
+        assert_eq!(
+            decoder.next().unwrap().unwrap_err().code,
+            Code::ResourceExhausted
+        );
+        assert_released(&decoder);
+    }
+
+    #[test]
+    fn compressed_messages_are_decoded_into_new_storage() {
+        let payload = pattern(256);
+        let mut framed = encode(&payload).unwrap();
+        framed[0] = 1;
+        let buf = buffer(&framed, 0);
+        let buffer_ptr = buf.as_ptr();
+        let mut decoder = decoder_over(buf, 4096, Some(&TEST_CODEC));
+
+        let (message, wire_len) = decoder.next_framed().unwrap().unwrap();
+        assert_eq!(message, payload);
+        assert_eq!(wire_len, framed.len());
+        assert_ne!(message.as_ptr(), buffer_ptr);
+        assert_released(&decoder);
+    }
+
+    #[test]
+    fn compressed_prefix_without_a_codec_releases_its_buffer() {
+        let mut framed = encode(&pattern(256)).unwrap();
+        framed[0] = 1;
+        let mut decoder = Decoder::new(4096);
+        decoder.push(&framed);
+        assert_eq!(decoder.next().unwrap().unwrap_err().code, Code::Internal);
+        assert_released(&decoder);
+    }
+
+    #[test]
+    fn truncated_message_is_not_transferred_until_complete() {
+        let payload = pattern(100);
+        let framed = encode(&payload).unwrap();
+        let (head, last) = framed.split_at(framed.len() - 1);
+        let mut decoder = Decoder::new(4096);
+        decoder.push(head);
+        assert!(decoder.next().is_none());
+        assert_eq!(decoder.finish().unwrap_err().code, Code::Internal);
+        assert_eq!(decoder.buffered(), head.len());
+
+        decoder.push(last);
+        let (message, wire_len) = decoder.next_framed().unwrap().unwrap();
+        assert_eq!(message, payload);
+        assert_eq!(wire_len, framed.len());
+        assert_released(&decoder);
+        assert_eq!(decoder.finish(), Ok(()));
     }
 }

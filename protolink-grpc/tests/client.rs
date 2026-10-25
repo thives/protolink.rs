@@ -329,6 +329,45 @@ fn completed_unary_holds_credit_until_consumed_once() {
     assert_eq!(connection_credit(&client.take_output()), 0);
 }
 
+/// A response that is transferred rather than copied keeps the capacity of its
+/// frame, and its retention charge must still cover that capacity exactly.
+#[test]
+fn eligible_response_is_charged_its_framed_bytes_and_budget_is_exact() {
+    let body = encoded(&[42; 1000]);
+    let framed = body.len();
+
+    let (mut client, mut peer) = setup(ClientConfig {
+        max_buffered_response_bytes: framed,
+        ..ClientConfig::default()
+    });
+    let id = open(&mut client, &mut peer, true);
+    headers(&mut peer, id);
+    peer.send_data(id, body.clone(), false).unwrap();
+    finish(&mut peer, id);
+    deliver(&mut client, &mut peer);
+    assert_eq!(client.buffered_response_bytes(id), Some(framed));
+    assert_eq!(client.retained_response_bytes(), framed);
+    let response = client.take_response(id).unwrap().unwrap();
+    assert_eq!(response.message, [42; 1000]);
+    assert!(response.message.capacity() <= framed);
+    assert_eq!(client.retained_response_bytes(), 0);
+    assert_eq!(connection_credit(&client.take_output()), framed);
+
+    let (mut client, mut peer) = setup(ClientConfig {
+        max_buffered_response_bytes: framed - 1,
+        ..ClientConfig::default()
+    });
+    let id = open(&mut client, &mut peer, true);
+    headers(&mut peer, id);
+    peer.send_data(id, body, false).unwrap();
+    finish(&mut peer, id);
+    deliver(&mut client, &mut peer);
+    assert_eq!(
+        client.take_response(id).unwrap().unwrap_err().code,
+        Code::ResourceExhausted
+    );
+}
+
 #[test]
 fn completed_stream_holds_credit_until_messages_consumed_once() {
     let (mut client, mut peer) = setup(ClientConfig::default());

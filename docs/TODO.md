@@ -8,3 +8,6 @@ Add:
 * load balancing
 * opentelemetry metrics
 * wait-for-ready
+
+Memory footprint optimization is planned in [MEMORY_PLAN.md](MEMORY_PLAN.md). Prioritize bounded
+memory and single-owner buffers before expanding the feature set.

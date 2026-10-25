@@ -151,7 +151,8 @@ impl Server {
         // `recv` has no waker and must deliver all available non-bidi
         // requests, so every call is driven without one. Once the connection
         // has failed, no handler runs again: its calls were cancelled.
-        for id in self.calls.ids() {
+        let mut traversal = self.calls.receive_traversal();
+        while let Some(id) = self.calls.next_id(&mut traversal) {
             if self.core.failure().is_some() {
                 break;
             }
@@ -175,7 +176,8 @@ impl Server {
     /// they have more to send. The starting call rotates each pass, and calls
     /// yield after a bounded quantum, waking `cx` if runnable work remains.
     pub fn poll<H: Handler + ?Sized>(&mut self, handler: &mut H, cx: &mut Context<'_>) {
-        for id in self.calls.poll_order() {
+        let mut traversal = self.calls.poll_traversal();
+        while let Some(id) = self.calls.next_id(&mut traversal) {
             self.calls
                 .drive(&mut self.core, id, handler, Some(&mut *cx));
             self.flush(handler);

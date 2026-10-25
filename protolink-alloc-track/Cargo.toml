@@ -1,0 +1,12 @@
+[package]
+name = "protolink-alloc-track"
+version = "0.0.0"
+authors = [
+  "Thomas Ivesdal-Tronstad <>",
+]
+edition = "2024"
+rust-version = "1.88"
+publish = false
+description = "Test-only counting global allocator and measurement windows for protolink allocation tests."
+
+[dependencies]

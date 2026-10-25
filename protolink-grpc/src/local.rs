@@ -8,8 +8,8 @@
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
-use alloc::vec::Vec;
 use core::mem;
+use core::ops::Bound;
 use core::task::{Context, Poll};
 use core::time::Duration;
 
@@ -58,6 +58,79 @@ impl Call {
     }
 }
 
+/// A walk over the local calls in id order, advanced by
+/// [`LocalCalls::next_id`].
+///
+/// A receive walk visits every id in ascending order. A polling walk visits
+/// the ids after its split, the cursor when it started, and then the ids up to
+/// and including it, so each polling pass starts one call later than the last.
+///
+/// The walk holds no borrow of the call map and no storage, which is why it is
+/// `Copy`. Each step is a short-lived range lookup for the next id, so the
+/// caller can drive calls and apply lifecycle events between steps. Bounds are
+/// ids rather than positions: removing a call skips only that call, a call that
+/// is still present is reached exactly once, and the walk wraps at most once,
+/// even if the split call itself is removed.
+///
+/// Insertion policy: a call added during a walk is visited by it only if it is
+/// ahead of the walk, meaning its id sorts after the last id visited in the run
+/// in progress. The driving loops add no calls mid-walk. Calls are admitted only
+/// by [`Lifecycle::recv`], which those loops never call, so the walk sees a
+/// fixed set of calls apart from removals.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Traversal {
+    /// The cursor when a polling walk started. `None` for a receive walk.
+    split: Option<StreamId>,
+    /// The last id yielded in the run in progress.
+    last: Option<StreamId>,
+    /// Whether the run over the ids up to `split` is in progress.
+    wrapped: bool,
+    /// Whether any id has been yielded yet.
+    started: bool,
+}
+
+impl Traversal {
+    fn new(split: Option<StreamId>) -> Self {
+        Self {
+            split,
+            last: None,
+            wrapped: false,
+            started: false,
+        }
+    }
+
+    /// The next id of the run in progress, or the first id of the wrapped run
+    /// once the first run is exhausted.
+    fn advance(&mut self, calls: &BTreeMap<StreamId, Call>) -> Option<StreamId> {
+        loop {
+            if let Some((&id, _)) = calls.range(self.bounds()).next() {
+                self.last = Some(id);
+                return Some(id);
+            }
+            if self.wrapped || self.split.is_none() {
+                return None;
+            }
+            self.wrapped = true;
+            self.last = None;
+        }
+    }
+
+    /// The bounds of the next lookup in the run in progress. Both bounds are
+    /// ids, so a removed call neither moves them nor leaves them dangling.
+    fn bounds(&self) -> (Bound<StreamId>, Bound<StreamId>) {
+        let from = match (self.last, self.split) {
+            (Some(last), _) => Bound::Excluded(last),
+            (None, Some(split)) if !self.wrapped => Bound::Excluded(split),
+            _ => Bound::Unbounded,
+        };
+        let to = match self.split {
+            Some(split) if self.wrapped => Bound::Included(split),
+            _ => Bound::Unbounded,
+        };
+        (from, to)
+    }
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct LocalCalls {
     /// Calls the handler has been told about and has not finished.
@@ -67,21 +140,28 @@ pub(crate) struct LocalCalls {
 }
 
 impl LocalCalls {
-    /// The id of every local call, in the order to poll them in: the call that
-    /// was polled first in the previous pass moves to the back.
-    pub(crate) fn poll_order(&mut self) -> Vec<StreamId> {
-        let mut ids = self.ids();
-        let start = ids.partition_point(|id| *id <= self.poll_cursor);
-        ids.rotate_left(start);
-        if let Some(id) = ids.first() {
-            self.poll_cursor = *id;
-        }
-        ids
+    /// A walk in ascending id order. It leaves the polling rotation unchanged.
+    pub(crate) fn receive_traversal(&self) -> Traversal {
+        Traversal::new(None)
     }
 
-    /// The ids of the local calls, in ascending order.
-    pub(crate) fn ids(&self) -> Vec<StreamId> {
-        self.calls.keys().copied().collect()
+    /// A polling walk: it starts after the call that the previous pass visited
+    /// first, so that call moves to the back of the rotation.
+    pub(crate) fn poll_traversal(&self) -> Traversal {
+        Traversal::new(Some(self.poll_cursor))
+    }
+
+    /// Advance `traversal` to the next local call and return its id. The first
+    /// id a polling walk yields becomes the cursor of the next polling walk.
+    pub(crate) fn next_id(&mut self, traversal: &mut Traversal) -> Option<StreamId> {
+        let id = traversal.advance(&self.calls)?;
+        if !traversal.started {
+            traversal.started = true;
+            if traversal.split.is_some() {
+                self.poll_cursor = id;
+            }
+        }
+        Some(id)
     }
 
     /// Whether `id` is a local call.
@@ -470,3 +550,7 @@ impl LocalCalls {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "tests_local.rs"]
+mod tests_local;

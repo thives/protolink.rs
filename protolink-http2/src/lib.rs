@@ -50,6 +50,7 @@ extern crate std;
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;
 use core::fmt;
+use core::ops::Bound::{Excluded, Unbounded};
 
 mod headers;
 mod hpack;
@@ -1515,13 +1516,16 @@ impl Connection {
     }
 
     fn flush_streams(&mut self) {
-        let ids: Vec<(StreamId, usize)> = self
+        let mut after = Unbounded;
+        // A flush can remove its stream, so re-seek instead of retaining an
+        // iterator or allocating a snapshot of the stream IDs.
+        while let Some((&id, stream)) = self
             .streams
-            .iter()
-            .filter(|(_, s)| !s.outbound.is_empty())
-            .map(|(id, s)| (*id, s.queued_bytes()))
-            .collect();
-        for (id, before) in ids {
+            .range((after, Unbounded))
+            .find(|(_, s)| !s.outbound.is_empty())
+        {
+            let before = stream.queued_bytes();
+            after = Excluded(id);
             self.flush_stream(id);
             if let Some(s) = self.streams.get(&id)
                 && s.can_send()
@@ -1596,26 +1600,31 @@ impl Connection {
                     if n == 0 && remaining > 0 {
                         break;
                     }
-                    // Admission comes before the copy and before any state
+                    // Admission comes before serialization and before any state
                     // changes, so a refused frame leaves the stream untouched.
                     if FRAME_HEADER_LEN + n > room {
                         self.refuse_output(FRAME_HEADER_LEN + n);
                         return;
                     }
-                    let chunk = buf[*offset..*offset + n].to_vec();
-                    *offset += n;
-                    let done = *offset == buf.len();
+                    let done = *offset + n == buf.len();
                     let flags = if done && *end_stream {
                         Flags::END_STREAM
                     } else {
                         0
                     };
+                    append_frame(
+                        &mut self.output,
+                        FrameType::Data,
+                        flags,
+                        id,
+                        &buf[*offset..*offset + n],
+                    );
+                    *offset += n;
                     stream.send_window -= n as i64;
                     if done {
                         stream.outbound.pop_front();
                     }
                     self.conn_send_window -= n as i64;
-                    self.write_frame(FrameType::Data, flags, id, &chunk);
                 }
             }
         }
@@ -1645,19 +1654,7 @@ impl Connection {
             self.refuse_output(len);
             return false;
         }
-        let header = FrameHeader {
-            length: payload.len() as u32,
-            frame_type,
-            flags: Flags(flags),
-            stream_id,
-        };
-        let start = self.output.len();
-        self.output.resize(start + len, 0);
-        // Payload sizes are bounded by the peer's max frame size by construction.
-        let written =
-            encode_frame(&header, payload, &mut self.output[start..], u32::MAX).unwrap_or(0);
-        self.output.truncate(start + written);
-        written == len
+        append_frame(&mut self.output, frame_type, flags, stream_id, payload)
     }
 
     fn encoded_header_limit(&self) -> usize {
@@ -1669,6 +1666,29 @@ impl Connection {
     fn local_max_frame_size(&self) -> u32 {
         DEFAULT_MAX_FRAME_SIZE
     }
+}
+
+/// Append a frame already admitted under the connection's output limit.
+fn append_frame(
+    output: &mut Vec<u8>,
+    frame_type: FrameType,
+    flags: u8,
+    stream_id: StreamId,
+    payload: &[u8],
+) -> bool {
+    let len = FRAME_HEADER_LEN + payload.len();
+    let header = FrameHeader {
+        length: payload.len() as u32,
+        frame_type,
+        flags: Flags(flags),
+        stream_id,
+    };
+    let start = output.len();
+    output.resize(start + len, 0);
+    // Payload sizes are bounded by the peer's max frame size by construction.
+    let written = encode_frame(&header, payload, &mut output[start..], u32::MAX).unwrap_or(0);
+    output.truncate(start + written);
+    written == len
 }
 
 /// Upper bound on the bytes a header block takes on the wire, once encoded

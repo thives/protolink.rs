@@ -6,6 +6,7 @@ members = [
     "protolink-http2",
     "protolink-grpc",
     "protolink-grpc-gen",
+    "protolink-alloc-track",
     "examples/embedded-device"
 ]
 exclude = ["examples/embedded-smoke"]

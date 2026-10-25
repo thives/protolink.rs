@@ -358,6 +358,123 @@ fn output_limit_refused_data_frame_is_not_copied_or_consumed() {
     assert!(c.failure().is_some());
 }
 
+#[test]
+fn data_serialization_preserves_partial_windows_and_end_stream() {
+    let mut c = Connection::client(Config::default());
+    let mut s = Connection::server(Config::default());
+    exchange(&mut c, &mut s);
+    let id = c.open_stream(request_headers(), false).unwrap();
+    c.take_output();
+    c.conn_send_window = 5;
+    c.streams.get_mut(&id).unwrap().send_window = 3;
+
+    c.send_data(id, b"abcdef".to_vec(), true).unwrap();
+    assert_eq!(
+        frames(&c.take_output()),
+        vec![(FrameType::Data as u8, 0, id, b"abc".to_vec())]
+    );
+    assert_eq!(c.conn_send_window, 2);
+    assert_eq!(c.streams[&id].send_window, 0);
+    assert_eq!(c.queued_send_bytes(id), Some(3));
+
+    c.recv(&wire_frame(
+        FrameType::WindowUpdate,
+        id,
+        0,
+        &encode_window_update(3),
+    ))
+    .unwrap();
+    assert_eq!(
+        frames(&c.take_output()),
+        vec![(FrameType::Data as u8, 0, id, b"de".to_vec())]
+    );
+    assert_eq!(c.conn_send_window, 0);
+    assert_eq!(c.streams[&id].send_window, 1);
+    assert_eq!(c.queued_send_bytes(id), Some(1));
+
+    c.recv(&wire_frame(
+        FrameType::WindowUpdate,
+        0,
+        0,
+        &encode_window_update(1),
+    ))
+    .unwrap();
+    assert_eq!(
+        frames(&c.take_output()),
+        vec![(FrameType::Data as u8, Flags::END_STREAM, id, b"f".to_vec())]
+    );
+    assert_eq!(c.conn_send_window, 0);
+    assert_eq!(c.streams[&id].send_window, 0);
+    assert_eq!(c.queued_send_bytes(id), Some(0));
+    assert_eq!(c.poll_send_ready(), None);
+}
+
+#[test]
+fn empty_data_serializes_with_zero_windows() {
+    for end_stream in [false, true] {
+        let mut c = Connection::client(Config::default());
+        let id = c.open_stream(request_headers(), false).unwrap();
+        c.take_output();
+        c.conn_send_window = 0;
+        c.streams.get_mut(&id).unwrap().send_window = 0;
+
+        c.send_data(id, Vec::new(), end_stream).unwrap();
+        assert_eq!(
+            frames(&c.take_output()),
+            vec![(
+                FrameType::Data as u8,
+                if end_stream { Flags::END_STREAM } else { 0 },
+                id,
+                Vec::new(),
+            )]
+        );
+        assert_eq!(c.conn_send_window, 0);
+        assert_eq!(c.streams[&id].send_window, 0);
+        assert_eq!(c.queued_send_bytes(id), Some(0));
+    }
+}
+
+#[test]
+fn flushing_completed_streams_does_not_skip_later_streams() {
+    let mut c = Connection::client(Config {
+        initial_window_size: 0,
+        ..Config::default()
+    });
+    let mut s = Connection::server(Config::default());
+    exchange(&mut c, &mut s);
+    let ids: Vec<_> = (0..3)
+        .map(|_| c.open_stream(request_headers(), true).unwrap())
+        .collect();
+    exchange(&mut c, &mut s);
+    for &id in &ids {
+        s.send_headers(id, vec![hf(":status", "200")], false)
+            .unwrap();
+        s.send_data(id, vec![id as u8], true).unwrap();
+        assert_eq!(s.queued_send_bytes(id), Some(1));
+    }
+    s.take_output();
+
+    s.recv(&wire_frame(
+        FrameType::Settings,
+        0,
+        0,
+        &encode_settings(&[Setting {
+            id: SettingId::InitialWindowSize,
+            value: 1,
+        }]),
+    ))
+    .unwrap();
+
+    let out = frames(&s.take_output());
+    assert_eq!(out[0], (FrameType::Settings as u8, Flags::ACK, 0, vec![]));
+    let expected: Vec<_> = ids
+        .iter()
+        .map(|&id| (FrameType::Data as u8, Flags::END_STREAM, id, vec![id as u8]))
+        .collect();
+    assert_eq!(out[1..], expected);
+    assert_eq!(s.stream_count(), 0);
+}
+
 /// A client with one open stream whose output is full: the headers are
 /// admitted under their bound, and a DATA frame fills the room they leave, so
 /// the stream has nothing queued and no more output fits. Returns the stream

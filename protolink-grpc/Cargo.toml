@@ -1,6 +1,6 @@
 [package]
 name = "protolink-grpc"
-version = "0.0.4"
+version = "0.0.5"
 authors = [
   "Thomas Ivesdal-Tronstad <>",
 ]
@@ -20,6 +20,7 @@ miniz_oxide = { version = "0.9", default-features = false, features = ["with-all
 [dev-dependencies]
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 prost = { version = "0.14", features = ["derive"] }
+protolink-alloc-track = { path = "../protolink-alloc-track" }
 
 [features]
 default = ["micropb"]

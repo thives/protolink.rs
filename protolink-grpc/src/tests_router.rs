@@ -4,18 +4,21 @@
 
 extern crate std;
 
+use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 use core::task::{Context, Poll, Waker};
 use core::time::Duration;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+use std::sync::{Arc, Mutex};
 
 use super::*;
 use crate::dispatch::Dispatcher;
+use crate::local::CALL_QUANTUM;
 use crate::test_support::drain;
 use crate::tests_relay::{
     BIDI, DENIED, METHODS as REMOTE, RawBackend, Script, Service, metadata, script,
 };
+use protolink_http2::StreamId;
 
 const LOCAL: &[MethodDescriptor] = &[
     MethodDescriptor::new("/test.Local/Upper", MethodKind::Unary, 0),
@@ -761,4 +764,109 @@ fn local_overflow_during_poll_cancels_every_local_call() {
     assert!(g.router.gateway_failure().is_some());
     assert_eq!(cancelled.load(SeqCst), 1);
     assert_eq!(g.router.active_calls(), 0);
+}
+
+const SPIN: &str = "/test.Probe/Spin";
+const STOP: &str = "/test.Probe/Stop";
+const PROBE: &[MethodDescriptor] = &[
+    MethodDescriptor::new(SPIN, MethodKind::BidiStreaming, 0),
+    MethodDescriptor::new(STOP, MethodKind::BidiStreaming, 1),
+];
+
+/// A local service whose calls always have a response ready. `Spin` never
+/// ends, and `Stop` answers once and then ends. Every poll is logged by call.
+#[derive(Default)]
+struct Probe {
+    polled: Arc<Mutex<Vec<StreamId>>>,
+    answered: BTreeSet<StreamId>,
+}
+
+impl Handler for Probe {
+    fn route(&self, path: &str) -> Option<Route> {
+        Route::find(PROBE, path)
+    }
+
+    fn poll_response(
+        &mut self,
+        ctx: &mut CallContext<'_>,
+        _: &mut Context<'_>,
+    ) -> Poll<Next<Vec<u8>>> {
+        self.polled.lock().unwrap().push(ctx.id);
+        if ctx.path == STOP && !self.answered.insert(ctx.id) {
+            return Poll::Ready(Next::Done(Ok(())));
+        }
+        Poll::Ready(Next::Message(b"x".to_vec()))
+    }
+}
+
+impl Dispatcher for Probe {
+    fn methods(&self) -> &[MethodDescriptor] {
+        PROBE
+    }
+}
+
+#[test]
+fn local_poll_passes_rotate_their_starting_call_like_a_server() {
+    let probe = Probe::default();
+    let polled = Arc::clone(&probe.polled);
+    let mut router = Router::builder().with_service(probe).build().unwrap();
+    let mut caller = Client::new(ClientConfig::default());
+    for _ in 0..3 {
+        caller.start_streaming(SPIN).unwrap();
+    }
+    router.recv(&caller.take_output()).unwrap();
+
+    let mut ring: Vec<StreamId> = Vec::new();
+    for pass in 0..4 {
+        polled.lock().unwrap().clear();
+        router.poll(&mut Context::from_waker(Waker::noop()));
+        caller.recv(&router.take_output()).unwrap();
+        let mut order = polled.lock().unwrap().clone();
+        order.dedup();
+        assert_eq!(order.len(), 3, "pass {pass}");
+        // The first pass runs in id order; each later pass starts one call on.
+        if ring.is_empty() {
+            ring = order.clone();
+            ring.sort_unstable();
+        }
+        let expected: Vec<StreamId> = ring
+            .iter()
+            .cycle()
+            .skip(pass % ring.len())
+            .take(ring.len())
+            .copied()
+            .collect();
+        assert_eq!(order, expected, "pass {pass}");
+    }
+    assert_eq!(router.active_calls(), 3);
+}
+
+#[test]
+fn local_calls_finishing_mid_pass_leave_the_rest_of_the_pass_intact() {
+    let probe = Probe::default();
+    let polled = Arc::clone(&probe.polled);
+    let mut router = Router::builder().with_service(probe).build().unwrap();
+    let mut caller = Client::new(ClientConfig::default());
+    let first = caller.start_streaming(STOP).unwrap();
+    let busy = caller.start_streaming(SPIN).unwrap();
+    let last = caller.start_streaming(STOP).unwrap();
+    router.recv(&caller.take_output()).unwrap();
+
+    // Each `Stop` finishes as the pass reaches it, and the `Spin` call in
+    // between still gets its whole quantum.
+    router.poll(&mut Context::from_waker(Waker::noop()));
+    caller.recv(&router.take_output()).unwrap();
+    assert_eq!(router.active_calls(), 1);
+    for id in [first, last] {
+        let (messages, status) = drain(&mut caller, id);
+        assert_eq!(messages, [b"x".to_vec()]);
+        assert_eq!(status, Some(Ok(())));
+    }
+
+    polled.lock().unwrap().clear();
+    router.poll(&mut Context::from_waker(Waker::noop()));
+    assert_eq!(polled.lock().unwrap().len(), CALL_QUANTUM);
+    caller.recv(&router.take_output()).unwrap();
+    assert!(caller.is_pending(busy));
+    assert_eq!(router.active_calls(), 1);
 }

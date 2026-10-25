@@ -11,9 +11,15 @@ use alloc::vec::Vec;
 use core::task::{Context, Waker};
 
 use super::*;
+use protolink_alloc_track::CountingAllocator;
 use protolink_http2::{Connection, Event, HeaderField};
 
 pub(crate) use crate::fields::{field as hf, header};
+
+/// The counting allocator for this test binary. Only a measurement window
+/// records anything, so the other tests see the system allocator's behavior.
+#[global_allocator]
+static ALLOCATOR: CountingAllocator = CountingAllocator;
 
 /// Every event `conn` has queued.
 pub(crate) fn events(conn: &mut Connection) -> Vec<Event> {

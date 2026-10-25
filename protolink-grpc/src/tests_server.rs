@@ -24,6 +24,8 @@ struct HandlerState {
     cancelled: Vec<StreamId>,
     cancellation_deadlines: Vec<Option<Duration>>,
     response_size: usize,
+    /// The call of each `poll_response`, in the order the calls were polled.
+    polled: Vec<StreamId>,
 }
 
 impl Handler for HandlerState {
@@ -54,6 +56,7 @@ impl Handler for HandlerState {
         ctx: &mut CallContext<'_>,
         _: &mut Context<'_>,
     ) -> Poll<Next<Vec<u8>>> {
+        self.polled.push(ctx.id);
         let replies = self.replies.entry(ctx.id).or_default();
         if ctx.path == "/test/Bidi" {
             return match self.requests.entry(ctx.id).or_default().pop_front() {
@@ -835,6 +838,41 @@ fn peer_reset_reclaims_a_completed_draining_stream() {
     assert!(peer.handler.cancelled.is_empty());
 }
 
+/// Connection-level credit (stream zero WINDOW_UPDATE increments) in `bytes`.
+fn connection_credit(bytes: &[u8]) -> usize {
+    let mut pos = 0;
+    let mut credit = 0;
+    while pos < bytes.len() {
+        let len = (usize::from(bytes[pos]) << 16)
+            | (usize::from(bytes[pos + 1]) << 8)
+            | usize::from(bytes[pos + 2]);
+        let id = u32::from_be_bytes(bytes[pos + 5..pos + 9].try_into().unwrap()) & 0x7fff_ffff;
+        if bytes[pos + 3] == 8 && id == 0 {
+            credit += (u32::from_be_bytes(bytes[pos + 9..pos + 13].try_into().unwrap())
+                & 0x7fff_ffff) as usize;
+        }
+        pos += 9 + len;
+    }
+    credit
+}
+
+/// A request in one DATA frame may be handed over in its received buffer. Its
+/// framed bytes are credited back once, when the server takes it.
+#[test]
+fn eligible_request_is_delivered_intact_and_credited_its_framed_bytes_once() {
+    let body = [9; 100];
+    let framed = body.len() + lpm::HEADER_LEN;
+    let mut peer = Peer::new(0, 1024);
+    let id = peer.open("/test/Client", &body, true, false);
+
+    peer.recv_requests();
+    assert_eq!(peer.handler.requests[&id], [body.to_vec()]);
+    assert_eq!(connection_credit(&peer.server.take_output()), framed);
+
+    peer.poll();
+    assert_eq!(connection_credit(&peer.server.take_output()), 0);
+}
+
 #[derive(Default)]
 struct CountingWaker(AtomicUsize);
 
@@ -918,6 +956,74 @@ fn rotating_polls_progress_later_finite_and_bidi_calls_under_a_tight_output_budg
         "bidi request delivery starved"
     );
     assert_eq!(peer.data_len(bidi), lpm::HEADER_LEN + 4);
+}
+
+#[test]
+fn each_poll_pass_starts_at_the_call_after_the_previous_passes_first() {
+    let mut peer = Peer::new(65_535, usize::MAX);
+    peer.handler.response_size = 1;
+    let ids: Vec<StreamId> = (0..3)
+        .map(|_| peer.open("/test/Infinite", b"", true, false))
+        .collect();
+    peer.recv_requests();
+    for pass in 0..4 {
+        peer.handler.polled.clear();
+        peer.poll();
+        // Each call is polled for its whole quantum before the next one.
+        let mut order = peer.handler.polled.clone();
+        order.dedup();
+        let expected: Vec<StreamId> = ids
+            .iter()
+            .cycle()
+            .skip(pass % ids.len())
+            .take(ids.len())
+            .copied()
+            .collect();
+        assert_eq!(order, expected, "pass {pass}");
+        peer.recv_responses();
+    }
+}
+
+#[test]
+fn calls_finishing_mid_pass_leave_the_rest_of_the_pass_intact() {
+    let mut peer = Peer::new(65_535, usize::MAX);
+    let finite_first = peer.open("/test/Finite", b"", true, false);
+    let busy = peer.open("/test/Infinite", b"", true, false);
+    let finite_last = peer.open("/test/Finite", b"", true, false);
+    peer.recv_requests();
+    // Each finite call finishes as the pass reaches it, and the busy call in
+    // between still gets its whole quantum.
+    peer.poll();
+    peer.recv_responses();
+    assert!(peer.has_trailers(finite_first));
+    assert!(peer.has_trailers(finite_last));
+    assert_eq!(peer.handler.replies[&finite_first], 1);
+    assert_eq!(peer.handler.replies[&finite_last], 1);
+    assert_eq!(peer.handler.replies[&busy], CALL_QUANTUM);
+    assert_eq!(peer.server.active_calls(), 1);
+
+    peer.poll();
+    assert_eq!(peer.handler.replies[&busy], 2 * CALL_QUANTUM);
+    assert_eq!(peer.server.active_calls(), 1);
+}
+
+#[test]
+fn receive_passes_leave_the_polling_rotation_where_it_was() {
+    let mut peer = Peer::new(65_535, usize::MAX);
+    peer.handler.response_size = 1;
+    let ids: Vec<StreamId> = (0..3)
+        .map(|_| peer.open("/test/Infinite", b"", true, false))
+        .collect();
+    peer.recv_requests();
+    peer.poll();
+    peer.recv_responses();
+
+    // An empty receive pass traverses in id order, and must not move the
+    // cursor, which is still the first call of the previous polling pass.
+    peer.server.recv(&[], &mut peer.handler).unwrap();
+    peer.handler.polled.clear();
+    peer.poll();
+    assert_eq!(peer.handler.polled[0], ids[1]);
 }
 
 #[test]

@@ -32,7 +32,7 @@ use core::fmt;
 use core::task::{Context, Poll};
 use core::time::Duration;
 
-use protolink_http2::{Error, StreamId};
+use protolink_http2::Error;
 
 use crate::client::Client;
 use crate::dispatch::{Dispatcher, RouteConflict, RouteTable};
@@ -377,12 +377,12 @@ impl Router {
     /// Drive every local call once, or until its quantum is spent when there
     /// is a context to wake.
     fn drive_locals(&mut self, mut cx: Option<&mut Context<'_>>) {
-        let ids: Vec<StreamId> = if cx.is_some() {
-            self.locals.poll_order()
+        let mut traversal = if cx.is_some() {
+            self.locals.poll_traversal()
         } else {
-            self.locals.ids()
+            self.locals.receive_traversal()
         };
-        for id in ids {
+        while let Some(id) = self.locals.next_id(&mut traversal) {
             // A failed gateway runs no more local handlers; its calls were cancelled.
             if self.lifecycle.failure().is_some() {
                 break;
