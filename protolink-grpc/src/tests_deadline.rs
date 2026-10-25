@@ -22,7 +22,7 @@ impl Peek {
         Self(Connection::server(Default::default()))
     }
 
-    fn events(&mut self, client: &mut Client) -> Vec<Event> {
+    fn events(&mut self, client: &mut Client) -> Vec<Event<'static>> {
         self.0.recv(&client.take_output()).unwrap();
         core::iter::from_fn(|| self.0.poll_event()).collect()
     }
@@ -341,7 +341,7 @@ fn late_response_after_the_deadline_is_ignored() {
 struct Raw {
     conn: Connection,
     server: Server,
-    events: Vec<Event>,
+    events: Vec<Event<'static>>,
 }
 
 impl Raw {

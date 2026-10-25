@@ -4,6 +4,14 @@
 > [!CAUTION]
 > This crate is not yet production-ready. It has not been widely tested and may contain bugs.
 
+## Receiving
+
+`Connection::recv_step` consumes the caller's bytes and yields one event per call,
+with body bytes borrowed from the input. Call it with `&input[consumed..]` until it
+returns no event. Nothing from the input is kept between calls, so a body can be
+released or its stream reset before the next call. `Connection::recv` with
+`poll_event` is a convenience that copies body bytes into owned events.
+
 ## Protocol limits
 
 - Decoded HPACK field sections are bounded incrementally, including indexed

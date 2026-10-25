@@ -22,12 +22,12 @@ pub(crate) use crate::fields::{field as hf, header};
 static ALLOCATOR: CountingAllocator = CountingAllocator;
 
 /// Every event `conn` has queued.
-pub(crate) fn events(conn: &mut Connection) -> Vec<Event> {
+pub(crate) fn events(conn: &mut Connection) -> Vec<Event<'static>> {
     core::iter::from_fn(|| conn.poll_event()).collect()
 }
 
 /// The `grpc-status` of the last field section that carries one.
-pub(crate) fn final_status(events: &[Event]) -> Option<&str> {
+pub(crate) fn final_status<'a>(events: &'a [Event<'_>]) -> Option<&'a str> {
     events.iter().rev().find_map(|e| match e {
         Event::Headers { headers, .. } => header(headers, "grpc-status"),
         _ => None,
@@ -96,7 +96,7 @@ pub(crate) fn send_raw(
     handler: &mut impl Handler,
     headers: Vec<HeaderField>,
     body: &[u8],
-) -> Vec<Event> {
+) -> Vec<Event<'static>> {
     let mut conn = Connection::client(Default::default());
     let id = conn.open_stream(headers, false).unwrap();
     conn.send_data(id, body.to_vec(), true).unwrap();

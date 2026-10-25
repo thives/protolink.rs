@@ -160,7 +160,7 @@ fn closure_handlers_answer_unserved_paths_with_unimplemented() {
 }
 
 /// Drive the server with a raw HTTP/2 client to check non-gRPC requests.
-fn raw_request(headers: Vec<HeaderField>, body: &[u8]) -> Vec<Event> {
+fn raw_request(headers: Vec<HeaderField>, body: &[u8]) -> Vec<Event<'static>> {
     let mut server = Server::new(ServerConfig::default());
     send_raw(&mut server, &mut FnHandler(echo), headers, body)
 }

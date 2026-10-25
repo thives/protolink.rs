@@ -9,7 +9,7 @@
 //!
 //! - connection preface and initial SETTINGS exchange,
 //! - SETTINGS / PING acknowledgement,
-//! - partial-frame buffering across arbitrary read boundaries,
+//! - incremental frame parsing across arbitrary read boundaries,
 //! - header blocks split over CONTINUATION frames, padding and priority fields,
 //! - send-side flow control (connection + stream windows, WINDOW_UPDATE),
 //! - receive-side flow control, either replenished automatically or released by
@@ -17,8 +17,10 @@
 //! - RST_STREAM, GOAWAY and connection error handling.
 //!
 //! The [`Connection`] never performs I/O. Feed received bytes with
-//! [`Connection::recv`], drain produced events with [`Connection::poll_event`]
-//! and write [`Connection::pending_output`] to the transport.
+//! [`Connection::recv_step`], which borrows the input and yields one event at a
+//! time, and write [`Connection::pending_output`] to the transport. The
+//! convenience method [`Connection::recv`] collects owned events for
+//! [`Connection::poll_event`] instead, copying body bytes.
 //!
 //! # Streaming and backpressure
 //!
@@ -55,16 +57,19 @@ use core::ops::Bound::{Excluded, Unbounded};
 mod headers;
 mod hpack;
 mod huffman;
+mod rx;
 
+use alloc::borrow::Cow;
 use headers::Phase;
 use hpack::Decoder;
+use rx::Frame;
 use zerodds_hpack::Encoder;
-use zerodds_http2::flow::{decode_window_update, encode_window_update};
-use zerodds_http2::settings::{decode_settings, encode_settings};
+use zerodds_http2::flow::encode_window_update;
+use zerodds_http2::settings::encode_settings;
 use zerodds_http2::stream::{StreamEvent, is_client_initiated, is_server_initiated, transition};
 use zerodds_http2::{
-    CLIENT_PREFACE, Flags, FrameHeader, FrameType, Http2Error, Setting, SettingId, Settings,
-    StreamState, decode_frame, encode_frame,
+    CLIENT_PREFACE, Flags, FrameHeader, FrameType, Setting, SettingId, Settings, StreamState,
+    encode_frame,
 };
 
 pub use zerodds_hpack::HeaderField;
@@ -177,8 +182,11 @@ impl Default for Config {
 }
 
 /// Something that happened on the connection.
+///
+/// Body bytes in [`Event::Data`] borrow the input given to
+/// [`Connection::recv_step`]. [`Connection::recv`] copies them into owned events.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Event {
+pub enum Event<'a> {
     /// A complete header block (request/response headers or trailers).
     Headers {
         /// Stream the headers belong to.
@@ -188,13 +196,22 @@ pub enum Event {
         /// The peer closed its side of the stream.
         end_stream: bool,
     },
-    /// Body bytes (padding stripped).
+    /// Body bytes (padding stripped). One DATA frame can produce several of
+    /// these, in order, before its [`Event::DataEnd`].
     Data {
         /// Stream the data belongs to.
         stream_id: StreamId,
-        /// Payload bytes.
-        data: Vec<u8>,
-        /// The peer closed its side of the stream.
+        /// Payload bytes, borrowed from the input unless copied by
+        /// [`Connection::recv`].
+        data: Cow<'a, [u8]>,
+    },
+    /// A DATA frame has been received completely, including its trailing
+    /// padding. Reported once for each frame that delivered its body, whether or
+    /// not the frame carried body bytes.
+    DataEnd {
+        /// Stream the frame belongs to.
+        stream_id: StreamId,
+        /// The frame carried END_STREAM: the peer closed its side of the stream.
         end_stream: bool,
     },
     /// The stream was reset, by the peer or because of a stream error.
@@ -211,6 +228,58 @@ pub enum Event {
         /// Reason.
         error_code: ErrorCode,
     },
+}
+
+impl Event<'_> {
+    /// An owned copy of the event. Body bytes are copied.
+    fn into_owned(self) -> Event<'static> {
+        match self {
+            Event::Headers {
+                stream_id,
+                headers,
+                end_stream,
+            } => Event::Headers {
+                stream_id,
+                headers,
+                end_stream,
+            },
+            Event::Data { stream_id, data } => Event::Data {
+                stream_id,
+                data: Cow::Owned(data.into_owned()),
+            },
+            Event::DataEnd {
+                stream_id,
+                end_stream,
+            } => Event::DataEnd {
+                stream_id,
+                end_stream,
+            },
+            Event::Reset {
+                stream_id,
+                error_code,
+            } => Event::Reset {
+                stream_id,
+                error_code,
+            },
+            Event::GoAway {
+                last_stream_id,
+                error_code,
+            } => Event::GoAway {
+                last_stream_id,
+                error_code,
+            },
+        }
+    }
+}
+
+/// Outcome of one [`Connection::recv_step`] call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Step<'a> {
+    /// Bytes of the supplied input used by this call. The next call takes the rest.
+    pub consumed: usize,
+    /// The event, if one is ready. `None` means the whole input was used and
+    /// nothing else is pending until more input arrives.
+    pub event: Option<Event<'a>>,
 }
 
 /// Connection-level errors and API misuse.
@@ -438,10 +507,13 @@ impl Stream {
     }
 }
 
+/// A header block being received. Its octets are decoded as they arrive, so
+/// only the running total is kept.
 struct PendingBlock {
     stream_id: StreamId,
     end_stream: bool,
-    block: Vec<u8>,
+    /// Encoded octets received so far.
+    encoded: usize,
 }
 
 /// Sans-IO HTTP/2 connection.
@@ -452,9 +524,16 @@ pub struct Connection {
     encoder: Encoder,
     encoder_update_pending: bool,
     decoder: Decoder,
-    input: Vec<u8>,
     output: Vec<u8>,
+    /// The client preface is still being received (servers only).
     awaiting_preface: bool,
+    /// Preface octets matched so far.
+    preface_matched: usize,
+    /// The frame header being received, and how much of it there is.
+    header: [u8; FRAME_HEADER_LEN],
+    header_len: usize,
+    /// The frame whose payload is being received.
+    frame: Option<Frame>,
     awaiting_peer_settings: bool,
     streams: BTreeMap<StreamId, Stream>,
     retained_credit: BTreeMap<StreamId, usize>,
@@ -468,7 +547,13 @@ pub struct Connection {
     next_local_id: StreamId,
     last_peer_id: StreamId,
     continuation: Option<PendingBlock>,
-    events: VecDeque<Event>,
+    /// Notices that must be delivered before any further input is parsed.
+    notices: VecDeque<Event<'static>>,
+    /// Owned events collected by [`recv`](Connection::recv).
+    events: VecDeque<Event<'static>>,
+    /// After a GOAWAY: the highest stream id the peer processed, and the last
+    /// stream refused. Streams above the first are refused one per call.
+    refusal: Option<(StreamId, StreamId)>,
     goaway_sent: bool,
     /// The last-stream-ID advertised by the first GOAWAY; later ones repeat it.
     goaway_last_stream_id: Option<StreamId>,
@@ -549,9 +634,12 @@ impl Connection {
             encoder,
             encoder_update_pending: true,
             decoder: Decoder::new(),
-            input: Vec::new(),
             output: Vec::new(),
             awaiting_preface: role == Role::Server,
+            preface_matched: 0,
+            header: [0; FRAME_HEADER_LEN],
+            header_len: 0,
+            frame: None,
             awaiting_peer_settings: true,
             streams: BTreeMap::new(),
             retained_credit: BTreeMap::new(),
@@ -562,7 +650,9 @@ impl Connection {
             next_local_id: if role == Role::Client { 1 } else { 2 },
             last_peer_id: 0,
             continuation: None,
+            notices: VecDeque::new(),
             events: VecDeque::new(),
+            refusal: None,
             goaway_sent: false,
             goaway_last_stream_id: None,
             goaway_received: false,
@@ -618,9 +708,10 @@ impl Connection {
         !self.output.is_empty()
     }
 
-    /// Next connection event, if any.
-    pub fn poll_event(&mut self) -> Option<Event> {
-        self.events.pop_front()
+    /// Next event collected by [`recv`](Self::recv), or a notice raised by a call
+    /// made since then, such as a flushed reset.
+    pub fn poll_event(&mut self) -> Option<Event<'static>> {
+        self.events.pop_front().or_else(|| self.notices.pop_front())
     }
 
     /// Number of open (not fully closed) streams.
@@ -639,280 +730,91 @@ impl Connection {
             || ((self.goaway_sent || self.goaway_received) && self.streams.is_empty())
     }
 
-    /// Feed bytes received from the transport.
+    /// Feed bytes received from the transport, one event at a time.
     ///
-    /// On `Err(Error::Connection { .. })` a GOAWAY has been queued: write the
-    /// remaining output and close the transport.
-    pub fn recv(&mut self, bytes: &[u8]) -> Result<(), Error> {
-        if let Some(e) = &self.failed {
-            return Err(e.clone());
+    /// Returns the next event and how many bytes of `input` were used to reach
+    /// it. Call again with `&input[consumed..]` until `event` is `None`, which
+    /// means the whole input was used. Body bytes in [`Event::Data`] borrow
+    /// `input` and stay valid only until the next call. The connection keeps no
+    /// reference to them, so the caller may release credit or reset the stream
+    /// before continuing, and may stop between calls without losing the rest of
+    /// the input.
+    ///
+    /// Errors are terminal: a GOAWAY has been queued where the protocol requires
+    /// one, and every later call returns the same error.
+    pub fn recv_step<'a>(&mut self, input: &'a [u8]) -> Result<Step<'a>, Error> {
+        if let Some(event) = self.notices.pop_front() {
+            return Ok(Step {
+                consumed: 0,
+                event: Some(event),
+            });
         }
-        let mut input = core::mem::take(&mut self.input);
-        input.extend_from_slice(bytes);
-        let result = self.process_input(&mut input);
-        self.input = input;
-        result
-    }
-
-    fn process_input(&mut self, input: &mut Vec<u8>) -> Result<(), Error> {
+        if let Some(event) = self.next_refusal() {
+            return Ok(Step {
+                consumed: 0,
+                event: Some(event),
+            });
+        }
+        self.check_failed()?;
         let mut pos = 0;
-        if self.awaiting_preface {
-            let n = input.len().min(CLIENT_PREFACE.len());
-            if input[..n] != CLIENT_PREFACE[..n] {
-                return Err(self.fail(ErrorCode::ProtocolError, "invalid connection preface"));
-            }
-            if n < CLIENT_PREFACE.len() {
+        let event = match self.parse(input, &mut pos) {
+            Ok(event) => event,
+            // A notice queued before the failure is still delivered; the next
+            // call reports the failure.
+            Err(error) => match self.notices.pop_front() {
+                Some(event) => Some(event),
+                None => return Err(error),
+            },
+        };
+        if event.is_some() {
+            return Ok(Step {
+                consumed: pos,
+                event,
+            });
+        }
+        // The input is used up: write what it made ready, then report what that
+        // produced.
+        self.flush_streams();
+        if let Some(event) = self.notices.pop_front() {
+            return Ok(Step {
+                consumed: pos,
+                event: Some(event),
+            });
+        }
+        self.check_failed()?;
+        Ok(Step {
+            consumed: pos,
+            event: None,
+        })
+    }
+
+    /// Feed bytes received from the transport and collect the events they produce,
+    /// to be drained with [`poll_event`](Self::poll_event).
+    ///
+    /// This copies body bytes into owned events. Drivers should use
+    /// [`recv_step`](Self::recv_step), which lends them instead. On `Err` the
+    /// connection is unusable, and the events produced before the failure stay
+    /// available.
+    pub fn recv(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        let mut input = bytes;
+        loop {
+            let Step { consumed, event } = self.recv_step(input)?;
+            input = &input[consumed..];
+            let Some(event) = event else {
                 return Ok(());
-            }
-            self.awaiting_preface = false;
-            pos = CLIENT_PREFACE.len();
-        }
-        let max_frame = self.local_max_frame_size();
-        let mut result = Ok(());
-        while input.len() - pos >= FRAME_HEADER_LEN {
-            let rest = &input[pos..];
-            let len =
-                (usize::from(rest[0]) << 16) | (usize::from(rest[1]) << 8) | usize::from(rest[2]);
-            if len > max_frame as usize {
-                result = Err(self.fail(
-                    ErrorCode::FrameSizeError,
-                    "frame exceeds SETTINGS_MAX_FRAME_SIZE",
-                ));
-                break;
-            }
-            if rest.len() < FRAME_HEADER_LEN + len {
-                break;
-            }
-            let frame = &rest[..FRAME_HEADER_LEN + len];
-            pos += frame.len();
-            if let Err(e) = self.handle_frame(frame, max_frame) {
-                result = Err(e);
-                break;
-            }
-            // A reply that did not fit latched the output limit: nothing else
-            // is processed, since its consequences could not be written.
-            if let Some(e) = &self.failed {
-                result = Err(e.clone());
-                break;
-            }
-        }
-        input.drain(..pos);
-        if result.is_ok() {
-            self.flush_streams();
-            if let Some(e) = &self.failed {
-                result = Err(e.clone());
-            }
-        }
-        result
-    }
-
-    fn handle_frame(&mut self, raw: &[u8], max_frame: u32) -> Result<(), Error> {
-        // RFC 9113 §3.4: the peer's first frame must be a non-ACK SETTINGS, so
-        // this precedes the unknown-frame early return.
-        if self.awaiting_peer_settings
-            && (raw[3] != FrameType::Settings as u8 || Flags(raw[4]).has(Flags::ACK))
-        {
-            return Err(self.fail(ErrorCode::ProtocolError, "first frame must be SETTINGS"));
-        }
-        let Ok(frame_type) = FrameType::from_u8(raw[3]) else {
-            // RFC 9113 §4.1: unknown frame types MUST be ignored, except in the
-            // middle of a header block.
-            if self.continuation.is_some() {
-                return Err(self.fail(ErrorCode::ProtocolError, "expected CONTINUATION"));
-            }
-            return Ok(());
-        };
-        let (frame, _) = match decode_frame(raw, max_frame) {
-            Ok(f) => f,
-            Err(_) => return Err(self.fail(ErrorCode::FrameSizeError, "malformed frame")),
-        };
-        let FrameHeader {
-            flags, stream_id, ..
-        } = frame.header;
-        let payload = frame.payload;
-
-        self.awaiting_peer_settings = false;
-        if self.continuation.is_some() && frame_type != FrameType::Continuation {
-            return Err(self.fail(ErrorCode::ProtocolError, "expected CONTINUATION"));
-        }
-
-        match frame_type {
-            FrameType::Data => self.on_data(stream_id, flags, payload),
-            FrameType::Headers => self.on_headers(stream_id, flags, payload),
-            FrameType::Continuation => self.on_continuation(stream_id, flags, payload),
-            FrameType::Priority => {
-                if stream_id == 0 {
-                    return Err(self.fail(ErrorCode::ProtocolError, "PRIORITY on stream 0"));
-                }
-                if payload.len() != 5 {
-                    self.reset(stream_id, ErrorCode::FrameSizeError);
-                }
-                Ok(())
-            }
-            FrameType::RstStream => self.on_rst_stream(stream_id, payload),
-            FrameType::Settings => self.on_settings(stream_id, flags, payload),
-            FrameType::PushPromise => {
-                Err(self.fail(ErrorCode::ProtocolError, "PUSH_PROMISE not supported"))
-            }
-            FrameType::Ping => self.on_ping(stream_id, flags, payload),
-            FrameType::GoAway => self.on_goaway(stream_id, payload),
-            FrameType::WindowUpdate => self.on_window_update(stream_id, payload),
+            };
+            self.events.push_back(event.into_owned());
         }
     }
 
-    fn on_data(&mut self, id: StreamId, flags: Flags, payload: &[u8]) -> Result<(), Error> {
-        if id == 0 {
-            return Err(self.fail(ErrorCode::ProtocolError, "DATA on stream 0"));
-        }
-        // Both modes enforce the same windows; only credit timing differs.
-        let flow_len = payload.len();
-        if flow_len as i64 > self.conn_recv_window {
-            return Err(self.fail(
-                ErrorCode::FlowControlError,
-                "connection receive window exceeded",
-            ));
-        }
-        self.conn_recv_window -= flow_len as i64;
-        let data = match strip_padding(flags, payload) {
-            Some(d) => d,
-            None => return Err(self.fail(ErrorCode::ProtocolError, "invalid DATA padding")),
-        };
-        let end_stream = flags.has(Flags::END_STREAM);
-        let padding = flow_len - data.len();
-
-        let Some(stream) = self.streams.get_mut(&id) else {
-            if self.is_idle_stream(id) {
-                return Err(self.fail(ErrorCode::ProtocolError, "DATA on idle stream"));
-            }
-            // Closed or reset stream: discard.
-            self.release_connection(flow_len);
-            return Ok(());
-        };
-        if !stream.can_recv() {
-            self.release_connection(flow_len);
-            self.reset(id, ErrorCode::StreamClosed);
-            return Ok(());
-        }
-        if flow_len as i64 > stream.recv_window {
-            self.release_connection(flow_len);
-            self.reset(id, ErrorCode::FlowControlError);
-            return Ok(());
-        }
-        if stream.recv_phase != Phase::Body {
-            self.release_connection(flow_len);
-            self.reset(id, ErrorCode::ProtocolError);
-            return Ok(());
-        }
-        let Ok(body) = stream.recv_body.checked_data(data.len(), end_stream) else {
-            self.release_connection(flow_len);
-            self.reset(id, ErrorCode::ProtocolError);
-            return Ok(());
-        };
-        stream.recv_body = body;
-        stream.recv_window -= flow_len as i64;
-        if end_stream {
-            stream.recv_phase = Phase::End;
-            stream.apply(StreamEvent::RecvEndStream);
-        }
-        if stream.reset_after_flush.is_some() {
-            // The application has finished with this stream; nobody will
-            // release these bytes.
-            self.release_connection(flow_len);
-            self.cleanup(id);
-            return Ok(());
-        }
-        // Credit that goes back at once: the whole frame in automatic mode, but
-        // in manual mode only the padding, which is never delivered. The
-        // application releases the rest.
-        let credit = if self.config.flow_control == FlowControl::Manual {
-            stream.unreleased += data.len();
-            padding
-        } else {
-            flow_len
-        };
-        self.credit_received(id, credit);
-        self.events.push_back(Event::Data {
-            stream_id: id,
-            data: data.to_vec(),
-            end_stream,
-        });
-        self.cleanup(id);
-        Ok(())
-    }
-
-    fn on_headers(&mut self, id: StreamId, flags: Flags, payload: &[u8]) -> Result<(), Error> {
-        if id == 0 {
-            return Err(self.fail(ErrorCode::ProtocolError, "HEADERS on stream 0"));
-        }
-        let Some(mut block) = strip_padding(flags, payload) else {
-            return Err(self.fail(ErrorCode::ProtocolError, "invalid HEADERS padding"));
-        };
-        if flags.has(Flags::PRIORITY) {
-            if block.len() < 5 {
-                return Err(self.fail(ErrorCode::FrameSizeError, "short HEADERS priority"));
-            }
-            block = &block[5..];
-        }
-        if block.len() > self.encoded_header_limit() {
-            return Err(self.fail(ErrorCode::EnhanceYourCalm, "header block too large"));
-        }
-        let pending = PendingBlock {
-            stream_id: id,
-            end_stream: flags.has(Flags::END_STREAM),
-            block: block.to_vec(),
-        };
-        if flags.has(Flags::END_HEADERS) {
-            self.on_header_block(pending)
-        } else {
-            self.continuation = Some(pending);
-            Ok(())
-        }
-    }
-
-    fn on_continuation(&mut self, id: StreamId, flags: Flags, payload: &[u8]) -> Result<(), Error> {
-        let Some(mut pending) = self.continuation.take() else {
-            return Err(self.fail(ErrorCode::ProtocolError, "unexpected CONTINUATION"));
-        };
-        if pending.stream_id != id {
-            return Err(self.fail(ErrorCode::ProtocolError, "CONTINUATION on wrong stream"));
-        }
-        if payload.len()
-            > self
-                .encoded_header_limit()
-                .saturating_sub(pending.block.len())
-        {
-            return Err(self.fail(ErrorCode::EnhanceYourCalm, "header block too large"));
-        }
-        pending.block.extend_from_slice(payload);
-        if flags.has(Flags::END_HEADERS) {
-            self.on_header_block(pending)
-        } else {
-            self.continuation = Some(pending);
-            Ok(())
-        }
-    }
-
-    fn on_header_block(&mut self, block: PendingBlock) -> Result<(), Error> {
-        let PendingBlock {
-            stream_id: id,
-            end_stream,
-            block,
-        } = block;
-        // Decode even discarded streams. Overflow terminates the connection,
-        // avoiding both unbounded materialization and unsynchronized HPACK state.
-        let headers = match self
-            .decoder
-            .decode(&block, self.config.max_header_list_size as usize)
-        {
-            Ok(h) => h,
-            Err(hpack::DecodeError::Limit) => {
-                return Err(self.fail(ErrorCode::EnhanceYourCalm, "decoded header list too large"));
-            }
-            Err(hpack::DecodeError::Compression) => {
-                return Err(self.fail(ErrorCode::CompressionError, "HPACK decode failed"));
-            }
-        };
-
+    /// Act on a complete header block, already decoded (also for discarded
+    /// streams, so that the shared compression context stays in step).
+    fn on_header_block(
+        &mut self,
+        id: StreamId,
+        end_stream: bool,
+        headers: Vec<hpack::RawHeader>,
+    ) -> Result<(), Error> {
         if !self.streams.contains_key(&id) {
             if !self.is_peer_initiated(id) {
                 if id >= self.next_local_id {
@@ -975,152 +877,12 @@ impl Connection {
             stream.apply(StreamEvent::RecvEndStream);
         }
         stream.commit_headers(section, body, false);
-        self.events.push_back(Event::Headers {
+        self.notices.push_back(Event::Headers {
             stream_id: id,
             headers,
             end_stream,
         });
         self.cleanup(id);
-        Ok(())
-    }
-
-    fn on_rst_stream(&mut self, id: StreamId, payload: &[u8]) -> Result<(), Error> {
-        if id == 0 {
-            return Err(self.fail(ErrorCode::ProtocolError, "RST_STREAM on stream 0"));
-        }
-        if payload.len() != 4 {
-            return Err(self.fail(ErrorCode::FrameSizeError, "RST_STREAM length"));
-        }
-        if self.is_idle_stream(id) {
-            return Err(self.fail(ErrorCode::ProtocolError, "RST_STREAM on idle stream"));
-        }
-        let code = ErrorCode::from_u32(u32::from_be_bytes([
-            payload[0], payload[1], payload[2], payload[3],
-        ]));
-        if self.remove_stream(id) {
-            self.events.push_back(Event::Reset {
-                stream_id: id,
-                error_code: code,
-            });
-        }
-        Ok(())
-    }
-
-    fn on_settings(&mut self, id: StreamId, flags: Flags, payload: &[u8]) -> Result<(), Error> {
-        if id != 0 {
-            return Err(self.fail(ErrorCode::ProtocolError, "SETTINGS on non-zero stream"));
-        }
-        if flags.has(Flags::ACK) {
-            if !payload.is_empty() {
-                return Err(self.fail(ErrorCode::FrameSizeError, "SETTINGS ACK with payload"));
-            }
-            self.on_settings_ack();
-            return Ok(());
-        }
-        let settings = match decode_settings(payload) {
-            Ok(s) => s,
-            Err(_) => return Err(self.fail(ErrorCode::FrameSizeError, "SETTINGS length")),
-        };
-        for s in settings {
-            let old_window = i64::from(self.peer.initial_window_size);
-            if let Err(e) = self.peer.apply(s) {
-                let code = match e {
-                    Http2Error::Protocol(c) => c,
-                    _ => ErrorCode::ProtocolError,
-                };
-                return Err(self.fail(code, "invalid SETTINGS value"));
-            }
-            if s.id == SettingId::InitialWindowSize {
-                let delta = i64::from(self.peer.initial_window_size) - old_window;
-                for stream in self.streams.values_mut() {
-                    stream.send_window += delta;
-                    if stream.send_window > MAX_WINDOW {
-                        return Err(
-                            self.fail(ErrorCode::FlowControlError, "stream window overflow")
-                        );
-                    }
-                }
-            }
-        }
-        self.write_frame(FrameType::Settings, Flags::ACK, 0, &[]);
-        Ok(())
-    }
-
-    fn on_ping(&mut self, id: StreamId, flags: Flags, payload: &[u8]) -> Result<(), Error> {
-        if id != 0 {
-            return Err(self.fail(ErrorCode::ProtocolError, "PING on non-zero stream"));
-        }
-        if payload.len() != 8 {
-            return Err(self.fail(ErrorCode::FrameSizeError, "PING length"));
-        }
-        if !flags.has(Flags::ACK) {
-            self.write_frame(FrameType::Ping, Flags::ACK, 0, payload);
-        }
-        Ok(())
-    }
-
-    fn on_goaway(&mut self, id: StreamId, payload: &[u8]) -> Result<(), Error> {
-        if id != 0 {
-            return Err(self.fail(ErrorCode::ProtocolError, "GOAWAY on non-zero stream"));
-        }
-        if payload.len() < 8 {
-            return Err(self.fail(ErrorCode::FrameSizeError, "GOAWAY length"));
-        }
-        let last =
-            u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]) & 0x7fff_ffff;
-        let code = ErrorCode::from_u32(u32::from_be_bytes([
-            payload[4], payload[5], payload[6], payload[7],
-        ]));
-        self.goaway_received = true;
-        self.events.push_back(Event::GoAway {
-            last_stream_id: last,
-            error_code: code,
-        });
-        // Locally-initiated streams above `last` were never processed by the peer.
-        let refused: Vec<StreamId> = self
-            .streams
-            .keys()
-            .copied()
-            .filter(|s| !self.is_peer_initiated(*s) && *s > last)
-            .collect();
-        for s in refused {
-            self.remove_stream(s);
-            self.events.push_back(Event::Reset {
-                stream_id: s,
-                error_code: ErrorCode::RefusedStream,
-            });
-        }
-        Ok(())
-    }
-
-    fn on_window_update(&mut self, id: StreamId, payload: &[u8]) -> Result<(), Error> {
-        let inc = match decode_window_update(payload) {
-            Ok(i) => i64::from(i),
-            Err(_) => return Err(self.fail(ErrorCode::FrameSizeError, "WINDOW_UPDATE length")),
-        };
-        if id == 0 {
-            if inc == 0 {
-                return Err(self.fail(ErrorCode::ProtocolError, "zero WINDOW_UPDATE"));
-            }
-            self.conn_send_window += inc;
-            if self.conn_send_window > MAX_WINDOW {
-                return Err(self.fail(ErrorCode::FlowControlError, "connection window overflow"));
-            }
-            return Ok(());
-        }
-        if self.is_idle_stream(id) {
-            return Err(self.fail(ErrorCode::ProtocolError, "WINDOW_UPDATE on idle stream"));
-        }
-        if inc == 0 {
-            self.reset(id, ErrorCode::ProtocolError);
-            return Ok(());
-        }
-        if let Some(stream) = self.streams.get_mut(&id) {
-            stream.send_window += inc;
-            if stream.send_window > MAX_WINDOW {
-                self.reset(id, ErrorCode::FlowControlError);
-            }
-        }
         Ok(())
     }
 
@@ -1414,7 +1176,7 @@ impl Connection {
     fn reset(&mut self, id: StreamId, code: ErrorCode) {
         self.write_frame(FrameType::RstStream, 0, id, &(code as u32).to_be_bytes());
         if self.remove_stream(id) {
-            self.events.push_back(Event::Reset {
+            self.notices.push_back(Event::Reset {
                 stream_id: id,
                 error_code: code,
             });
@@ -1703,18 +1465,6 @@ fn header_block_bound(fields: &[HeaderField], update: usize, max_frame: usize) -
     });
     let frames = block.div_ceil(max_frame.max(1)).max(1);
     block.saturating_add(frames.saturating_mul(FRAME_HEADER_LEN))
-}
-
-fn strip_padding(flags: Flags, payload: &[u8]) -> Option<&[u8]> {
-    if !flags.has(Flags::PADDED) {
-        return Some(payload);
-    }
-    let (&pad, rest) = payload.split_first()?;
-    let pad = usize::from(pad);
-    if pad > rest.len() {
-        return None;
-    }
-    Some(&rest[..rest.len() - pad])
 }
 
 #[cfg(test)]

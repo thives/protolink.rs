@@ -47,10 +47,17 @@ impl Inbound {
         self.decoder.set_codec(codec);
     }
 
-    /// Buffer a DATA payload.
-    pub(crate) fn push(&mut self, conn: &mut Connection, id: StreamId, data: &[u8]) {
+    /// Buffer a chunk of a DATA payload. Credit for a partial message waits for
+    /// the end of its frame, see [`finish_frame`](Self::finish_frame), so that a
+    /// frame delivered in small pieces costs one window update, not one per piece.
+    pub(crate) fn push(&mut self, data: &[u8]) {
         self.held += data.len();
         self.decoder.push(data);
+    }
+
+    /// The DATA frame carrying the buffered bytes is complete: credit a partial
+    /// message back to the peer, as far as it is not held for a whole message.
+    pub(crate) fn finish_frame(&mut self, conn: &mut Connection, id: StreamId) {
         self.release_partial(conn, id);
     }
 

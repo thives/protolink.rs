@@ -9,8 +9,8 @@ use protolink_alloc_track::{CountingAllocator, Window};
 use protolink_grpc::http2::{Config, Connection, HeaderField};
 use protolink_grpc::lpm::{self, Decoder};
 use protolink_grpc::{
-    CallContext, CallId, Client, ClientConfig, Dispatcher, Handler, MethodDescriptor, MethodKind,
-    Next, Route, Router, Server, ServerConfig,
+    CallContext, CallId, Client, ClientConfig, Code, Dispatcher, Handler, MethodDescriptor,
+    MethodKind, Next, Route, Router, Server, ServerConfig,
 };
 
 #[global_allocator]
@@ -388,4 +388,155 @@ fn router_passes_allocate_nothing_across_active_local_calls() {
         assert_no_allocation(&window, "router receive");
     }
     assert_eq!(router.active_calls(), 8);
+}
+
+/// The client's response path with the transport delivering the response in
+/// segments, as a serial link does. Reported, with the take and the receive
+/// separated: a missed buffer transfer shows up as an allocation at take time.
+#[test]
+fn client_unary_response_in_transport_segments_is_reported() {
+    for payload_len in [1024, 4096] {
+        for segment in [usize::MAX, 1460] {
+            let payload = pattern(payload_len);
+            let framed = lpm::encode(&payload).unwrap();
+            let (mut client, mut peer, id) = unary_call();
+            peer.send_headers(
+                id,
+                vec![
+                    field(":status", "200"),
+                    field("content-type", "application/grpc"),
+                ],
+                false,
+            )
+            .unwrap();
+            peer.send_data(id, framed.clone(), false).unwrap();
+            peer.send_headers(id, vec![field("grpc-status", "0")], true)
+                .unwrap();
+            let bytes = peer.take_output();
+
+            let window = Window::open();
+            for piece in bytes.chunks(segment) {
+                client.recv(piece).unwrap();
+            }
+            let received = window.checkpoint();
+            let response = client.take_response(id).unwrap().unwrap();
+            let taken = window.checkpoint();
+            let label = if segment == usize::MAX {
+                "whole".to_string()
+            } else {
+                format!("{segment}-byte segments")
+            };
+            eprintln!(
+                "client unary {payload_len}-byte response, {label}: receive {received:?}, take {taken:?}"
+            );
+            assert_eq!(response.message, payload);
+        }
+    }
+}
+
+/// A PING frame from the peer: 17 bytes in, and the client's ACK grows its
+/// output buffer, whose capacity is then kept for the measurement below.
+const PING_FRAME: [u8; 17] = [0, 0, 8, 6, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8];
+
+/// Measure header/trailer bookkeeping separately from ignored DATA. Only output
+/// capacity is warmed; body processing must add no heap storage, even transiently,
+/// and bookkeeping must not grow with body size or fragment count.
+#[test]
+fn ignored_response_body_copies_nothing_however_it_is_cut() {
+    eprintln!(
+        "inline Client: {} B; separate from measured heap usage",
+        std::mem::size_of::<Client>()
+    );
+    let mut baseline = None;
+    for body_len in [16usize, 16_384usize] {
+        for chunk in [usize::MAX, 1024usize, 64usize, 1usize] {
+            let (mut client, mut peer, id) = unary_call();
+            for _ in 0..64 {
+                client.recv(&PING_FRAME).unwrap();
+            }
+            let warm = client.pending_output().len();
+            client.consume_output(warm);
+
+            peer.send_headers(
+                id,
+                vec![field(":status", "503"), field("content-type", "text/html")],
+                false,
+            )
+            .unwrap();
+            let headers = peer.take_output();
+            peer.send_data(id, pattern(body_len), false).unwrap();
+            let body = peer.take_output();
+            assert_eq!(body.len(), 9 + body_len, "one nonterminal DATA frame");
+            peer.send_headers(
+                id,
+                vec![field("grpc-status", "14"), field("grpc-message", "down")],
+                true,
+            )
+            .unwrap();
+            let trailers = peer.take_output();
+
+            let (header_phase, body_phase, trailer_phase) = {
+                let window = Window::open();
+                for piece in headers.chunks(chunk) {
+                    client.recv(piece).unwrap();
+                }
+                let header_phase = window.checkpoint();
+                for piece in body.chunks(chunk) {
+                    client.recv(piece).unwrap();
+                    assert!(
+                        client.is_pending(id),
+                        "nonterminal body, {body_len}/{chunk}"
+                    );
+                    assert_eq!(client.retained_response_bytes(), 0, "{body_len}/{chunk}");
+                    assert_eq!(client.buffered_response_bytes(id), Some(0));
+                }
+                let body_phase = window.checkpoint();
+                for piece in trailers.chunks(chunk) {
+                    client.recv(piece).unwrap();
+                }
+                (header_phase, body_phase, window.checkpoint())
+            };
+            eprintln!(
+                "ignored {body_len}-byte body, cut at {chunk}: headers {header_phase:?}, body {body_phase:?}, trailers {trailer_phase:?}"
+            );
+            assert_eq!(
+                (
+                    body_phase.allocations,
+                    body_phase.reallocations,
+                    body_phase.largest
+                ),
+                (0, 0, 0),
+                "ignored DATA allocates nothing, {body_len}/{chunk}"
+            );
+            assert_eq!(
+                (body_phase.live, body_phase.peak),
+                (header_phase.live, header_phase.live),
+                "body adds no live or transient heap storage, {body_len}/{chunk}"
+            );
+            let key = [header_phase, trailer_phase].map(|phase| {
+                (
+                    phase.allocations,
+                    phase.reallocations,
+                    phase.largest,
+                    phase.live,
+                    phase.peak,
+                )
+            });
+            if let Some(expected) = baseline {
+                assert_eq!(key, expected, "bookkeeping grew, {body_len}/{chunk}");
+            } else {
+                baseline = Some(key);
+            }
+            assert_eq!(client.retained_response_bytes(), 0, "before result take");
+            let status = client.take_response(id).unwrap().unwrap_err();
+            assert_eq!(
+                status.code,
+                Code::Unavailable,
+                "the authoritative trailers decide, {body_len}/{chunk}"
+            );
+            assert_eq!(status.message, "down");
+            assert!(client.take_response(id).is_none(), "no duplicate result");
+            assert_eq!(client.retained_response_bytes(), 0, "after result take");
+        }
+    }
 }

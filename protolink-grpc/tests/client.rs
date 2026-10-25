@@ -1,8 +1,12 @@
 //! Client-only raw-peer regressions for response lifetime and validation.
 
+use core::time::Duration;
+
 use protolink_grpc::compression::{Codec, CodecError};
 use protolink_grpc::http2::{Config, Connection, ErrorCode, Event, HeaderField};
-use protolink_grpc::{CallId, Client, ClientConfig, Code, Compression, Next, lpm};
+use protolink_grpc::{
+    CallId, CallOptions, Client, ClientConfig, Code, Compression, Next, Status, lpm,
+};
 
 fn field(name: &str, value: &str) -> HeaderField {
     HeaderField {
@@ -40,10 +44,23 @@ fn setup(config: ClientConfig) -> (Client, Connection) {
 }
 
 fn open(client: &mut Client, peer: &mut Connection, unary: bool) -> CallId {
+    open_with(client, peer, unary, &CallOptions::new())
+}
+
+fn open_with(
+    client: &mut Client,
+    peer: &mut Connection,
+    unary: bool,
+    options: &CallOptions,
+) -> CallId {
     let id = if unary {
-        client.start_unary("/test.Client/Unary", b"").unwrap()
+        client
+            .start_unary_with("/test.Client/Unary", b"", options)
+            .unwrap()
     } else {
-        let id = client.start_streaming("/test.Client/Stream").unwrap();
+        let id = client
+            .start_streaming_with("/test.Client/Stream", options)
+            .unwrap();
         client.close_send(id).unwrap();
         id
     };
@@ -75,23 +92,7 @@ fn deliver(client: &mut Client, peer: &mut Connection) {
 
 /// Connection WINDOW_UPDATE increments in already-handshaken output.
 fn connection_credit(bytes: &[u8]) -> usize {
-    let mut pos = 0;
-    let mut credit = 0;
-    while pos < bytes.len() {
-        assert!(bytes.len() - pos >= 9);
-        let len = (usize::from(bytes[pos]) << 16)
-            | (usize::from(bytes[pos + 1]) << 8)
-            | usize::from(bytes[pos + 2]);
-        let id = u32::from_be_bytes(bytes[pos + 5..pos + 9].try_into().unwrap()) & 0x7fff_ffff;
-        if bytes[pos + 3] == 8 && id == 0 {
-            assert_eq!(len, 4);
-            credit += (u32::from_be_bytes(bytes[pos + 9..pos + 13].try_into().unwrap())
-                & 0x7fff_ffff) as usize;
-        }
-        pos += 9 + len;
-    }
-    assert_eq!(pos, bytes.len());
-    credit
+    credit(bytes).0
 }
 
 fn informational_headers_then_grpc_response(unary: bool) {
@@ -930,4 +931,605 @@ fn unary_body_overflow_adopts_failure_for_other_calls() {
         "{}",
         status.message
     );
+}
+
+#[test]
+fn fragmented_non_grpc_error_body_keeps_credit_bounded_and_peer_alive() {
+    // Keep client TX blocked while fragmenting A's terminal ignored body.
+    // Control output must stay bounded and the unrelated call B must survive.
+    let body = vec![b'x'; 16_384];
+    for small_budget in [false, true] {
+        let mut config = ClientConfig::default();
+        if small_budget {
+            // A deliberately tight buffer that still fits the setup.
+            config.http2.max_pending_output_bytes = 1024;
+        }
+        for chunk in [16_384, 512, 1] {
+            let (mut client, mut peer) = setup(config.clone());
+            let a = open(&mut client, &mut peer, true);
+            let b = open(&mut client, &mut peer, true);
+
+            peer.send_headers(
+                a,
+                vec![field(":status", "503"), field("content-type", "text/html")],
+                false,
+            )
+            .unwrap();
+            peer.send_data(a, body.clone(), true).unwrap();
+            let response = peer.take_output();
+
+            client.take_output();
+            for piece in response.chunks(chunk) {
+                client.recv(piece).unwrap_or_else(|error| {
+                    panic!("chunk={chunk} small_budget={small_budget}: {error:?}")
+                });
+            }
+            assert!(client.failure().is_none());
+            let frames = decoded_frames(&client.take_output()).len();
+            assert!(frames <= 2, "flooded {frames} frames at chunk={chunk}");
+
+            let status = client.take_response(a).unwrap().unwrap_err();
+            assert_eq!(status.code, Code::Unavailable);
+            assert_eq!(client.retained_response_bytes(), 0);
+
+            complete_unrelated_call(&mut client, &mut peer, b);
+        }
+    }
+}
+
+const DATA_FRAME: u8 = 0;
+const RST_STREAM_FRAME: u8 = 3;
+const WINDOW_UPDATE_FRAME: u8 = 8;
+const WINDOW: usize = 16_384;
+
+/// Whole, already-handshaken frames as `(type, stream, payload)`; reject truncation.
+fn decoded_frames(mut bytes: &[u8]) -> Vec<(u8, u32, &[u8])> {
+    let mut frames = Vec::new();
+    while !bytes.is_empty() {
+        assert!(bytes.len() >= 9, "truncated frame header");
+        let len =
+            (usize::from(bytes[0]) << 16) | (usize::from(bytes[1]) << 8) | usize::from(bytes[2]);
+        assert!(bytes.len() - 9 >= len, "truncated {len}-byte payload");
+        let id = u32::from_be_bytes(bytes[5..9].try_into().unwrap()) & 0x7fff_ffff;
+        frames.push((bytes[3], id, &bytes[9..9 + len]));
+        bytes = &bytes[9 + len..];
+    }
+    frames
+}
+
+/// `(connection_bytes, connection_frames, stream_bytes, stream_frames)`.
+/// Check both amounts and counts: totals alone miss floods; counts alone miss lost credit.
+fn credit(bytes: &[u8]) -> (usize, usize, usize, usize) {
+    let mut credit = (0, 0, 0, 0);
+    for (kind, id, payload) in decoded_frames(bytes) {
+        if kind == WINDOW_UPDATE_FRAME {
+            let increment = (u32::from_be_bytes(payload.try_into().expect("WINDOW_UPDATE payload"))
+                & 0x7fff_ffff) as usize;
+            if id == 0 {
+                credit.0 += increment;
+                credit.1 += 1;
+            } else {
+                credit.2 += increment;
+                credit.3 += 1;
+            }
+        }
+    }
+    credit
+}
+
+/// DATA payload byte counts in `bytes` as `(stream, payload_len)` pairs.
+fn data_frames(bytes: &[u8]) -> Vec<(u32, usize)> {
+    decoded_frames(bytes)
+        .iter()
+        .filter(|frame| frame.0 == DATA_FRAME)
+        .map(|frame| (frame.1, frame.2.len()))
+        .collect()
+}
+
+#[test]
+fn ignored_body_returns_credit_before_terminal_and_unblocks_next_frame() {
+    // Six nonterminal frames exceed both flow-control windows. Terminal cleanup
+    // cannot stand in for frame credit: each release must unblock the real peer.
+    for unary in [true, false] {
+        // Zero selects a deterministic irregular cycle; other values are fixed
+        // transport chunks, with MAX feeding the entire prefix at once.
+        for chunk in [1, 2, 32, 64, 128, 512, usize::MAX, 0] {
+            ignored_body_credit_liveness(unary, chunk);
+        }
+    }
+}
+
+fn ignored_body_credit_liveness(unary: bool, chunk: usize) {
+    let (mut client, mut peer) = setup(small_window_config());
+    let a = open(&mut client, &mut peer, unary);
+    let b = open(&mut client, &mut peer, true);
+    assert_eq!(peer.send_capacity(a), Some(WINDOW));
+    ignored_headers(&mut client, &mut peer, a, html_error_headers());
+    assert!(client.is_pending(a));
+    assert!(client.take_response(a).is_none());
+    assert!(client.try_next(a).is_none());
+    assert_eq!(client.retained_response_bytes(), 0);
+
+    let body = vec![b'x'; WINDOW];
+    peer.send_data(a, body.clone(), false).unwrap();
+    assert_eq!(peer.queued_send_bytes(a), Some(0));
+    let mut wire = peer.take_output();
+    assert_eq!(data_frames(&wire), [(a, WINDOW)]);
+
+    let mut total = (0, 0);
+    for frame in 0..6 {
+        // Queue the next frame now; only forwarding this frame's credit may unblock it.
+        if frame < 5 {
+            peer.send_data(a, body.clone(), false).unwrap();
+            assert_eq!(peer.queued_send_bytes(a), Some(WINDOW));
+            assert!(peer.pending_output().is_empty());
+        }
+        let last = wire.len() - 1;
+        let mut at = 0;
+        let mut piece = 0;
+        while at < last {
+            let size = if chunk == 0 {
+                [7, 2, 13, 1, 29, 4][piece % 6]
+            } else {
+                chunk
+            };
+            let end = at + size.min(last - at);
+            client.recv(&wire[at..end]).unwrap();
+            at = end;
+            piece += 1;
+        }
+        assert!(
+            client.pending_output().is_empty(),
+            "frame {frame} released credit before completion",
+        );
+        client.recv(&wire[last..]).unwrap();
+
+        let queued = client.take_output();
+        let released = credit(&queued);
+        assert_eq!(
+            released,
+            (WINDOW, 1, WINDOW, 1),
+            "unary={unary} chunk={chunk} frame={frame}: boundary credit",
+        );
+        assert!(client.failure().is_none(), "frame {frame}: output limit");
+        assert_eq!(client.retained_response_bytes(), 0, "frame {frame}");
+        assert!(client.is_pending(a), "frame {frame} ended the call early");
+        total.0 += released.0;
+        total.1 += released.2;
+
+        // Still blocked at the boundary, even though the client has queued credit.
+        if frame < 5 {
+            assert_eq!(peer.queued_send_bytes(a), Some(WINDOW));
+            assert!(data_frames(peer.pending_output()).is_empty());
+        }
+        peer.recv(&queued).unwrap();
+        assert!(peer.failure().is_none());
+        if frame < 5 {
+            assert_eq!(peer.queued_send_bytes(a), Some(0));
+            wire = peer.take_output();
+            assert_eq!(data_frames(&wire), [(a, WINDOW)], "after frame {frame}");
+        } else {
+            assert!(peer.take_output().is_empty());
+        }
+    }
+    assert_eq!(total, (6 * WINDOW, 6 * WINDOW));
+    assert!(total.0 > 65_535 && total.1 > WINDOW);
+
+    peer.send_headers(a, vec![field("x-detail", "after six frames")], true)
+        .unwrap();
+    deliver(&mut client, &mut peer);
+    let status = ended_status(&mut client, a, unary);
+    assert_eq!(status.code, Code::Unavailable);
+    assert_eq!(status.metadata.get("x-detail"), Some("after six frames"));
+    complete_unrelated_call(&mut client, &mut peer, b);
+}
+
+#[test]
+fn interrupted_ignored_body_releases_delivered_credit_once() {
+    // Cleanup owns the delivered prefix; the parser owns the unread tail.
+    // Neither may credit the other's bytes, regardless of how the call ends.
+    for unary in [true, false] {
+        for prefix in [1usize, 8_192usize] {
+            cancelled_ignored_body(unary, prefix);
+            expired_ignored_body(unary, prefix);
+            failed_over_ignored_body(unary, prefix);
+        }
+    }
+}
+
+fn small_window_config() -> ClientConfig {
+    ClientConfig {
+        http2: Config {
+            initial_window_size: WINDOW as u32,
+            max_pending_output_bytes: 1024,
+            ..ClientConfig::default().http2
+        },
+        ..ClientConfig::default()
+    }
+}
+
+fn html_error_headers() -> Vec<HeaderField> {
+    vec![field(":status", "503"), field("content-type", "text/html")]
+}
+
+/// Deliver initial headers and clear both output buffers before measuring DATA credit.
+fn ignored_headers(
+    client: &mut Client,
+    peer: &mut Connection,
+    id: CallId,
+    initial: Vec<HeaderField>,
+) {
+    peer.send_headers(id, initial, false).unwrap();
+    deliver(client, peer);
+    client.take_output();
+    peer.take_output();
+}
+
+fn complete_unrelated_call(client: &mut Client, peer: &mut Connection, id: CallId) {
+    headers(peer, id);
+    peer.send_data(id, encoded(b"ok"), false).unwrap();
+    finish(peer, id);
+    exchange(client, peer);
+    assert_eq!(client.take_response(id).unwrap().unwrap().message, b"ok");
+}
+
+/// Deliver only a nonterminal frame's prefix; return the wire bytes for its tail.
+fn ignored_prefix(
+    unary: bool,
+    timeout: bool,
+    prefix: usize,
+) -> (Client, Connection, CallId, CallId, Vec<u8>) {
+    let (mut client, mut peer) = setup(small_window_config());
+    let options = if timeout {
+        CallOptions::timeout(Duration::from_secs(1))
+    } else {
+        CallOptions::new()
+    };
+    let a = open_with(&mut client, &mut peer, unary, &options);
+    let b = open(&mut client, &mut peer, true);
+    ignored_headers(&mut client, &mut peer, a, html_error_headers());
+
+    peer.send_data(a, vec![b'y'; WINDOW], false).unwrap();
+    let frame = peer.take_output();
+    assert_eq!(data_frames(&frame), [(a, WINDOW)]);
+    client.recv(&frame[..9]).unwrap();
+    for piece in frame[9..9 + prefix].chunks(1) {
+        client.recv(piece).unwrap();
+    }
+    assert!(
+        client.pending_output().is_empty(),
+        "unary={unary} prefix={prefix}"
+    );
+    assert!(client.is_pending(a));
+    assert_eq!(client.retained_response_bytes(), 0);
+    (client, peer, a, b, frame)
+}
+
+/// RST_STREAM frames for `id` in `bytes`.
+fn resets_for(bytes: &[u8], id: CallId) -> usize {
+    decoded_frames(bytes)
+        .iter()
+        .filter(|frame| frame.0 == RST_STREAM_FRAME && frame.1 == id)
+        .count()
+}
+
+fn cancelled_ignored_body(unary: bool, prefix: usize) {
+    let (mut client, mut peer, a, b, frame) = ignored_prefix(unary, false, prefix);
+
+    client.cancel(a);
+    client.cancel(a);
+    let output = client.take_output();
+    assert_eq!(credit(&output), (prefix, 1, prefix, 1), "unary={unary}");
+    assert_eq!(resets_for(&output, a), 1);
+
+    // After cancellation, the parser owes the tail at connection level only.
+    for piece in frame[9 + prefix..].chunks(1) {
+        client.recv(piece).unwrap();
+    }
+    assert_eq!(credit(&client.take_output()), (WINDOW - prefix, 1, 0, 0));
+    assert!(client.failure().is_none());
+    assert!(!client.is_pending(a));
+    assert!(client.take_response(a).is_none());
+    assert!(client.try_next(a).is_none());
+    client.cancel(a);
+    assert_eq!(credit(&client.take_output()), (0, 0, 0, 0));
+    assert_eq!(client.retained_response_bytes(), 0);
+    complete_unrelated_call(&mut client, &mut peer, b);
+}
+
+fn expired_ignored_body(unary: bool, prefix: usize) {
+    let (mut client, mut peer, a, b, frame) = ignored_prefix(unary, true, prefix);
+
+    assert_eq!(client.next_deadline(), Some(Duration::from_secs(1)));
+    client.tick(Duration::from_secs(1));
+    let output = client.take_output();
+    // Deadline termination resets before discarding: only connection credit remains.
+    assert_eq!(credit(&output), (prefix, 1, 0, 0), "unary={unary}");
+    assert_eq!(resets_for(&output, a), 1);
+    assert!(client.next_deadline().is_none());
+
+    let status = ended_status(&mut client, a, unary);
+    assert_eq!(status.code, Code::DeadlineExceeded);
+    assert_eq!(status.message, "deadline exceeded");
+    client.cancel(a);
+    assert_eq!(credit(&client.take_output()), (0, 0, 0, 0));
+
+    for piece in frame[9 + prefix..].chunks(1) {
+        client.recv(piece).unwrap();
+    }
+    assert_eq!(credit(&client.take_output()), (WINDOW - prefix, 1, 0, 0));
+    assert!(client.failure().is_none());
+    assert_eq!(client.retained_response_bytes(), 0);
+    complete_unrelated_call(&mut client, &mut peer, b);
+}
+
+fn failed_over_ignored_body(unary: bool, prefix: usize) {
+    let (mut client, _peer, a, b, _frame) = ignored_prefix(unary, false, prefix);
+
+    let known = Status::new(Code::Unavailable, "transport retired");
+    client.fail_all(known.clone());
+    let output = client.take_output();
+    assert_eq!(credit(&output), (prefix, 1, prefix, 1), "unary={unary}");
+    assert_eq!(resets_for(&output, a), 0);
+    client.fail_all(known);
+    assert_eq!(credit(&client.take_output()), (0, 0, 0, 0));
+
+    // Both calls learn the failure. Do not resume the retired transport's unread tail.
+    for (id, unary) in [(a, unary), (b, true)] {
+        let status = ended_status(&mut client, id, unary);
+        assert_eq!(status.code, Code::Unavailable);
+        assert_eq!(status.message, "transport retired");
+    }
+}
+
+/// Consume one error outcome, release streaming metadata, and check cleanup.
+#[track_caller]
+fn ended_status(client: &mut Client, id: CallId, unary: bool) -> Status {
+    let status = if unary {
+        client.take_response(id).unwrap().unwrap_err()
+    } else {
+        match client.try_next(id) {
+            Some(Next::Done(Err(status))) => status,
+            next => panic!("call {id}: expected an error outcome, got {next:?}"),
+        }
+    };
+    assert!(
+        client.take_response(id).is_none(),
+        "call {id}: duplicate result"
+    );
+    assert!(
+        client.try_next(id).is_none(),
+        "call {id}: duplicate outcome"
+    );
+    if !unary {
+        client.take_metadata(id);
+    }
+    assert_eq!(client.retained_response_bytes(), 0);
+    assert!(client.failure().is_none());
+    status
+}
+
+#[test]
+fn fragmented_ignored_body_preserves_terminal_status_and_metadata() {
+    // Explicit error trailers override the fallback; missing status keeps it.
+    // Success trailers cannot rehabilitate an invalid content type.
+    for unary in [true, false] {
+        for chunk in [1, 40] {
+            for (initial, code, message) in [
+                (
+                    html_error_headers(),
+                    Code::Unavailable,
+                    "unexpected HTTP status 503",
+                ),
+                (
+                    vec![
+                        field(":status", "200"),
+                        field("content-type", "application/grpc-web"),
+                    ],
+                    Code::Internal,
+                    "invalid response content-type",
+                ),
+                (
+                    vec![field(":status", "200")],
+                    Code::Internal,
+                    "invalid response content-type",
+                ),
+            ] {
+                ignored_trailers_decide_status(unary, chunk, initial.clone(), code, message);
+                ignored_terminal_data_decides_status(unary, chunk, initial.clone(), code, message);
+                ignored_padded_frame_credits_padding_separately(
+                    unary, chunk, initial, code, message,
+                );
+            }
+        }
+    }
+}
+
+/// Check an unpadded frame immediately before and after its final byte.
+fn ignored_body_opened(
+    unary: bool,
+    initial: Vec<HeaderField>,
+    body: usize,
+    end_stream: bool,
+    chunk: usize,
+) -> (Client, Connection, CallId) {
+    let (mut client, mut peer) = setup(ClientConfig::default());
+    let a = open(&mut client, &mut peer, unary);
+    ignored_headers(&mut client, &mut peer, a, initial);
+
+    peer.send_data(a, vec![b'x'; body], end_stream).unwrap();
+    let wire = peer.take_output();
+    assert_eq!(data_frames(&wire), [(a, body)]);
+
+    let last = wire.len() - 1;
+    for piece in wire[..last].chunks(chunk) {
+        client.recv(piece).unwrap();
+    }
+    assert!(
+        client.is_pending(a),
+        "unary={unary} end_stream={end_stream}"
+    );
+    assert!(client.take_response(a).is_none());
+    assert!(client.try_next(a).is_none());
+    assert_eq!(client.retained_response_bytes(), 0);
+    assert_eq!(credit(&client.take_output()), (0, 0, 0, 0));
+    client.recv(&wire[last..]).unwrap();
+
+    // END_STREAM closes the receive half, so only the connection is owed credit.
+    let frames = usize::from(body != 0);
+    let expected = if end_stream {
+        (body, frames, 0, 0)
+    } else {
+        (body, frames, body, frames)
+    };
+    assert_eq!(
+        credit(&client.take_output()),
+        expected,
+        "body={body} end_stream={end_stream} chunk={chunk} unary={unary}",
+    );
+    (client, peer, a)
+}
+
+fn ignored_trailers_decide_status(
+    unary: bool,
+    chunk: usize,
+    initial: Vec<HeaderField>,
+    code: Code,
+    message: &str,
+) {
+    let shapes = [
+        (
+            "error trailers override the fallback",
+            vec![
+                field("grpc-status", "7"),
+                field("grpc-message", "denied%20here"),
+                field("x-detail", "kept"),
+            ],
+            Code::PermissionDenied,
+            "denied here",
+        ),
+        (
+            "statusless trailers keep the fallback",
+            vec![field("x-detail", "kept")],
+            code,
+            message,
+        ),
+        (
+            "success trailers stay rejected",
+            vec![field("grpc-status", "0"), field("x-detail", "kept")],
+            Code::Internal,
+            "invalid response content-type",
+        ),
+    ];
+    for (shape, trailers, expected_code, expected_message) in shapes {
+        let (mut client, mut peer, a) =
+            ignored_body_opened(unary, initial.clone(), 64, false, chunk);
+        peer.send_headers(a, trailers, true).unwrap();
+        deliver(&mut client, &mut peer);
+        assert_eq!(credit(&client.take_output()), (0, 0, 0, 0), "{shape}");
+        let status = ended_status(&mut client, a, unary);
+        assert_eq!(
+            (status.code, status.message.as_str()),
+            (expected_code, expected_message),
+            "{shape} unary={unary} chunk={chunk}",
+        );
+        assert_eq!(status.metadata.get("x-detail"), Some("kept"));
+    }
+}
+
+/// Terminal body, empty DATA, and padding-only DATA all keep the fallback.
+fn ignored_terminal_data_decides_status(
+    unary: bool,
+    chunk: usize,
+    initial: Vec<HeaderField>,
+    code: Code,
+    message: &str,
+) {
+    for body in [64, 0] {
+        let (mut client, _peer, a) = ignored_body_opened(unary, initial.clone(), body, true, chunk);
+        let status = ended_status(&mut client, a, unary);
+        assert_eq!(
+            (status.code, status.message.as_str()),
+            (code, message),
+            "terminal DATA body={body} unary={unary} chunk={chunk}",
+        );
+        assert!(status.metadata.is_empty());
+    }
+
+    for pad in [2, 255] {
+        let (mut client, _peer, a) = ignored_raw_body(unary, initial.clone(), 0, pad, true, chunk);
+        assert_eq!(credit(&client.take_output()), (1 + pad, 1, 0, 0));
+        let status = ended_status(&mut client, a, unary);
+        assert_eq!(
+            (status.code, status.message.as_str()),
+            (code, message),
+            "padding-only pad={pad} unary={unary} chunk={chunk}",
+        );
+        assert!(status.metadata.is_empty());
+    }
+}
+
+/// Padding is credited at admission, body at completion: two updates per window.
+fn ignored_padded_frame_credits_padding_separately(
+    unary: bool,
+    chunk: usize,
+    initial: Vec<HeaderField>,
+    code: Code,
+    message: &str,
+) {
+    for pad in [7, 255] {
+        let (mut client, mut peer, a) =
+            ignored_raw_body(unary, initial.clone(), 64, pad, false, chunk);
+        assert_eq!(
+            credit(&client.take_output()),
+            (1 + pad + 64, 2, 1 + pad + 64, 2),
+            "padded pad={pad} unary={unary} chunk={chunk}",
+        );
+        peer.send_headers(a, vec![field("x-detail", "kept")], true)
+            .unwrap();
+        deliver(&mut client, &mut peer);
+        assert_eq!(credit(&client.take_output()), (0, 0, 0, 0));
+        let status = ended_status(&mut client, a, unary);
+        assert_eq!((status.code, status.message.as_str()), (code, message));
+        assert_eq!(status.metadata.get("x-detail"), Some("kept"));
+    }
+}
+
+/// The peer serializer never pads, so inject a padded frame directly.
+fn ignored_raw_body(
+    unary: bool,
+    initial: Vec<HeaderField>,
+    body: usize,
+    pad: usize,
+    end_stream: bool,
+    chunk: usize,
+) -> (Client, Connection, CallId) {
+    let (mut client, mut peer) = setup(ClientConfig::default());
+    let a = open(&mut client, &mut peer, unary);
+    ignored_headers(&mut client, &mut peer, a, initial);
+
+    let frame = raw_data(a, body, pad, end_stream);
+    for piece in frame.chunks(chunk) {
+        client.recv(piece).unwrap();
+    }
+    assert_eq!(client.retained_response_bytes(), 0);
+    (client, peer, a)
+}
+
+/// Padded DATA: header, pad length, body, then padding.
+fn raw_data(id: CallId, body: usize, pad: usize, end_stream: bool) -> Vec<u8> {
+    assert!(pad <= 255, "the pad-length byte holds at most 255");
+    let len = 1 + pad + body;
+    let mut frame = vec![
+        (len >> 16) as u8,
+        (len >> 8) as u8,
+        len as u8,
+        DATA_FRAME,
+        if end_stream { 0x09 } else { 0x08 },
+    ];
+    frame.extend_from_slice(&id.to_be_bytes());
+    frame.push(pad as u8);
+    frame.extend(std::iter::repeat_n(b'x', body));
+    frame.extend(std::iter::repeat_n(0x20, pad));
+    frame
 }

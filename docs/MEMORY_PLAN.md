@@ -172,23 +172,25 @@ failure is reported without panic where the library controls the allocation/erro
 
 The [incremental HTTP/2 RX implementation plan](INCREMENTAL_HTTP2_RX_PLAN.md) defines the pull API,
 input leases, DATA credit ledger, staged SETTINGS, bounded header ownership, and validation gates.
-It is proposed, not implemented. Incremental frame/DATA delivery and incremental HPACK are separate
-stages so their memory savings and remaining allocations can be measured independently.
+Stages 1 (frames, borrowed DATA, gRPC delivery) and 2 (incremental HPACK) are implemented in the
+working tree and gated; the plan's validation record has the measurements and the open items. The
+items below are marked accordingly.
 
 Primary files: `protolink-http2/src/{lib,hpack}.rs`, `protolink-grpc/src/{inbound,lpm}.rs`.
 
-- [ ] Replace whole-frame accumulation with a resumable frame parser: fixed header state,
+- [x] Replace whole-frame accumulation with a resumable frame parser: fixed header state,
   bounded control/header scratch, and DATA delivered in borrowed chunks. Report consumed input
   and backpressure so caller-supplied batches are never copied wholesale into an internal `Vec`.
-- [ ] Skip unknown-frame payloads and padding incrementally. Process large SETTINGS sequences
+- [x] Skip unknown-frame payloads and padding incrementally. Process large SETTINGS sequences
   without retaining the entire frame. Validate lengths, stream state, and flow-control rules
   at the earliest valid point, preserving protocol error ordering.
-- [ ] Replace the unbounded owned DATA event queue with direct chunk consumption or a bounded
+- [x] Replace the unbounded owned DATA event queue with direct chunk consumption or a bounded
   event interface. Do not hold a borrowed input slice across an unrelated async I/O operation.
-- [ ] Feed chunks directly into one bounded partial-message buffer per call. Deliver/decode
+  (gRPC consumes each read in full before returning; the owned collector is explicit and unused.)
+- [x] Feed chunks directly into one bounded partial-message buffer per call. Deliver/decode
   uncompressed messages from that storage where lifetimes permit; transfer ownership when a
   result must outlive the parser. Copy only at a genuine lifetime boundary.
-- [ ] Make HPACK decoding incremental across HEADERS/CONTINUATION chunks, or retain a strictly
+- [x] Make HPACK decoding incremental across HEADERS/CONTINUATION chunks, or retain a strictly
   bounded encoded block as an intermediate step. Final target: avoid simultaneous full encoded
   and decoded header blocks. Parse protocol fields directly; retain application metadata once.
 - [ ] Reserve storage against granted receive credit and only release credit when budget permits.

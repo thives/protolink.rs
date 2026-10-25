@@ -15,5 +15,8 @@ rust-version = "1.88"
 zerodds-http2 = { version = "1.0.0-rc.6", default-features = false, features = ["alloc"] }
 zerodds-hpack = { version = "1.0.0-rc.6", default-features = false, features = ["alloc"] }
 
+[dev-dependencies]
+protolink-alloc-track = { path = "../protolink-alloc-track" }
+
 [features]
 std = []

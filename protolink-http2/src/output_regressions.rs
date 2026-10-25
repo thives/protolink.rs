@@ -232,7 +232,7 @@ fn serialized_prefix_survives_recv_reset_and_goaway() {
     let id = c.open_stream(request_headers(), false).unwrap();
     c.send_data(id, b"request".to_vec(), true).unwrap();
     exchange(&mut c, &mut s);
-    assert_eq!(events(&mut s).len(), 2);
+    assert_eq!(events(&mut s).len(), 3);
     s.send_headers(id, vec![hf(":status", "200")], false)
         .unwrap();
     s.send_data(id, vec![5; 300], false).unwrap();

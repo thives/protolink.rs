@@ -297,11 +297,11 @@ fn informational_responses_final_headers_body_and_trailers() {
         .unwrap();
     exchange(&mut c, &mut s);
     let ev = events(&mut c);
-    assert_eq!(ev.len(), 5);
+    assert_eq!(ev.len(), 6);
     assert!(matches!(&ev[0], Event::Headers { headers, .. } if headers[0].value == "103"));
     assert!(matches!(&ev[1], Event::Headers { headers, .. } if headers[0].value == "100"));
     assert!(matches!(
-        &ev[4],
+        &ev[5],
         Event::Headers {
             end_stream: true,
             ..
@@ -409,8 +409,8 @@ fn established_connect_closes_through_data() {
     c.send_data(id, b"up".to_vec(), true).unwrap();
     s.send_data(id, b"down".to_vec(), true).unwrap();
     exchange(&mut c, &mut s);
-    assert_eq!(events(&mut c).len(), 1);
-    assert_eq!(events(&mut s).len(), 1);
+    assert_eq!(events(&mut c).len(), 2);
+    assert_eq!(events(&mut s).len(), 2);
     assert!(!c.has_stream(id));
     assert!(!s.has_stream(id));
 }
@@ -575,7 +575,7 @@ fn existing_streams_complete_after_graceful_shutdown() {
     assert!(!c.has_stream(id));
     assert!(events(&mut c).iter().any(|e| matches!(
         e,
-        Event::Data {
+        Event::DataEnd {
             end_stream: true,
             ..
         }

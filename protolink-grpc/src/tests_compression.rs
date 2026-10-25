@@ -870,7 +870,7 @@ fn request(path: &str, extra: &[(&str, &str)]) -> Vec<HeaderField> {
 }
 
 /// The events a raw HTTP/2 peer sees after sending `headers` and `body`.
-fn raw_call(server: Compression, headers: Vec<HeaderField>, body: &[u8]) -> Vec<Event> {
+fn raw_call(server: Compression, headers: Vec<HeaderField>, body: &[u8]) -> Vec<Event<'static>> {
     let mut server = Server::new(ServerConfig {
         compression: server,
         ..ServerConfig::default()
@@ -878,11 +878,11 @@ fn raw_call(server: Compression, headers: Vec<HeaderField>, body: &[u8]) -> Vec<
     send_raw(&mut server, &mut TestHandler::default(), headers, body)
 }
 
-fn response_data(events: &[Event]) -> Vec<u8> {
+fn response_data(events: &[Event<'_>]) -> Vec<u8> {
     events
         .iter()
         .filter_map(|e| match e {
-            Event::Data { data, .. } => Some(data.clone()),
+            Event::Data { data, .. } => Some(data.to_vec()),
             _ => None,
         })
         .flatten()

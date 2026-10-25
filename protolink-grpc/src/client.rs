@@ -4,7 +4,9 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::time::Duration;
 
-use protolink_http2::{Config, Connection, Error, ErrorCode, Event, FlowControl, HeaderField};
+use protolink_http2::{
+    Config, Connection, Error, ErrorCode, Event, FlowControl, HeaderField, Step,
+};
 
 use crate::compression::Compression;
 use crate::fields::{field, header};
@@ -199,6 +201,8 @@ impl ResponseBuffer {
         self.message_bytes.saturating_add(self.decoder.buffered())
     }
 
+    /// Buffer a chunk of a response body. Credit for a partial message waits for
+    /// [`finish_frame`](Self::finish_frame), as on the server.
     fn push(
         &mut self,
         conn: &mut Connection,
@@ -234,8 +238,24 @@ impl ResponseBuffer {
             self.message_bytes += message.bytes();
             self.messages.push_back(message);
         }
-        self.release_partial(conn, id);
         Ok(())
+    }
+
+    /// The DATA frame carrying the buffered bytes is complete: see
+    /// [`release_partial`](Self::release_partial).
+    fn finish_frame(&mut self, conn: &mut Connection, id: CallId) {
+        self.release_partial(conn, id);
+    }
+
+    /// Record the credit owed to a non-gRPC body this call will ignore. The
+    /// bytes are never decoded or retained (they do not enter `credited`, the
+    /// LPM decoder, or the retention budget); only the scalar delivered-byte
+    /// credit is held in `held`. [`finish_frame`](Self::finish_frame) returns
+    /// it once at frame completion, and the existing discard/termination
+    /// cleanup releases it once if the call ends earlier, so a fragmented
+    /// ignored body cannot multiply WINDOW_UPDATE output.
+    fn hold_ignored(&mut self, len: usize) {
+        self.held += len;
     }
 
     fn take_message(&mut self) -> Option<RetainedMessage> {
@@ -582,10 +602,7 @@ impl Client {
     /// On `Err` the connection is unusable and every in-flight call completes
     /// with `UNAVAILABLE`; write the pending output and close the transport.
     pub fn recv(&mut self, bytes: &[u8]) -> Result<(), Error> {
-        let result = self.conn.recv(bytes);
-        while let Some(event) = self.conn.poll_event() {
-            self.on_event(event);
-        }
+        let result = self.feed(bytes);
         // Handling the events can latch a failure too, such as a credit release
         // that does not fit. The input is not successful then.
         let result = match (result, self.conn.failure()) {
@@ -596,6 +613,19 @@ impl Client {
             self.fail_all(failure_status(error));
         }
         result
+    }
+
+    /// Hand each event of `input` to the calls as soon as it is produced. Body
+    /// bytes are borrowed from `input` and go straight to the call's decoder.
+    fn feed(&mut self, mut input: &[u8]) -> Result<(), Error> {
+        loop {
+            let Step { consumed, event } = self.conn.recv_step(input)?;
+            input = &input[consumed..];
+            let Some(event) = event else {
+                return Ok(());
+            };
+            self.on_event(event);
+        }
     }
 
     /// The connection's terminal failure, if it has one. Every call has then
@@ -802,7 +832,7 @@ impl Client {
         );
     }
 
-    fn on_event(&mut self, event: Event) {
+    fn on_event(&mut self, event: Event<'_>) {
         match event {
             Event::Headers {
                 stream_id,
@@ -884,11 +914,7 @@ impl Client {
                 call.trailers = trailers;
                 self.terminate(stream_id, result, Some(ErrorCode::NoError));
             }
-            Event::Data {
-                stream_id,
-                data,
-                end_stream,
-            } => {
+            Event::Data { stream_id, data } => {
                 let retained = self.retained_response_bytes();
                 let Some(call) = self.calls.get_mut(&stream_id) else {
                     self.conn.release_capacity(stream_id, data.len());
@@ -908,14 +934,11 @@ impl Client {
                     return;
                 }
                 if !call.valid_content_type {
-                    self.conn.release_capacity(stream_id, data.len());
-                    if end_stream {
-                        let status = call
-                            .fallback
-                            .clone()
-                            .unwrap_or_else(|| Status::internal("invalid response content-type"));
-                        self.terminate(stream_id, Err(status), Some(ErrorCode::ProtocolError));
-                    }
+                    // Hold the ignored bytes' credit; the frame's completion
+                    // returns it once, so a fragmented non-gRPC body does not
+                    // multiply WINDOW_UPDATE output. The bytes are never decoded
+                    // or retained as a message.
+                    call.inbound.hold_ignored(data.len());
                     return;
                 }
                 let limit = self
@@ -931,7 +954,46 @@ impl Client {
                         )),
                         Some(ErrorCode::Cancel),
                     );
-                } else if end_stream {
+                }
+            }
+            Event::DataEnd {
+                stream_id,
+                end_stream,
+            } => {
+                // The frame is complete. Empty frames reach here too, so the
+                // checks that a body chunk makes are repeated for them.
+                let Some(call) = self.calls.get_mut(&stream_id) else {
+                    return;
+                };
+                if call.status.is_some() {
+                    return;
+                }
+                if !call.headers_received {
+                    self.terminate(
+                        stream_id,
+                        Err(Status::internal("DATA before response headers")),
+                        Some(ErrorCode::ProtocolError),
+                    );
+                    return;
+                }
+                if !call.valid_content_type {
+                    // Reconcile the credit held for this call's ignored bytes once
+                    // per frame, before deciding terminal behaviour. A fallback
+                    // stays provisional until the terminal DATA/trailers; the
+                    // held delivered bytes resolve through the frame-finish
+                    // credit path.
+                    call.inbound.finish_frame(&mut self.conn, stream_id);
+                    if end_stream {
+                        let status = call
+                            .fallback
+                            .clone()
+                            .unwrap_or_else(|| Status::internal("invalid response content-type"));
+                        self.terminate(stream_id, Err(status), Some(ErrorCode::ProtocolError));
+                    }
+                    return;
+                }
+                call.inbound.finish_frame(&mut self.conn, stream_id);
+                if end_stream {
                     let status = call
                         .fallback
                         .clone()

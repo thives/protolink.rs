@@ -267,6 +267,58 @@ const TABLE: [(u32, u8); 257] = [
     (0x3fffffff, 30),
 ];
 
+/// Decoding state of one Huffman-coded string, resumable across fragments: the
+/// bits of the code being matched so far.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Bits {
+    code: u32,
+    bits: u8,
+}
+
+impl Bits {
+    /// Decode one octet of the string, appending its symbols to `out`. Each symbol
+    /// uses one of the `room` octets, which is checked before the symbol is kept.
+    pub(crate) fn push(
+        &mut self,
+        byte: u8,
+        out: &mut Vec<u8>,
+        room: &mut usize,
+    ) -> Result<(), DecodeError> {
+        for shift in (0..8).rev() {
+            self.code = (self.code << 1) | u32::from((byte >> shift) & 1);
+            self.bits += 1;
+            if let Some(symbol) = TABLE
+                .iter()
+                .position(|entry| *entry == (self.code, self.bits))
+            {
+                if symbol == 256 {
+                    return Err(DecodeError::Compression);
+                }
+                if *room == 0 {
+                    return Err(DecodeError::Limit);
+                }
+                *room -= 1;
+                out.push(symbol as u8);
+                *self = Self::default();
+            } else if self.bits == 30 {
+                return Err(DecodeError::Compression);
+            }
+        }
+        Ok(())
+    }
+
+    /// The string has ended. What is left must be a prefix of EOS of at most
+    /// seven bits, so the padding is never mistaken for a symbol.
+    pub(crate) fn finish(&self) -> Result<(), DecodeError> {
+        if self.bits > 7 || self.code != (1u32 << self.bits) - 1 {
+            return Err(DecodeError::Compression);
+        }
+        Ok(())
+    }
+}
+
+/// One-shot reference decoder, kept to check the resumable one.
+#[cfg(test)]
 pub(crate) fn decode_bounded(bytes: &[u8], limit: usize) -> Result<Vec<u8>, DecodeError> {
     let mut out = Vec::new();
     let mut code = 0u32;

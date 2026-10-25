@@ -6,9 +6,11 @@ use alloc::vec::Vec;
 
 use super::*;
 use crate::compression::{Codec, Compression};
+use crate::fields::field as hf;
 use crate::lifecycle::{CallEvent, Lifecycle};
 use crate::test_support::drain;
 use crate::tests_compression::{ACCEPT_RLE, RLE};
+use protolink_http2::{Connection, Event, HeaderField};
 
 const PATH: &str = "/test.Life/Echo";
 const LIMIT: usize = 1000;
@@ -322,4 +324,261 @@ fn output_limit_during_finish_cancels_calls_and_keeps_no_draining() {
     assert!(peers.gateway.is_closed());
     assert!(peers.gateway.pending_output().len() <= limit);
     assert!(!peers.gateway.has_call(id));
+}
+
+/// Four-byte control payloads for one frame type and stream, in wire order.
+fn control_values(output: &[u8], kind: u8, stream: CallId) -> Vec<u32> {
+    let mut out: Vec<u32> = Vec::new();
+    let mut rest = output;
+    while !rest.is_empty() {
+        assert!(rest.len() >= 9, "truncated frame header");
+        let len = (usize::from(rest[0]) << 16) | (usize::from(rest[1]) << 8) | usize::from(rest[2]);
+        assert!(rest.len() >= 9 + len, "truncated frame payload");
+        let id = u32::from_be_bytes([rest[5] & 0x7f, rest[6], rest[7], rest[8]]);
+        if rest[3] == kind {
+            assert_eq!(len, 4, "control frame payload length");
+            if id == stream {
+                out.push(u32::from_be_bytes(rest[9..13].try_into().unwrap()));
+            }
+        }
+        rest = &rest[9 + len..];
+    }
+    out
+}
+
+fn updates(output: &[u8], stream: CallId) -> Vec<u32> {
+    control_values(output, 0x8, stream)
+        .into_iter()
+        .map(|value| value & 0x7fff_ffff)
+        .collect()
+}
+
+fn resets(output: &[u8], stream: CallId) -> usize {
+    control_values(output, 0x3, stream).len()
+}
+
+/// A request from a raw HTTP/2 peer for a call this lifecycle serves.
+fn request() -> Vec<HeaderField> {
+    vec![
+        hf(":method", "POST"),
+        hf(":scheme", "http"),
+        hf(":path", PATH),
+        hf(":authority", "localhost"),
+        hf("content-type", "application/grpc"),
+    ]
+}
+
+/// Only [`PATH`] is served.
+fn resolve(path: &str) -> Option<()> {
+    (path == PATH).then_some(())
+}
+
+#[test]
+fn cancelled_request_tail_does_not_cancel_other_lifecycle_calls() {
+    // A raw peer lets us stop mid-frame. Per-octet credit would exhaust 1 KiB
+    // of blocked output and prevent the surviving call from completing.
+    const OUTPUT_LIMIT: usize = 1024;
+    let mut peer = Connection::client(protolink_http2::Config::default());
+    let mut gateway = Lifecycle::<()>::new(ServerConfig {
+        http2: protolink_http2::Config {
+            max_pending_output_bytes: OUTPUT_LIMIT,
+            ..ServerConfig::default().http2
+        },
+        ..ServerConfig::default()
+    });
+    gateway.recv(&peer.take_output(), resolve).unwrap();
+    // The lifecycle's handshake (SETTINGS, its connection-window widening and
+    // the ACK of the peer's SETTINGS) goes to the peer, so every later phase
+    // measures only what that phase owes.
+    peer.recv(&gateway.take_output()).unwrap();
+
+    let a = peer.open_stream(request(), false).unwrap();
+    let b = peer.open_stream(request(), false).unwrap();
+    gateway.recv(&peer.take_output(), resolve).unwrap();
+    peer.recv(&gateway.take_output()).unwrap();
+    for (label, expected) in [("A", a), ("B", b)] {
+        let Some(CallEvent::Started { id, .. }) = gateway.poll_event() else {
+            panic!("{label} did not start");
+        };
+        assert_eq!(id, expected, "{label} is the call the peer opened");
+    }
+    assert!(gateway.poll_event().is_none(), "both calls are active");
+
+    // One DATA frame on A, of which only the first octet is delivered: no
+    // complete request message can be decoded, so nothing handler-visible can
+    // happen early.
+    let body = crate::lpm::encode(&vec![0x21; 295]).unwrap();
+    let frame_size = body.len();
+    peer.send_data(a, body, false).unwrap();
+    let wire = peer.take_output();
+    assert_eq!(wire.len(), 9 + frame_size, "exactly one DATA frame");
+
+    gateway.recv(&wire[..10], resolve).unwrap();
+    assert!(gateway.pending_output().is_empty(), "no mid-frame output");
+    assert_eq!(
+        gateway.buffered_request_bytes(a),
+        Some(1),
+        "one octet is buffered"
+    );
+    assert_eq!(
+        gateway.request_count(a),
+        0,
+        "no request message is complete"
+    );
+    // The handler ends A while its request frame is still on the wire.
+    gateway.finish(a, Ok(()), ResponseMetadata::default());
+    let out = gateway.pending_output();
+    assert!(!gateway.has_call(a), "A is over");
+    assert!(gateway.has_call(b), "B is untouched");
+    assert_eq!(resets(out, a), 1, "A's request side ends with one reset");
+    assert_eq!(resets(out, b), 0, "B is never reset");
+    assert_eq!(
+        updates(out, 0),
+        vec![1u32],
+        "the delivered octet returns once"
+    );
+    assert!(
+        updates(out, a).is_empty(),
+        "its stream is gone, so only the connection owes it"
+    );
+    let blocked = out.len();
+    assert!(blocked > 0 && blocked <= OUTPUT_LIMIT);
+    assert!(
+        gateway.poll_event().is_none(),
+        "finishing a call is not a cancellation"
+    );
+    gateway.finish(a, Ok(()), ResponseMetadata::default());
+    assert_eq!(gateway.pending_output().len(), blocked, "A ends only once");
+
+    // Leave A's response/reset queued throughout the bytewise tail. No tail
+    // credit is owed until the final frame byte arrives.
+    for piece in wire[10..wire.len() - 1].chunks(1) {
+        gateway.recv(piece, resolve).unwrap();
+        assert_eq!(gateway.pending_output().len(), blocked, "tail incomplete");
+    }
+    gateway.recv(&wire[wire.len() - 1..], resolve).unwrap();
+    let out = gateway.take_output();
+    assert_eq!(out.len(), blocked + 13, "one tail WINDOW_UPDATE");
+    assert!(out.len() <= OUTPUT_LIMIT, "bounded blocked output");
+    assert_eq!(
+        updates(&out, 0),
+        vec![1u32, (frame_size - 1) as u32],
+        "prefix and tail each return connection credit exactly once"
+    );
+    assert!(
+        updates(&out, a).is_empty(),
+        "closed A gets no stream credit"
+    );
+    assert!(updates(&out, b).is_empty(), "B owes no credit yet");
+    assert_eq!(resets(&out, a), 1, "no duplicate reset during the tail");
+    assert_eq!(resets(&out, b), 0, "B is never reset");
+    assert!(!gateway.has_call(a));
+    assert!(gateway.has_call(b));
+    assert!(
+        gateway.poll_event().is_none(),
+        "discarded bytes report nothing"
+    );
+    assert!(
+        gateway.failure().is_none(),
+        "a mid-frame cancellation is not a connection failure"
+    );
+    peer.recv(&out).unwrap();
+
+    // B is a real call: its request arrives without ending the stream, the handler
+    // takes it, and a full response goes out and arrives intact. That is only
+    // meaningful if cancelling A never disturbed this stream.
+    peer.send_data(b, lpm::encode(b"ping").unwrap(), false)
+        .unwrap();
+    gateway.recv(&peer.take_output(), resolve).unwrap();
+    assert!(
+        updates(&gateway.take_output(), 0).is_empty(),
+        "a complete message is withheld until the handler takes it"
+    );
+    assert_eq!(
+        gateway.take_request(b),
+        Ok(Some(b"ping".to_vec())),
+        "B still takes its request message"
+    );
+    let out = gateway.take_output();
+    assert_eq!(
+        updates(&out, 0),
+        vec![9u32],
+        "the taken message is credited once"
+    );
+    assert_eq!(
+        updates(&out, b),
+        vec![9u32],
+        "and its stream can still receive"
+    );
+    peer.recv(&out).unwrap();
+
+    // The peer ends B's request side, so the handler can close the call normally
+    // rather than needing a reset the way A did.
+    peer.send_data(b, Vec::new(), true).unwrap();
+    gateway.recv(&peer.take_output(), resolve).unwrap();
+    assert!(gateway.is_half_closed(b), "B's request side has ended");
+    assert!(
+        updates(&gateway.take_output(), 0).is_empty(),
+        "an empty frame owes nothing"
+    );
+
+    assert!(
+        gateway.send_headers(b, Metadata::new()),
+        "B can still send headers"
+    );
+    gateway.send_message(b, b"response").unwrap();
+    gateway.finish(b, Ok(()), ResponseMetadata::default());
+    assert!(
+        gateway.failure().is_none(),
+        "the connection stayed usable throughout"
+    );
+
+    // B's small response fits the peer's window, so one transfer delivers it.
+    peer.recv(&gateway.take_output()).unwrap();
+    assert!(!gateway.has_output());
+    let mut payloads = Vec::new();
+    let mut trailers = Vec::new();
+    let mut resets = Vec::new();
+    let mut ended = Vec::new();
+    while let Some(event) = peer.poll_event() {
+        match event {
+            Event::Data { stream_id, data } if stream_id == b => payloads.push(data.to_vec()),
+            Event::Headers {
+                stream_id,
+                headers,
+                end_stream: true,
+            } => {
+                ended.push(stream_id);
+                assert_eq!(crate::fields::header(&headers, "grpc-status"), Some("0"));
+                if stream_id == b {
+                    trailers.push(headers);
+                }
+            }
+            Event::DataEnd {
+                stream_id,
+                end_stream: true,
+            } => ended.push(stream_id),
+            Event::Reset { stream_id, .. } => resets.push(stream_id),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        payloads,
+        [lpm::encode(b"response").unwrap()],
+        "B's message arrives framed and intact"
+    );
+    assert!(!peer.has_stream(b), "B closed cleanly on the peer as well");
+    assert_eq!(resets, [a], "only A was reset, exactly once");
+    assert_eq!(ended, [a, b], "both calls ended exactly once");
+    assert_eq!(
+        trailers.len(),
+        1,
+        "B received exactly one set of success trailers"
+    );
+    assert!(
+        gateway.draining().is_empty(),
+        "B's output was fully delivered"
+    );
+    assert_eq!(gateway.active_calls(), 0, "no call is left behind");
+    assert!(gateway.poll_event().is_none(), "no spurious cancellation");
 }

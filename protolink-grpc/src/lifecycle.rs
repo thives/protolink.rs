@@ -35,7 +35,7 @@ use alloc::vec::Vec;
 use core::mem;
 use core::time::Duration;
 
-use protolink_http2::{Connection, Error, ErrorCode, Event, HeaderField, StreamId};
+use protolink_http2::{Connection, Error, ErrorCode, Event, HeaderField, Step, StreamId};
 
 use crate::compression::{Codec, Compression};
 use crate::fields::{field, header};
@@ -163,10 +163,7 @@ impl<K: Copy> Lifecycle<K> {
         bytes: &[u8],
         mut resolve: impl FnMut(&str) -> Option<K>,
     ) -> Result<(), Error> {
-        let result = self.conn.recv(bytes);
-        while let Some(event) = self.conn.poll_event() {
-            self.on_event(event, &mut resolve);
-        }
+        let result = self.feed(bytes, &mut resolve);
         // Handling the events can latch a failure too, such as a credit release
         // that does not fit. The input is not successful then.
         let result = match (result, self.conn.failure()) {
@@ -177,6 +174,23 @@ impl<K: Copy> Lifecycle<K> {
             self.cancel_all();
         }
         result
+    }
+
+    /// Hand each event of `input` to the calls as soon as it is produced. Body
+    /// bytes are borrowed from `input` and go straight to the call's decoder.
+    fn feed(
+        &mut self,
+        mut input: &[u8],
+        resolve: &mut impl FnMut(&str) -> Option<K>,
+    ) -> Result<(), Error> {
+        loop {
+            let Step { consumed, event } = self.conn.recv_step(input)?;
+            input = &input[consumed..];
+            let Some(event) = event else {
+                return Ok(());
+            };
+            self.on_event(event, resolve);
+        }
     }
 
     /// The connection's terminal failure, if it has one: a protocol error or
@@ -551,25 +565,29 @@ impl<K: Copy> Lifecycle<K> {
         self.conn.is_closed()
     }
 
-    fn on_event(&mut self, event: Event, resolve: &mut impl FnMut(&str) -> Option<K>) {
+    fn on_event(&mut self, event: Event<'_>, resolve: &mut impl FnMut(&str) -> Option<K>) {
         match event {
             Event::Headers {
                 stream_id,
                 headers,
                 end_stream,
             } => self.on_headers(stream_id, headers, end_stream, resolve),
-            Event::Data {
-                stream_id,
-                data,
-                end_stream,
-            } => {
+            Event::Data { stream_id, data } => {
                 let Some(call) = self.calls.get_mut(&stream_id) else {
                     // Finished call: nobody will consume this.
                     self.conn.release_capacity(stream_id, data.len());
                     return;
                 };
-                call.inbound.push(&mut self.conn, stream_id, &data);
-                call.half_closed |= end_stream;
+                call.inbound.push(&data);
+            }
+            Event::DataEnd {
+                stream_id,
+                end_stream,
+            } => {
+                if let Some(call) = self.calls.get_mut(&stream_id) {
+                    call.inbound.finish_frame(&mut self.conn, stream_id);
+                    call.half_closed |= end_stream;
+                }
             }
             Event::Reset { stream_id, .. } => {
                 // Locally deferred resets also produce this event, before

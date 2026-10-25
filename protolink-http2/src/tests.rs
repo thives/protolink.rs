@@ -46,7 +46,7 @@ fn exchange(c: &mut Connection, s: &mut Connection) {
     }
 }
 
-fn events(c: &mut Connection) -> Vec<Event> {
+fn events(c: &mut Connection) -> Vec<Event<'static>> {
     core::iter::from_fn(|| c.poll_event()).collect()
 }
 
@@ -169,7 +169,7 @@ fn unary_round_trip() {
     exchange(&mut c, &mut s);
 
     let ev = events(&mut s);
-    assert_eq!(ev.len(), 2, "{ev:?}");
+    assert_eq!(ev.len(), 3, "{ev:?}");
     match &ev[0] {
         Event::Headers {
             stream_id,
@@ -190,7 +190,13 @@ fn unary_round_trip() {
         ev[1],
         Event::Data {
             stream_id: 1,
-            data: b"hello".to_vec(),
+            data: b"hello".to_vec().into(),
+        }
+    );
+    assert_eq!(
+        ev[2],
+        Event::DataEnd {
+            stream_id: 1,
             end_stream: true
         }
     );
@@ -204,9 +210,9 @@ fn unary_round_trip() {
     exchange(&mut c, &mut s);
 
     let ev = events(&mut c);
-    assert_eq!(ev.len(), 3, "{ev:?}");
+    assert_eq!(ev.len(), 4, "{ev:?}");
     assert!(
-        matches!(&ev[2], Event::Headers { end_stream: true, headers, .. } if headers[0].value == "0")
+        matches!(&ev[3], Event::Headers { end_stream: true, headers, .. } if headers[0].value == "0")
     );
     assert_eq!(c.stream_count(), 0);
 }
@@ -219,7 +225,14 @@ fn byte_by_byte_delivery() {
     c.send_data(id, vec![7; 300], true).unwrap();
     pump(&mut c, &mut s, 1).unwrap();
     let ev = events(&mut s);
-    assert!(matches!(&ev[1], Event::Data { data, end_stream: true, .. } if data.len() == 300));
+    assert_eq!(data_len(&ev, 1), 300);
+    assert!(matches!(
+        ev.last(),
+        Some(Event::DataEnd {
+            stream_id: 1,
+            end_stream: true
+        })
+    ));
 }
 
 #[test]
@@ -321,18 +334,18 @@ fn server_rejects_unknown_frame_before_settings() {
 #[test]
 fn unknown_frame_before_settings_is_rejected_when_fragmented() {
     let mut c = Connection::client(Config::default());
-    // An incomplete header, then an incomplete payload, are not errors yet.
+    // An incomplete header is not an error yet. The envelope is judged as soon as
+    // its nine octets are in, before the payload arrives.
     c.recv(&UNKNOWN_FRAME[..4]).unwrap();
-    c.recv(&UNKNOWN_FRAME[4..10]).unwrap();
     assert!(!c.is_closed());
-    assert_protocol_error(c.recv(&UNKNOWN_FRAME[10..]));
+    assert_protocol_error(c.recv(&UNKNOWN_FRAME[4..10]));
 
     let (mut s, preface) = server_after_preface();
     s.recv(&preface).unwrap();
-    for piece in UNKNOWN_FRAME[..UNKNOWN_FRAME.len() - 1].chunks(3) {
+    for piece in UNKNOWN_FRAME[..8].chunks(3) {
         s.recv(piece).unwrap();
     }
-    assert_protocol_error(s.recv(&UNKNOWN_FRAME[UNKNOWN_FRAME.len() - 1..]));
+    assert_protocol_error(s.recv(&UNKNOWN_FRAME[8..9]));
 }
 
 #[test]
@@ -459,7 +472,7 @@ fn manual_flow_control_waits_for_release() {
         if ev.iter().any(|e| {
             matches!(
                 e,
-                Event::Data {
+                Event::DataEnd {
                     end_stream: true,
                     ..
                 }

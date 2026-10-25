@@ -1,6 +1,9 @@
 # Incremental HTTP/2 receive implementation plan
 
-Status: proposed; none of the parser/API changes below are implemented.
+Status: implemented in the working tree, not committed. Stage 1 (incremental frames, borrowed
+DATA, direct gRPC delivery) and stage 2 (incremental HPACK) are in place and gated. The items
+still open, and the choices that differ from the text below, are listed under
+[Deviations and open items](#deviations-and-open-items). The validation record is at the end.
 Parent: [memory footprint plan](MEMORY_PLAN.md), Milestone 2.
 
 ## Objective
@@ -22,6 +25,9 @@ Deliver two separately reported stages:
    contracts are stable. Do not claim the first stage eliminates all header-sized allocations.
 
 ## Current receive path and change scope
+
+This section describes the tree before the change (commit `6ffb1a6`), which is the baseline for
+the measurements below.
 
 Rechecked on-disk sources:
 
@@ -214,90 +220,93 @@ streaming messages, and never manufacture END_STREAM or successful trailers.
 
 ## Implementation milestones and gates
 
+[x] marks an item that is implemented and gated by the tests named in the validation record.
+[ ] marks an item that is open or was replaced; the deviations section gives the reason.
+
 ### 0. Characterize current behavior and storage
 
-- [ ] Add source-to-consumer ownership/credit diagrams and table-driven frame tests. Record
-  equivalent semantic results under complete, bytewise, and randomized slicing.
-- [ ] Baseline HTTP/2-only and gRPC client/server peak/live allocations for a 16 KiB DATA frame,
-  many frames in one supplied slice, padding, unknown frames, SETTINGS, and continued headers.
-- [ ] Reuse [`protolink-alloc-track`](../protolink-alloc-track/src/lib.rs) and existing HTTP/2/gRPC
-  allocation test binaries. Its current tracker holds 16 live blocks: split scenarios or extend
-  test-only capacity for multi-stream tests; never ignore tracker overflow. Distinguish requested
-  bytes from allocator metadata/realloc overlap. Measure inline parser/future sizes separately.
+- [x] Differential oracle: `protolink-http2/tests/rx_oracle.rs` runs 40 scenarios (valid, padded,
+  CONTINUATION, SETTINGS, GOAWAY, manual flow control, and each protocol error) through the public
+  API under 9 chunkings. Events, results and output must not depend on chunking. Its whole-slice
+  trace matched the pre-change trace byte for byte.
+- [x] Baselines for parser, owned path and gRPC receive, recorded before the change (below).
 
 Gate: measured baseline and explicit state/credit/API contracts precede parser changes.
 
 ### 1. Introduce the pull contract and input leases
 
-- [ ] Specify progress/event/EOF types, event ordering, zero-consumption transitions, and the work
-  budget. Prototype input-only DATA lifetimes in compile-tested gRPC call sites.
-- [ ] Add retained-inbox/suffix handling through coordinator/client/blocking paths. Test yield
-  after partial consumption while a ready worker tries to read again.
-- [ ] Bound notice fan-out and define admission for local mutating APIs. Adapt test helpers without
-  silently recreating a production DATA queue. Keep fairness traversal invariants explicit when
-  newly decoded headers can admit calls between parser steps.
+- [x] Progress and event types: `Step { consumed, event }` returns one event per call, and
+  `Event<'a>` borrows DATA body bytes. `DataEnd` carries END_STREAM once per frame.
+- [x] Event ordering: notices (HEADERS, RST_STREAM, GOAWAY, flushed resets) are delivered before
+  any further input is parsed. A call without an event has used all its input.
+- [x] Bounded notice fan-out: a GOAWAY refuses streams one per call, through a cursor, so it queues
+  nothing. Queued notices from application calls are bounded by the streams with pending resets.
+- [ ] Work budget per step. Not implemented; see deviations.
+- [ ] Input leases through coordinator, client and blocking paths. Not needed: each driver read is
+  consumed in full before the call returns, so no unread suffix survives an await.
 
-Gate: input is never overwritten/replayed, connection mutation while handling DATA is possible
-without unsafe lifetime tricks, and TX/deadlines remain live with an unread suffix.
+Gate: input is never overwritten or replayed, connection mutation while handling DATA is possible
+without unsafe lifetime tricks, and TX and deadlines stay live (the serial duplex matrix passes).
 
 ### 2. Implement incremental frames and DATA ownership
 
-- [ ] Replace `input: Vec<u8>` with preface/header/payload state and the DATA ledger.
-- [ ] Implement borrowed DATA, completion, padding/discard, fixed controls, streamed SETTINGS,
-  unknown payload skipping, and bounded GOAWAY/reset notice traversal.
-- [ ] Initially append only HPACK fragments to one bounded `PendingBlock`, checking capacity
-  before extension and retaining CONTINUATION state after stream cancellation/refusal.
-- [ ] Preserve error scopes, output admission, and control ACK timing. Add credit coalescing with
-  stalled-peer liveness tests before migrating normal gRPC traffic to chunk events.
+- [x] `input: Vec<u8>` removed. The state is the frame header scratch, the frame state (`rx.rs`),
+  and the stream table; nothing holds the input.
+- [x] Borrowed DATA with padding and discard handled in place, a completion after trailing padding,
+  fixed-size controls, staged SETTINGS published once per frame, unknown payloads skipped, and one
+  notice per frame.
+- [x] Credit: admission-time credit is unchanged from the old code, so WINDOW_UPDATE bytes match.
+  An END_STREAM frame credits the connection only. Partial-message credit is returned once per DATA
+  frame, at its completion. Returning it per chunk stalled the serial link (see the validation
+  record).
+- [x] Header fragments go to the HPACK decoder as they arrive (stage 2).
 
-Gate: legal 16 KiB DATA, ignored payloads, and control frames need no payload-sized parser buffer.
-A supplied multi-frame batch does not get copied internally. Header-block storage is separately
-reported, not hidden in that claim.
+Gate: legal 16 KiB DATA, ignored payloads and control frames allocate nothing (`rx_allocations`).
+Header storage is reported separately, below.
 
 ### 3. Integrate gRPC and remove owned DATA accumulation
 
-- [ ] Drive HTTP/2 one event at a time in client/lifecycle/server/router receive paths. Pass borrowed
-  body slices directly to bounded gRPC decoder storage, then drain applicable lifecycle notices.
-- [ ] Propagate frame completion independently of chunk presence. Keep response validation,
-  deadlines, trailers, unknown routes, compression negotiation, and retained-result credit correct.
-- [ ] Bound LPM feed sizes and validate prefixes before accumulating an arbitrarily large caller
-  chunk. Do not turn direct feeding into a new unbounded message/event accumulator.
-- [ ] Define the receive-event drain points: call startup/cancellation and handler dispatch occur
-  in order, with no unbounded queue between layers. Existing call/retention limits remain explicit;
-  this work alone does not establish a total protocol heap ceiling.
-- [ ] Remove the old raw receive/owned DATA event implementation and migrate all call sites/tests.
+- [x] Client, lifecycle (server) and router drive `recv_step`. Body bytes go straight to the LPM
+  decoder. DATA completion handles the client's end-of-response checks and the server's half-close.
+- [x] Message size limits and prefix checks are unchanged: the LPM decoder still validates each
+  prefix before accepting its message.
+- [x] Receive drain points: each `recv` call runs until its input is used up. No queue sits between
+  the layers.
+- [ ] The owned collector (`recv` with `poll_event`) remains as an explicit, copying convenience.
+  No gRPC path uses it; see deviations.
 
-Gate: no HTTP/2-owned DATA payload allocation on the gRPC path. All four RPC shapes work over
-small pipes while output, peer windows, and flush can be independently blocked. Re-measure the
-buffer-transfer fast-path hit rate; do not weaken its exact-capacity guard to mask regressions.
+Gate: no HTTP/2-owned DATA payload allocation on the gRPC path. All four RPC shapes work over small
+pipes (the duplex matrix passes; the embedded e2e matrix is in the workspace run). The buffer
+transfer still happens for segmented delivery: the take allocates 13 bytes in both cases.
 
 ### 4. Make HPACK incremental
 
-- [ ] Add resumable representation/integer/string/Huffman state spanning input chunks and
-  CONTINUATION frames. Bound integer lengths/overflow before allocation; distinguish need-input
-  from invalid encoding. Validate Huffman padding at each string end, not each transport slice.
-- [ ] Keep one bounded raw field-under-construction, bounded decoded fields, and the negotiated
-  dynamic table. Enforce field/list/encoded-byte limits before allocation and account capacities.
-  Only table-size updates before fields are legal; startup allowance remains 4 KiB as today unless
-  a separately tested negotiation change is made.
-- [ ] Decode rejected/reset streams too, preserving dynamic-table updates before HTTP/UTF-8
-  rejection. Keep header-list overflow connection-fatal unless a real synchronized discard decoder
-  is deliberately implemented. Never release the CONTINUATION lock on local stream cancellation.
-- [ ] Emit a complete validated field section only at END_HEADERS; remove aggregate encoded-block
-  storage without retaining another full encoded copy elsewhere. Preserve the encoded-byte cap
-  as a running counter across the whole header block.
+- [x] Resumable integer, string and Huffman decoding across fragments and CONTINUATION frames.
+  Integer limits follow the dependency (at most eight continuation octets, checked `u64` sums).
+  Huffman padding is checked at each string's end, and the Huffman state persists across fragments.
+- [x] One bounded decoded field list and the negotiated dynamic table. Every declared length is
+  checked against the budget before its octets are kept, and the 32-octet field overhead is charged
+  before the index is read, as before.
+- [x] Decoding happens for discarded and refused streams too, so the compression state stays in step.
+- [x] Only table-size updates before the first field are legal (unchanged).
+- [x] Encoded octets are not stored. The encoded-size limit is a running total, enforced from
+  declared fragment and CONTINUATION sizes before any octet is seen.
 
-Gate: header RX retains no aggregate encoded block. Report the actual peak of field scratch,
-decoded list, and dynamic-table clones; this is bounded header storage, not allocation-free HPACK.
+Gate: header RX retains no encoded block. Measured: an 8000-octet literal fed one octet at a time
+holds its decoded value and name plus the field list (3 allocations, 8,193 B peak, against 8,005
+encoded octets); a 20 KiB block over CONTINUATION peaks at 22,126 B, dominated by its decoded value.
+This is bounded header storage, not allocation-free HPACK.
 
 ### 5. Validate memory, interop, and migration
 
-- [ ] Add allocation/capacity regressions that fail on the old whole-frame/copy path. Separate
-  parser-only counters from application/protobuf/HPACK allocations and serialized output.
-- [ ] Assert chunk-size/batch-size independence of parser storage, bounded notices, credit
-  conservation, cleanup after error/EOF, and no retained high-water input buffer.
-- [ ] Update raw HTTP/2 API docs/examples, driver EOF/lease contracts, and the parent memory plan.
-  No public minimum-MCU-RAM claim until runtime stack/heap measurements cover a concrete firmware.
+- [x] Allocation gates (`protolink-http2/tests/rx_allocations.rs`) and the gRPC measurements
+  (`protolink-grpc/tests/allocations.rs`), below.
+- [x] Chunk-size and batch-size independence: the oracle and `tests/rx_contracts.rs`. Credit
+  conservation on cancellation mid-frame is covered by `cancelling_mid_frame_returns_each_byte_of_credit_once`.
+- [x] Interop: `scripts/grpcurl-interop.sh` passes against the example server.
+- [x] Docs: the crate docs describe `recv_step`, `Event`, and the owned collector. The memory plan
+  points here.
+- [ ] Miri: not run. The changed crates forbid unsafe code (`#![forbid(unsafe_code)]`).
 
 ## Required regression matrix
 
@@ -350,3 +359,116 @@ Success means no frame/batch-sized receive allocation, no HTTP/2-owned DATA copy
 path, bounded header/notice storage, correct input ownership across yields, and preserved duplex
 liveness/credit/error semantics. It does not mean zero allocations for decoded protobuf objects,
 zero retained gRPC messages, faster Huffman decoding, or a proven total-RAM budget by itself.
+
+## Validation record
+
+Toolchain: rustc 1.98.1, cargo 1.98.1, offline and locked where the lock file allows it. Baseline and
+measurements were taken on the pre-change commit `6ffb1a6` (a throwaway worktree, since removed) and on
+this tree.
+
+Tests and gates run on this tree:
+
+- `cargo nextest run --workspace --all-features --no-fail-fast`: 876 passed (852 before, the
+  difference being the new gates).
+- `cargo test --workspace --doc --all-features`: passes.
+- `cargo clippy --workspace --all-features --all-targets -- -D warnings`: clean.
+- `cargo fmt --all -- --check`: clean.
+- Embedded: `cargo build --target thumbv7em-none-eabihf --no-default-features` for `protolink`,
+  `protolink-grpc`, `protolink-http2`, `protolink-i2c` and `protolink-adaptors`; the `async,blocking`
+  and `prost` variants; `cargo check --target thumbv6m-none-eabi --lib --no-default-features --features async -p protolink`.
+- `cargo hack check --each-feature --no-dev-deps -p protolink-http2 -p protolink-grpc`: passes.
+- `RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links -D missing_docs" cargo doc --no-deps` for the two
+  crates: clean.
+- `cargo nextest run --workspace --all-features -E 'test(/concurrent_/)' --stress-count 30`: 30 of 30.
+- `bash scripts/grpcurl-interop.sh`: passes.
+
+Mutation checks (each defect was applied, the named test failed, and the code was restored):
+
+- Huffman padding check removed: `resumable_decoding_matches_the_one_shot_reference` fails.
+- Huffman state reset at each fragment: the same test fails.
+- Partial-message credit returned per chunk: `bytewise_partial_message_is_credited_once_per_frame`
+  sees 32,768 window updates where it expects 2.
+
+Measured (bytes are requested sizes; peak and live are per `protolink-alloc-track`):
+
+| Path | Before (`6ffb1a6`) | After |
+|---|---|---|
+| HTTP/2 receive, one 16 KiB DATA frame, `recv_step` | owned copy: 2 allocs, peak 32,803 B (input copy 16,393 + body 16,384) | 0 allocs, 0 B |
+| Same frame, bytewise input | owned copy: 10 reallocs of the input buffer, peak 45,594 B | 0 allocs, 0 B |
+| 64 KiB in four frames, one slice | peak 131,210 B | 0 allocs, 0 B |
+| Unknown 16 KiB frame, SETTINGS, PING | peak 16,402 B | 0 allocs, 0 B |
+| Same frame, owned `recv` (convenience) | peak 32,803 B | 1 alloc, 16,384 B (body only) |
+| 20 KiB header block over CONTINUATION | peak 74,959 B | peak 22,126 B (decoded value) |
+| 8000-octet literal, one octet at a time | not measured | 3 allocs, 8,193 B |
+| gRPC client unary 1 KiB response, receive | 17 allocs, peak 3,785 B | 14 allocs, peak 2,529 B |
+| gRPC client unary 4 KiB response, receive | 17 allocs, peak 13,001 B | 14 allocs, peak 5,601 B |
+| gRPC 4 KiB response in 1460-byte segments, receive | 16 allocs, 3 reallocs, peak 14,678 B | 14 allocs, 2 reallocs, peak 9,988 B |
+| Take of the 4 KiB response (buffer transfer) | 1 alloc, 13 B | 1 alloc, 13 B |
+| LPM one-frame messages returned without allocation | 48/48 | 48/48 (LPM-level, unchanged code) |
+| LPM 1460-byte segments returned without allocation | 0/48 | 0/48 (LPM-level, unchanged code) |
+
+The 1-octet-per-piece owned `recv` now costs one allocation per piece by design: each chunk becomes an
+owned event on the convenience path.
+
+## Review repair plan
+
+Review reproduced two fragmentation-dependent credit floods: ignored non-gRPC client response
+bodies and unread DATA tails after local cancellation. Both can exhaust queued output and fail
+unrelated calls. The [discard-credit repair plan](INCREMENTAL_HTTP2_RX_FIXES.md) defines local
+per-frame coalescing fixes, permanent failing reproductions, and credit/isolation/memory gates.
+
+Both repairs are now implemented with the two local fixes described there, and each is covered by
+a permanent regression that fails on the original per-chunk release (proven by temporarily restoring
+each defect):
+
+- **Cancelled DATA tails** (`protolink-http2/src/rx.rs`, `DataMode::Discard { tail: usize }`): the
+  unread body length is snapshotted once at the discard transition and returned once at frame
+  completion, before the removed-stream and suppressed-event early returns. `cancelled_data_tail_returns_credit_once_when_fed_bytewise`
+  in [`rx_contracts`](../protolink-http2/tests/rx_contracts.rs) fails with the reviewed `OutputLimitExceeded { limit: 1024, pending: 1014, attempted: 13 }`
+  on the original code; `cancelled_tail_returns_credit_at_frame_completion_not_response_end` proves credit is not held until the whole response.
+- **Ignored non-gRPC bodies** (`protolink-grpc/src/client.rs`, `ResponseBuffer::held` + `hold_ignored`):
+  delivered-but-ignored credit is held and reconciled once at `DataEnd` through the frame-finish path,
+  never per borrowed chunk. `fragmented_non_grpc_error_body_keeps_credit_bounded_and_peer_alive` in
+  [`client`](../protolink-grpc/tests/client.rs) fails on the original code at defaults and at a 1 KiB
+  buffer across 1/512/16 KiB chunk sizes, while an unrelated call still completes.
+
+The [coverage-completion results](INCREMENTAL_HTTP2_RX_FIXES.md#regression-coverage-completion)
+now also record permanent nonterminal window-exhaustion liveness, client interruption/trailer
+semantics, parser ownership boundaries, Lifecycle isolation, and allocation gates. Nine isolated
+mutations were caught at runtime, including missing frame-finish release that the terminal-only
+regression still accepts. Final validation passes 937 workspace tests, strict Clippy, debug/release
+allocation suites, and the embedded check; seven documentation examples remain ignored.
+
+These are separate from the still-open items below (the receive work budget and the EOF-in-DATA test);
+this patch is per-frame coalescing for the two discard paths only, not a general flow-control redesign.
+
+## Deviations and open items
+
+Choices that differ from the text above, and why:
+
+- **Pull API naming and shape.** `Connection::recv_step(&[u8]) -> Result<Step, Error>`. `Step` has
+  `consumed` and `event`. Errors are terminal and carry no consumed count, because a failed connection
+  accepts no more input. `Event::Data` holds a `Cow`, so the owned collector and the borrowed path
+  share one type.
+- **Owned collector kept.** `recv` and `poll_event` copy body bytes into an explicit queue. They are
+  not used by gRPC, and they keep raw-HTTP/2 tests and tools simple. The plan asked to remove the
+  owned path; this keeps it as a labelled convenience.
+- **No work budget.** `recv_step` does not yield after a fixed amount of work. Each driver read is
+  consumed in full by one call, and the gRPC layers do no await in between, so no input outlives its
+  read. Add a budget if a driver starts yielding inside a batch; the input lease is needed at that point.
+- **Credit granularity.** Partial-message credit is returned once per DATA frame (at `DataEnd`), not per
+  chunk. Per-chunk credit flooded the transport with window updates that the peer, a serial link that
+  does not read during a reply, never drained, and the test `serial_server_cannot_read_while_its_response_is_blocked`
+  timed out. This is the plan's coalescing requirement, found by the test.
+- **Notice queue.** Notices from application calls (a flushed `reset_stream_after_flush`) wait for the
+  next receive, as they did before. The queue is bounded by the streams with pending resets.
+- **Error precedence.** Declared sizes are checked when declared. A block whose raw string declares a
+  length past both its budget and its end is refused with `Limit` (EnhanceYourCalm) where the old
+  one-shot decoder reported `Compression`. Both are fatal. The equivalence test scopes exact comparison
+  to well-formed blocks.
+- **Huffman.** Still bit at a time with a linear table search. This change did not make it faster.
+- **EOF.** Driver behaviour on transport EOF is unchanged: clients retire their calls with "connection
+  closed", and the server ends. Decoding never publishes END_STREAM before a frame completes. A test
+  that an EOF inside a DATA frame yields no success is still open.
+- **Open:** Miri (no unsafe code here); the work budget; the EOF test; `just semver` (the public
+  `Event` gained a lifetime, which is a breaking change, allowed by AGENTS.md).

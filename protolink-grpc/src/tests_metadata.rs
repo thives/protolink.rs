@@ -407,11 +407,11 @@ fn trailing_metadata_is_sent_when_the_deadline_ends_the_call() {
 }
 
 /// A raw request on a fresh connection; returns what the server answered.
-fn raw_request(extra: &[(&str, &str)]) -> Vec<Event> {
+fn raw_request(extra: &[(&str, &str)]) -> Vec<Event<'static>> {
     raw_request_at("/m.M/UserAgent", extra)
 }
 
-fn raw_request_at(path: &str, extra: &[(&str, &str)]) -> Vec<Event> {
+fn raw_request_at(path: &str, extra: &[(&str, &str)]) -> Vec<Event<'static>> {
     let mut headers = vec![
         hf(":method", "POST"),
         hf(":scheme", "http"),

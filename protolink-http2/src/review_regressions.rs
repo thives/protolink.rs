@@ -294,7 +294,7 @@ fn body_counts_accumulate_and_trailers_validate_terminal_length() {
                         Event::Headers {
                             end_stream: true,
                             ..
-                        } | Event::Data {
+                        } | Event::DataEnd {
                             end_stream: true,
                             ..
                         }

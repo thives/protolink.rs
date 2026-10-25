@@ -1001,7 +1001,7 @@ fn error_after_messages_uses_trailers() {
     let data: Vec<u8> = ev
         .iter()
         .filter_map(|e| match e {
-            Event::Data { data, .. } => Some(data.clone()),
+            Event::Data { data, .. } => Some(data.to_vec()),
             _ => None,
         })
         .flatten()
@@ -1035,7 +1035,11 @@ fn early_finish_delivers_trailers_before_reset() {
     conn.send_data(id, lpm::encode(b"hi").unwrap(), false)
         .unwrap();
     raw_exchange(&mut conn, &mut server, &mut handler);
-    let ev = events(&mut conn);
+    // Frame completions carry no message order of their own.
+    let ev: Vec<Event<'static>> = events(&mut conn)
+        .into_iter()
+        .filter(|e| !matches!(e, Event::DataEnd { .. }))
+        .collect();
     let kinds: Vec<&str> = ev
         .iter()
         .map(|e| match e {
@@ -1091,12 +1095,13 @@ fn early_finish_waits_for_window_before_reset() {
     conn.release_capacity(busy, held);
     conn.reset_stream(busy, ErrorCode::Cancel).unwrap();
     raw_exchange(&mut conn, &mut server, &mut handler);
-    let ev: Vec<Event> = events(&mut conn)
+    let ev: Vec<Event<'static>> = events(&mut conn)
         .into_iter()
         .filter(|e| match e {
             Event::Headers { stream_id, .. }
             | Event::Data { stream_id, .. }
             | Event::Reset { stream_id, .. } => *stream_id == id,
+            Event::DataEnd { .. } => false,
             Event::GoAway { .. } => true,
         })
         .collect();
@@ -1116,4 +1121,48 @@ fn early_finish_waits_for_window_before_reset() {
         }
     ));
     assert_eq!(ev.len(), 3);
+}
+
+/// Number of WINDOW_UPDATE frames in `output`.
+fn window_update_frames(output: &[u8]) -> usize {
+    let mut count = 0;
+    let mut rest = output;
+    while rest.len() >= 9 {
+        let len = (usize::from(rest[0]) << 16) | (usize::from(rest[1]) << 8) | usize::from(rest[2]);
+        if rest[3] == 0x8 {
+            count += 1;
+        }
+        rest = &rest[9 + len..];
+    }
+    count
+}
+
+/// A message spanning two frames reaches the server one byte at a time. Its
+/// first frame is credited back once, when that frame completes: one window
+/// update for the stream and one for the connection. Crediting each piece
+/// instead costs two window updates per byte, which fills a transport the peer
+/// does not drain. The message completes with the second frame, and its credit
+/// returns when the handler takes it.
+#[test]
+fn bytewise_partial_message_is_credited_once_per_frame() {
+    let (mut conn, mut server, mut handler) = raw_setup();
+    let id = conn
+        .open_stream(request_headers("/s.S/Echo"), false)
+        .unwrap();
+    raw_exchange(&mut conn, &mut server, &mut handler);
+    conn.send_data(id, lpm::encode(&[3; 20_000]).unwrap(), false)
+        .unwrap();
+    let wire = conn.take_output();
+    assert!(wire.len() > 16_384 + 9, "the message spans two frames");
+
+    // The first frame, one byte at a time. The message is still incomplete, so
+    // only its completed frame is credited.
+    let (first, rest) = wire.split_at(9 + 16_384);
+    let mut updates = 0;
+    for byte in first.chunks(1) {
+        server.recv(byte, &mut handler).unwrap();
+        updates += window_update_frames(&server.take_output());
+    }
+    assert_eq!(updates, 2, "one stream and one connection update");
+    server.recv(rest, &mut handler).unwrap();
 }

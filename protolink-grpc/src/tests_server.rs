@@ -84,7 +84,7 @@ struct Peer {
     conn: Connection,
     server: Server,
     handler: HandlerState,
-    events: Vec<Event>,
+    events: Vec<Event<'static>>,
 }
 
 impl Peer {
