@@ -44,6 +44,17 @@ use crate::inbound::Inbound;
 use crate::status::encode_message;
 use crate::{CallId, Metadata, ServerConfig, Status, lpm, timeout};
 
+/// The status of a call that a connection failure ended. An output limit is
+/// an overload to act on, so it names the setting that raises it.
+pub fn failure_status(error: &Error) -> Status {
+    match error {
+        Error::OutputLimitExceeded { limit, .. } => Status::unavailable(format!(
+            "HTTP/2 output limit of {limit} bytes exceeded; raise http2.max_pending_output_bytes"
+        )),
+        _ => Status::unavailable("connection error"),
+    }
+}
+
 /// Something that happened to a call which the caller must act on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallEvent<K> {
@@ -156,10 +167,32 @@ impl<K: Copy> Lifecycle<K> {
         while let Some(event) = self.conn.poll_event() {
             self.on_event(event, &mut resolve);
         }
+        // Handling the events can latch a failure too, such as a credit release
+        // that does not fit. The input is not successful then.
+        let result = match (result, self.conn.failure()) {
+            (Ok(()), Some(error)) => Err(error.clone()),
+            (result, _) => result,
+        };
         if result.is_err() {
             self.cancel_all();
         }
         result
+    }
+
+    /// The connection's terminal failure, if it has one: a protocol error or
+    /// an output limit. Once set, every call has been cancelled and nothing
+    /// more is serialized; retire the connection after its output is handled.
+    pub fn failure(&self) -> Option<&Error> {
+        self.conn.failure()
+    }
+
+    /// Adopt a failure that the connection latched while this lifecycle did
+    /// work for it, such as queueing a response. Every call is cancelled once,
+    /// as for a failed [`recv`](Self::recv), and the failure is returned.
+    fn adopt_failure(&mut self) -> Option<Error> {
+        let error = self.conn.failure()?.clone();
+        self.cancel_all();
+        Some(error)
     }
 
     /// Next event, in the order it happened.
@@ -205,6 +238,7 @@ impl<K: Copy> Lifecycle<K> {
             // Keep its expired obligation armed until delivery is acknowledged
             // or the driver cancels the connection.
         }
+        self.adopt_failure();
     }
 
     /// Whether `deadline` has been reached at the current time.
@@ -258,6 +292,7 @@ impl<K: Copy> Lifecycle<K> {
             return false;
         }
         self.expire(id);
+        self.adopt_failure();
         true
     }
 
@@ -323,10 +358,16 @@ impl<K: Copy> Lifecycle<K> {
         let Some(call) = self.calls.get_mut(&id) else {
             return Ok(None);
         };
-        match call.inbound.next(&mut self.conn, id) {
+        let taken = match call.inbound.next(&mut self.conn, id) {
             Some(Ok(message)) => Ok(Some(message)),
             Some(Err(status)) => Err(status),
             None => Ok(None),
+        };
+        // Releasing the credit of the message can fail the connection, in which
+        // case the call is over whatever the message was.
+        match self.adopt_failure() {
+            Some(error) => Err(failure_status(&error)),
+            None => taken,
         }
     }
 
@@ -371,6 +412,7 @@ impl<K: Copy> Lifecycle<K> {
         call.headers_sent = true;
         if self.conn.send_headers(id, headers, false).is_err() {
             self.fail_stream(id);
+            self.adopt_failure();
             return false;
         }
         true
@@ -400,7 +442,10 @@ impl<K: Copy> Lifecycle<K> {
         let framed = lpm::frame(message, call.response_codec, self.compression.min_size)?;
         if self.conn.send_data(id, framed, false).is_err() {
             self.fail_stream(id);
-            return Err(Status::internal("failed to queue response message"));
+            return Err(match self.adopt_failure() {
+                Some(error) => failure_status(&error),
+                None => Status::internal("failed to queue response message"),
+            });
         }
         Ok(())
     }
@@ -427,7 +472,11 @@ impl<K: Copy> Lifecycle<K> {
         // the status it carries is already the deadline's.
         let deadline = if call.expired { None } else { call.deadline };
         self.send_status(id, call.half_closed, result, Vec::new(), response);
-        self.draining.insert(id, deadline);
+        // Output that can never be delivered is not waited for.
+        if self.conn.failure().is_none() {
+            self.draining.insert(id, deadline);
+        }
+        self.adopt_failure();
     }
 
     /// Cancel every active call, e.g. because the transport closed: streams are
@@ -494,6 +543,7 @@ impl<K: Copy> Lifecycle<K> {
     /// Start a graceful shutdown (GOAWAY). In-flight calls still complete.
     pub fn shutdown(&mut self) {
         self.conn.go_away(ErrorCode::NoError);
+        self.adopt_failure();
     }
 
     /// The connection failed or finished shutting down.
@@ -541,6 +591,10 @@ impl<K: Copy> Lifecycle<K> {
         end_stream: bool,
         resolve: &mut impl FnMut(&str) -> Option<K>,
     ) {
+        // A call that starts on a failed connection would never be answered.
+        if self.conn.failure().is_some() {
+            return;
+        }
         if let Some(call) = self.calls.get_mut(&stream_id) {
             // Request trailers: only END_STREAM matters.
             call.half_closed |= end_stream;

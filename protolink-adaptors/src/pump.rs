@@ -403,10 +403,12 @@ impl<const RX: usize, const TX: usize, const CHUNK: usize> PumpState<RX, TX, CHU
         let ctl = &self.ctl;
         (
             PumpHandle {
-                rx: rx_out,
-                tx: tx_in,
-                ctl,
-                accepted: 0,
+                reader: PumpReader { rx: rx_out, ctl },
+                writer: PumpWriter {
+                    tx: tx_in,
+                    ctl,
+                    accepted: 0,
+                },
             },
             RxPump {
                 ring: rx_in,
@@ -436,19 +438,53 @@ impl<const RX: usize, const TX: usize, const CHUNK: usize> Default for PumpState
 /// Implements `embedded_io_async::{Read, Write}` with operations that are
 /// cancel-safe: they only move bytes to or from the ring buffers. Give it to
 /// `protolink::link::reliable` or `protolink::link::CobsFramed::new`.
+///
+/// [`into_split`](Self::into_split) separates the directions, for a link whose
+/// reads and writes run on different tasks.
 pub struct PumpHandle<'a, const RX: usize, const TX: usize> {
+    reader: PumpReader<'a, RX>,
+    writer: PumpWriter<'a, TX>,
+}
+
+impl<'a, const RX: usize, const TX: usize> PumpHandle<'a, RX, TX> {
+    /// Split the handle into its read and write halves.
+    ///
+    /// Nothing is reset or copied: the writer takes the count of bytes accepted
+    /// so far, so a flush after the split still waits for every byte accepted
+    /// before it.
+    pub fn into_split(self) -> (PumpReader<'a, RX>, PumpWriter<'a, TX>) {
+        (self.reader, self.writer)
+    }
+}
+
+/// The read half of a [`PumpHandle`]. Cancel-safe, like the handle.
+pub struct PumpReader<'a, const RX: usize> {
     rx: RingRx<'a, u8, RX>,
+    ctl: &'a Control,
+}
+
+/// The write half of a [`PumpHandle`]: writes and flushes. Cancel-safe, like
+/// the handle.
+pub struct PumpWriter<'a, const TX: usize> {
     tx: RingTx<'a, u8, TX>,
     ctl: &'a Control,
     /// Bytes accepted by `write` so far (wrapping).
     accepted: usize,
 }
 
+impl<const RX: usize> ErrorType for PumpReader<'_, RX> {
+    type Error = PumpError;
+}
+
+impl<const TX: usize> ErrorType for PumpWriter<'_, TX> {
+    type Error = PumpError;
+}
+
 impl<const RX: usize, const TX: usize> ErrorType for PumpHandle<'_, RX, TX> {
     type Error = PumpError;
 }
 
-impl<const RX: usize, const TX: usize> Read for PumpHandle<'_, RX, TX> {
+impl<const RX: usize> Read for PumpReader<'_, RX> {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
         if buf.is_empty() {
             return Ok(0);
@@ -473,7 +509,7 @@ impl<const RX: usize, const TX: usize> Read for PumpHandle<'_, RX, TX> {
     }
 }
 
-impl<const RX: usize, const TX: usize> Write for PumpHandle<'_, RX, TX> {
+impl<const TX: usize> Write for PumpWriter<'_, TX> {
     async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
         let ctl = self.ctl;
         let tx = &mut self.tx;
@@ -514,6 +550,22 @@ impl<const RX: usize, const TX: usize> Write for PumpHandle<'_, RX, TX> {
             Poll::Pending
         })
         .await
+    }
+}
+
+impl<const RX: usize, const TX: usize> Read for PumpHandle<'_, RX, TX> {
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+        self.reader.read(buf).await
+    }
+}
+
+impl<const RX: usize, const TX: usize> Write for PumpHandle<'_, RX, TX> {
+    async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+        self.writer.write(buf).await
+    }
+
+    async fn flush(&mut self) -> Result<(), Self::Error> {
+        self.writer.flush().await
     }
 }
 
@@ -713,4 +765,62 @@ where
         }
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use core::convert::Infallible;
+
+    use embedded_io_async::{ErrorType, Read, Write};
+
+    use super::*;
+
+    /// A transmit half that accepts and flushes everything at once.
+    struct Sink;
+
+    impl ErrorType for Sink {
+        type Error = Infallible;
+    }
+
+    impl Write for Sink {
+        async fn write(&mut self, buf: &[u8]) -> Result<usize, Infallible> {
+            Ok(buf.len())
+        }
+
+        async fn flush(&mut self) -> Result<(), Infallible> {
+            Ok(())
+        }
+    }
+
+    /// A receive half that never has data.
+    struct Silent;
+
+    impl ErrorType for Silent {
+        type Error = Infallible;
+    }
+
+    impl Read for Silent {
+        async fn read(&mut self, _: &mut [u8]) -> Result<usize, Infallible> {
+            core::future::pending().await
+        }
+    }
+
+    /// The accepted count is compared for equality only, so it may wrap: a flush
+    /// after the wrap completes once the transmit pump has flushed the bytes.
+    #[tokio::test]
+    async fn flush_target_wraps_with_the_accepted_count() {
+        let mut state = PumpState::<64, 64, 16>::new();
+        let (mut handle, mut rx, mut tx) = state.split(Silent, Sink);
+        handle.writer.accepted = usize::MAX - 3;
+
+        handle.write_all(&[1; 8]).await.unwrap();
+        tokio::select! {
+            biased;
+            flushed = handle.flush() => flushed.unwrap(),
+            pumps = run(&mut rx, &mut tx) => panic!("the pump stopped: {pumps:?}"),
+        }
+        assert_eq!(handle.writer.accepted, 4, "the count wrapped past zero");
+    }
 }

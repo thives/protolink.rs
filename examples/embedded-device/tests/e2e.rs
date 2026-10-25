@@ -1,5 +1,7 @@
 //! End-to-end: micropb messages + generated bindings + protolink drivers.
 
+use std::future::Future;
+use std::pin::pin;
 use std::time::Duration;
 
 use embedded_device_example::device::{
@@ -10,7 +12,9 @@ use embedded_device_example::{
     ServiceDispatch,
 };
 use embedded_io_adapters::tokio_1::FromTokio;
-use protolink::grpc::Code;
+use protolink::grpc::{ClientConfig, Code, ServerConfig, StreamingTransport, UnaryTransport};
+use protolink::link::{ArqError, ReliableError, cobs_split};
+use protolink::tokio::TokioTimer;
 use protolink::{CallOptions, Metadata};
 
 fn get_status(correlation_id: Option<u32>) -> Command {
@@ -615,4 +619,222 @@ async fn metadata_through_generated_clients() {
         assert!(events.trailers().is_none(), "the call is still running");
     })
     .await;
+}
+
+// --- Small-pipe matrix ---------------------------------------------------------
+
+/// Run `test` on a thread with a large stack: in debug builds the reliable
+/// stack's futures and the matrix's servers are too big for the default 2 MiB
+/// test-thread stack.
+fn on_big_stack<Fut>(test: impl FnOnce() -> Fut + Send + 'static)
+where
+    Fut: Future<Output = ()>,
+{
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap()
+                .block_on(test());
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+/// Pipe capacities of the matrix, in bytes. Every exchange moves far more than
+/// one pipe holds, in each direction.
+const PIPES: [usize; 3] = [32, 64, 128];
+/// Calls of each kind in a matrix exchange.
+const MATRIX_CALLS: u32 = 40;
+
+/// Client credit and retained-result capacity for the small pipes: a stream
+/// window of a few hundred bytes, a connection window of four of them, and a
+/// retained-response budget well above one reply but far below the transfer.
+fn matrix_client_config() -> ClientConfig {
+    let mut config = ClientConfig::default();
+    config.http2.initial_window_size = 256;
+    config.http2.connection_window_size = 1024;
+    config.max_buffered_response_bytes = 4 * 1024;
+    config.max_retained_calls = 8;
+    config
+}
+
+fn matrix_server_config() -> ServerConfig {
+    let mut config = ServerConfig::default();
+    config.http2.initial_window_size = 256;
+    config.http2.connection_window_size = 1024;
+    config
+}
+
+/// The finite exchange every stack must complete: unary calls, a batch the
+/// server only answers at the end, and a bidirectional call answered one
+/// request at a time. Replies must arrive in order, and the last call must
+/// still succeed.
+async fn finite_exchange<T>(mut client: ServiceClient<T>)
+where
+    T: UnaryTransport + StreamingTransport,
+{
+    for id in 0..MATRIX_CALLS {
+        let reply = client.command(&get_status(Some(id))).await.unwrap();
+        assert_eq!(correlation_id(&reply), Some(id));
+    }
+
+    let mut batch = client.command_batch().await.unwrap();
+    for i in 0..MATRIX_CALLS {
+        batch.send(&set_output(i % 2, i % 2 == 0)).await.unwrap();
+    }
+    let summary = batch.finish().await.unwrap();
+    assert_eq!((summary.accepted, summary.rejected), (MATRIX_CALLS, 0));
+
+    let mut stream = client.command_stream().await.unwrap();
+    for id in 0..MATRIX_CALLS {
+        stream.send(&get_status(Some(id))).await.unwrap();
+        let reply = stream.message().await.unwrap().unwrap();
+        assert_eq!(correlation_id(&reply), Some(id));
+    }
+    stream.close_send().await.unwrap();
+    assert!(stream.message().await.unwrap().is_none());
+    drop(stream);
+
+    let last = client.command(&get_status(None)).await.unwrap();
+    assert!(matches!(last.reply, Some(Reply_::Reply::Status(_))));
+}
+
+/// Control: a peer that does not read holds the sender back. The request is
+/// too large for the peer's window, so it cannot finish until the server runs.
+/// Then the same connection carries the finite exchange.
+async fn backpressure_control<T, S>(
+    mut client: ServiceClient<T>,
+    server: S,
+) -> (ServiceClient<T>, tokio::task::JoinHandle<()>)
+where
+    T: UnaryTransport,
+    S: Future<Output = ()> + Send + 'static,
+{
+    let body = vec![0u8; 4096];
+    let (handle, result) = {
+        let transport = client.transport_mut();
+        let mut call = pin!(transport.unary(
+            "/protolink.examples.embedded.device.Service/Nope",
+            &body,
+            CallOptions::default(),
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), call.as_mut())
+                .await
+                .is_err(),
+            "a request went through a peer that never read"
+        );
+        let handle = tokio::spawn(server);
+        (handle, call.await)
+    };
+    assert_eq!(result.unwrap_err().code, Code::Unimplemented);
+    (client, handle)
+}
+
+/// Run the control and then the exchange on one connection, and check that the
+/// server ended cleanly: a deadline or overload retirement is not a pass.
+async fn small_pipe_case<T, S>(client: ServiceClient<T>, server: S)
+where
+    T: UnaryTransport + StreamingTransport,
+    S: Future<Output = ()> + Send + 'static,
+{
+    with_timeout(async {
+        let (client, handle) = backpressure_control(client, server).await;
+        finite_exchange(client).await;
+        handle.await.unwrap();
+    })
+    .await;
+}
+
+#[test]
+fn small_pipe_matrix_raw_duplex() {
+    on_big_stack(|| async {
+        for pipe in PIPES {
+            let (a, b) = tokio::io::duplex(pipe);
+            let server = async move {
+                let mut handler = ServiceDispatch::new(Device::default());
+                protolink::tokio::server(a)
+                    .with_config(matrix_server_config())
+                    .build()
+                    .serve(&mut handler)
+                    .await
+                    .unwrap();
+            };
+            let client = ServiceClient::new(
+                protolink::tokio::client(b)
+                    .with_config(matrix_client_config())
+                    .build(),
+            );
+            small_pipe_case(client, server).await;
+        }
+    });
+}
+
+#[test]
+fn generated_streaming_over_split_cobs_small_pipe() {
+    on_big_stack(|| async {
+        for pipe in PIPES {
+            let (a, b) = tokio::io::duplex(pipe);
+            let (a_rd, a_wr) = tokio::io::split(a);
+            let (b_rd, b_wr) = tokio::io::split(b);
+            let (server_rx, server_tx) = cobs_split(FromTokio::new(a_rd), FromTokio::new(a_wr));
+            let (client_rx, client_tx) = cobs_split(FromTokio::new(b_rd), FromTokio::new(b_wr));
+            let server = async move {
+                let mut handler = ServiceDispatch::new(Device::default());
+                protolink::server_split(server_rx, server_tx)
+                    .with_deadline_timer(TokioTimer::new())
+                    .with_config(matrix_server_config())
+                    .build()
+                    .serve(&mut handler)
+                    .await
+                    .unwrap();
+            };
+            let client = ServiceClient::new(
+                protolink::client_split(client_rx, client_tx)
+                    .with_deadline_timer(TokioTimer::new())
+                    .with_config(matrix_client_config())
+                    .build(),
+            );
+            small_pipe_case(client, server).await;
+        }
+    });
+}
+
+#[test]
+fn small_pipe_matrix_coordinated_reliable() {
+    on_big_stack(|| async {
+        for pipe in PIPES {
+            let (a, b) = tokio::io::duplex(pipe);
+            let server_link = protolink::link::reliable(FromTokio::new(a)).build();
+            let client_link = protolink::link::reliable(FromTokio::new(b)).build();
+            let server = async move {
+                let mut handler = ServiceDispatch::new(Device::default());
+                let result = protolink::server_reliable(server_link)
+                    .with_deadline_timer(TokioTimer::new())
+                    .with_config(matrix_server_config())
+                    .build()
+                    .serve(&mut handler)
+                    .await;
+                // The client hanging up is the only way the exchange ends, and ARQ
+                // reports it as a closed link. Anything else, such as a deadline or an
+                // overload, fails the test.
+                match result {
+                    Ok(()) => {}
+                    Err(protolink::Error::Io(ReliableError(ArqError::Closed))) => {}
+                    Err(e) => panic!("the server ended with {e:?}"),
+                }
+            };
+            let client = ServiceClient::new(
+                protolink::client_reliable(client_link)
+                    .with_deadline_timer(TokioTimer::new())
+                    .with_config(matrix_client_config())
+                    .build(),
+            );
+            small_pipe_case(client, server).await;
+        }
+    });
 }

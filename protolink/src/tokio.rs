@@ -22,11 +22,11 @@
 
 use core::time::Duration;
 
-use ::tokio::io::{AsyncRead, AsyncWrite};
+use ::tokio::io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf, split};
 use ::tokio::time::Instant;
 pub use embedded_io_adapters::tokio_1::FromTokio;
 
-use crate::{ClientBuilder, Clock, ServerBuilder, Timer};
+use crate::{ClientBuilder, Clock, Duplex, Serial, ServerBuilder, Timer};
 
 /// A [`Timer`] on tokio's clock.
 ///
@@ -81,13 +81,43 @@ pub fn compat<T: AsyncRead + AsyncWrite + Unpin>(io: T) -> FromTokio<T> {
     FromTokio::new(io)
 }
 
+/// The halves of a tokio stream, adapted to `embedded_io_async`, as a duplex
+/// transport.
+pub type TokioDuplex<T> = Duplex<FromTokio<ReadHalf<T>>, FromTokio<WriteHalf<T>>>;
+
+/// Adapt a tokio stream to be served in duplex mode: the stream is split into
+/// its read and write halves, each adapted to `embedded_io_async`.
+///
+/// Use it with [`protolink::server_split`](crate::server_split) or
+/// [`protolink::client_split`](crate::client_split) when the timer or
+/// configuration is chosen separately, or as a router downstream with
+/// [`Server::serve_router_split`](crate::Server::serve_router_split).
+pub fn duplex<T: AsyncRead + AsyncWrite + Unpin>(io: T) -> TokioDuplex<T> {
+    let (reader, writer) = split(io);
+    Duplex::new(FromTokio::new(reader), FromTokio::new(writer))
+}
+
 /// Start building a server on a tokio stream, with a [`TokioTimer`] as the
 /// deadline timer.
 ///
-/// The same [`ServerBuilder`] as [`crate::server`]; the timer can still be
-/// replaced with [`with_deadline_timer`](ServerBuilder::with_deadline_timer)
+/// The stream is split into its halves, so that input is read while output is
+/// blocked. This is the duplex mode (see [`Mode`](crate::Mode)); the
+/// [`ServerBuilder`] is the same as [`crate::server_split`]. The timer can still
+/// be replaced with [`with_deadline_timer`](ServerBuilder::with_deadline_timer)
 /// or removed with [`without_deadlines`](ServerBuilder::without_deadlines).
-pub fn server<T: AsyncRead + AsyncWrite + Unpin>(io: T) -> ServerBuilder<FromTokio<T>, TokioTimer> {
+pub fn server<T: AsyncRead + AsyncWrite + Unpin>(
+    io: T,
+) -> ServerBuilder<TokioDuplex<T>, TokioTimer> {
+    let (reader, writer) = duplex(io).into_parts();
+    crate::server_split(reader, writer).with_deadline_timer(TokioTimer::new())
+}
+
+/// Start building a server on a tokio stream served in serial mode: the stream
+/// is read and written in turn, without splitting it. Use it when the stream
+/// can't be split, or to keep the serial behaviour.
+pub fn server_serial<T: AsyncRead + AsyncWrite + Unpin>(
+    io: T,
+) -> ServerBuilder<Serial<FromTokio<T>>, TokioTimer> {
     crate::server(FromTokio::new(io)).with_deadline_timer(TokioTimer::new())
 }
 
@@ -105,6 +135,19 @@ pub fn server<T: AsyncRead + AsyncWrite + Unpin>(io: T) -> ServerBuilder<FromTok
 /// # let _ = transport;
 /// # }
 /// ```
-pub fn client<T: AsyncRead + AsyncWrite + Unpin>(io: T) -> ClientBuilder<FromTokio<T>, TokioTimer> {
+///
+/// Like [`server`], the client is served in duplex mode.
+pub fn client<T: AsyncRead + AsyncWrite + Unpin>(
+    io: T,
+) -> ClientBuilder<TokioDuplex<T>, TokioTimer> {
+    let (reader, writer) = duplex(io).into_parts();
+    crate::client_split(reader, writer).with_deadline_timer(TokioTimer::new())
+}
+
+/// Start building a client on a tokio stream served in serial mode, see
+/// [`server_serial`].
+pub fn client_serial<T: AsyncRead + AsyncWrite + Unpin>(
+    io: T,
+) -> ClientBuilder<Serial<FromTokio<T>>, TokioTimer> {
     crate::client(FromTokio::new(io)).with_deadline_timer(TokioTimer::new())
 }

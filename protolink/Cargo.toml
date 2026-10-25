@@ -41,7 +41,7 @@ async = [
 ]
 embedded-io = ["async"]
 blocking = ["dep:embedded-io"]
-tokio = ["std", "async", "dep:embedded-io-adapters", "dep:tokio", "tokio/time"]
+tokio = ["std", "async", "dep:embedded-io-adapters", "dep:tokio", "tokio/time", "tokio/io-util"]
 # Stock DEFLATE backend and ready-made gzip codec, see `protolink::compression`.
 miniz-oxide = ["protolink-grpc/miniz-oxide"]
 std = [

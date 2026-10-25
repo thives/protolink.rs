@@ -112,9 +112,9 @@ fn building_performs_no_io() {
 #[tokio::test]
 async fn tokio_factories_build_without_io() {
     let (a, mut b) = tokio::io::duplex(1024);
-    let server = protolink::tokio::server(a).build();
+    let server = protolink::tokio::server_serial(a).build();
     let (c, mut d) = tokio::io::duplex(1024);
-    let client = protolink::tokio::client(c).build();
+    let client = protolink::tokio::client_serial(c).build();
     let mut buf = [0u8; 1];
     for peer in [&mut b, &mut d] {
         let read = tokio::time::timeout(
@@ -138,10 +138,12 @@ async fn configuration_setters_reach_the_server() {
     let (a, b) = tokio::io::duplex(16 * 1024);
     tokio::spawn(async move {
         let mut services = FnHandler(echo);
-        let server = protolink::tokio::server(a).with_max_message_size(8).build();
+        let server = protolink::tokio::server_serial(a)
+            .with_max_message_size(8)
+            .build();
         let _ = server.serve(&mut services).await;
     });
-    let mut client = protolink::tokio::client(b).build();
+    let mut client = protolink::tokio::client_serial(b).build();
     assert_eq!(client.unary("/t.T/Echo", b"small").await.unwrap(), b"small");
     let err = client
         .unary("/t.T/Echo", b"far too large")
@@ -155,12 +157,14 @@ async fn configuration_setters_reach_the_client() {
     let (a, b) = tokio::io::duplex(16 * 1024);
     tokio::spawn(async move {
         let mut services = FnHandler(echo);
-        let _ = protolink::tokio::server(a)
+        let _ = protolink::tokio::server_serial(a)
             .build()
             .serve(&mut services)
             .await;
     });
-    let mut client = protolink::tokio::client(b).with_max_message_size(8).build();
+    let mut client = protolink::tokio::client_serial(b)
+        .with_max_message_size(8)
+        .build();
     let err = client
         .unary("/t.T/Echo", b"far too large")
         .await
@@ -183,7 +187,7 @@ fn silent_peer() -> tokio::io::DuplexStream {
 async fn tokio_client_matches_the_async_client_with_a_tokio_timer() {
     let options = || CallOptions::timeout(Duration::from_millis(100));
 
-    let mut tokio_client = protolink::tokio::client(silent_peer()).build();
+    let mut tokio_client = protolink::tokio::client_serial(silent_peer()).build();
     let start = tokio::time::Instant::now();
     let tokio_err = tokio_client
         .unary_with("/t.T/Echo", b"x", options())
@@ -209,7 +213,7 @@ async fn tokio_client_matches_the_async_client_with_a_tokio_timer() {
 
 #[tokio::test(start_paused = true)]
 async fn a_tokio_client_without_deadlines_leaves_enforcement_to_the_server() {
-    let mut client = protolink::tokio::client(silent_peer())
+    let mut client = protolink::tokio::client_serial(silent_peer())
         .without_deadlines()
         .build();
     let call = client.unary_with(

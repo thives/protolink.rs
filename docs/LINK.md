@@ -114,6 +114,12 @@ depends on whether the driver is cancel-safe. [UART.md](UART.md) has the full co
 | Split RX and TX halves, with a transfer that is aborted when its future is dropped (DMA) | `protolink_adaptors::uart(rx, tx).with_storage(..).build()`, and `link::reliable(port)` on its port |
 | Linux serial port (`tokio-serial`) | `link::reliable(protolink::tokio::compat(LinuxUart::open(path, baud)?))` |
 
+Without ARQ, a COBS stream can be split into its two directions: `link::cobs_split(reader, writer)`
+returns a `CobsReader` and a `CobsWriter` with fresh state. They share nothing, so a read can wait
+while a write is in progress, and each keeps the framing and cancel-safety rules of `CobsFramed`.
+Split before the stream carries frames: an existing `CobsFramed` cannot be split without discarding
+the bytes it has buffered. The reliable stack is not split: its one engine owns both directions.
+
 The Linux wrapper meets these requirements; see [UART.md](UART.md#operations).
 
 **Both ends of the line must use the same stack.** A UART has no framing or retransmission of its

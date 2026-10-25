@@ -156,63 +156,30 @@ impl<E: embedded_io_async::Error> embedded_io_async::Error for LinkError<E> {
     }
 }
 
-/// COBS framing over a raw byte stream.
-///
-/// Each `write` call (up to [`MAX_FRAME_PAYLOAD`] bytes) becomes one
-/// zero-delimited COBS frame; `read` returns decoded frame payloads. Corrupt
-/// frames are dropped, and the stream resynchronises on the next delimiter.
-/// Receive work yields cooperatively after 32 bounded steps, even when the
-/// raw stream continuously returns empty/malformed frames or oversized garbage.
-///
-/// All state lives in the struct, so the `read`/`write` futures may be dropped
-/// and re-created at any await point, as ARQ does. If a `write` future is
-/// dropped while the frame is half sent, the next `write` finishes that frame
-/// first and reports the length accepted for it. Callers must therefore retry
-/// with the same data, as ARQ does.
-pub struct CobsFramed<S> {
-    inner: S,
+/// Receive state of a COBS stream: the raw bytes not yet framed, and the decoded
+/// frame being handed out. Owned by a [`CobsFramed`] or a [`CobsReader`].
+struct RxState {
     rx_raw: [u8; RX_RAW],
     rx_len: usize,
     rx_discarding: bool,
     frame: [u8; MAX_FRAME_PAYLOAD],
     frame_len: usize,
     frame_pos: usize,
-    tx: [u8; ENCODED_FRAME],
-    tx_len: usize,
-    tx_pos: usize,
-    tx_accepted: usize,
 }
 
-impl<S> CobsFramed<S> {
-    /// Wrap a raw byte stream.
-    pub fn new(inner: S) -> Self {
+impl RxState {
+    const fn new() -> Self {
         Self {
-            inner,
             rx_raw: [0; RX_RAW],
             rx_len: 0,
             rx_discarding: false,
             frame: [0; MAX_FRAME_PAYLOAD],
             frame_len: 0,
             frame_pos: 0,
-            tx: [0; ENCODED_FRAME],
-            tx_len: 0,
-            tx_pos: 0,
-            tx_accepted: 0,
         }
     }
 
-    /// Unwrap the raw stream.
-    pub fn into_inner(self) -> S {
-        self.inner
-    }
-}
-
-impl<S: ErrorType> ErrorType for CobsFramed<S> {
-    type Error = LinkError<S::Error>;
-}
-
-impl<S: Read> CobsFramed<S> {
-    async fn receive_frame(&mut self) -> Result<bool, LinkError<S::Error>> {
+    async fn receive_frame<R: Read>(&mut self, inner: &mut R) -> Result<bool, LinkError<R::Error>> {
         let mut work = 0;
         loop {
             if self.frame_pos < self.frame_len {
@@ -259,8 +226,7 @@ impl<S: Read> CobsFramed<S> {
                 self.rx_len = 0;
                 self.rx_discarding = true;
             }
-            let n = self
-                .inner
+            let n = inner
                 .read(&mut self.rx_raw[self.rx_len..])
                 .await
                 .map_err(LinkError::Io)?;
@@ -270,17 +236,146 @@ impl<S: Read> CobsFramed<S> {
             self.rx_len += n;
         }
     }
-}
 
-impl<S: Read> Read for CobsFramed<S> {
-    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
-        if buf.is_empty() || !self.receive_frame().await? {
+    async fn read<R: Read>(
+        &mut self,
+        inner: &mut R,
+        buf: &mut [u8],
+    ) -> Result<usize, LinkError<R::Error>> {
+        if buf.is_empty() || !self.receive_frame(inner).await? {
             return Ok(0);
         }
         let n = buf.len().min(self.frame_len - self.frame_pos);
         buf[..n].copy_from_slice(&self.frame[self.frame_pos..self.frame_pos + n]);
         self.frame_pos += n;
         Ok(n)
+    }
+
+    async fn read_frame<R: Read>(
+        &mut self,
+        inner: &mut R,
+        buf: &mut [u8; MAX_FRAME_PAYLOAD],
+    ) -> Result<usize, LinkError<R::Error>> {
+        self.frame_pos = self.frame_len;
+        if !self.receive_frame(inner).await? {
+            return Ok(0);
+        }
+        let n = self.frame_len;
+        buf[..n].copy_from_slice(&self.frame[..n]);
+        self.frame_pos = n;
+        Ok(n)
+    }
+}
+
+/// Transmit state of a COBS stream: the encoded frame being written and how far
+/// it has got. Owned by a [`CobsFramed`] or a [`CobsWriter`].
+struct TxState {
+    tx: [u8; ENCODED_FRAME],
+    tx_len: usize,
+    tx_pos: usize,
+    tx_accepted: usize,
+}
+
+impl TxState {
+    const fn new() -> Self {
+        Self {
+            tx: [0; ENCODED_FRAME],
+            tx_len: 0,
+            tx_pos: 0,
+            tx_accepted: 0,
+        }
+    }
+
+    async fn drain<W: Write>(&mut self, inner: &mut W) -> Result<(), LinkError<W::Error>> {
+        while self.tx_pos < self.tx_len {
+            let n = inner
+                .write(&self.tx[self.tx_pos..self.tx_len])
+                .await
+                .map_err(LinkError::Io)?;
+            if n == 0 {
+                return Err(LinkError::WriteZero);
+            }
+            self.tx_pos += n;
+        }
+        Ok(())
+    }
+
+    async fn write<W: Write>(
+        &mut self,
+        inner: &mut W,
+        buf: &[u8],
+    ) -> Result<usize, LinkError<W::Error>> {
+        if self.tx_pos >= self.tx_len {
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            let n = buf.len().min(MAX_FRAME_PAYLOAD);
+            // Encoding into memory cannot overflow `tx`.
+            let len = encode_from_slice_including_sentinels(&buf[..n], &mut self.tx)
+                .map_err(|_| LinkError::WriteZero)?;
+            self.tx_len = len;
+            self.tx_pos = 0;
+            self.tx_accepted = n;
+        }
+        self.drain(inner).await?;
+        self.tx_len = 0;
+        self.tx_pos = 0;
+        Ok(self.tx_accepted)
+    }
+
+    async fn flush<W: Write>(&mut self, inner: &mut W) -> Result<(), LinkError<W::Error>> {
+        self.drain(inner).await?;
+        self.tx_len = 0;
+        self.tx_pos = 0;
+        inner.flush().await.map_err(LinkError::Io)
+    }
+}
+
+/// COBS framing over a raw byte stream.
+///
+/// Each `write` call (up to [`MAX_FRAME_PAYLOAD`] bytes) becomes one
+/// zero-delimited COBS frame; `read` returns decoded frame payloads. Corrupt
+/// frames are dropped, and the stream resynchronises on the next delimiter.
+/// Receive work yields cooperatively after 32 bounded steps, even when the
+/// raw stream continuously returns empty/malformed frames or oversized garbage.
+///
+/// All state lives in the struct, so the `read`/`write` futures may be dropped
+/// and re-created at any await point, as ARQ does. If a `write` future is
+/// dropped while the frame is half sent, the next `write` finishes that frame
+/// first and reports the length accepted for it. Callers must therefore retry
+/// with the same data, as ARQ does.
+///
+/// [`cobs_split`] gives the same framing as two halves that can be used from
+/// different tasks.
+pub struct CobsFramed<S> {
+    inner: S,
+    rx: RxState,
+    tx: TxState,
+}
+
+impl<S> CobsFramed<S> {
+    /// Wrap a raw byte stream.
+    pub fn new(inner: S) -> Self {
+        Self {
+            inner,
+            rx: RxState::new(),
+            tx: TxState::new(),
+        }
+    }
+
+    /// Unwrap the raw stream.
+    pub fn into_inner(self) -> S {
+        self.inner
+    }
+}
+
+impl<S: ErrorType> ErrorType for CobsFramed<S> {
+    type Error = LinkError<S::Error>;
+}
+
+impl<S: Read> Read for CobsFramed<S> {
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+        self.rx.read(&mut self.inner, buf).await
     }
 }
 
@@ -298,60 +393,107 @@ impl<S: Read> CobsFramed<S> {
         &mut self,
         buf: &mut [u8; MAX_FRAME_PAYLOAD],
     ) -> Result<usize, LinkError<S::Error>> {
-        self.frame_pos = self.frame_len;
-        if !self.receive_frame().await? {
-            return Ok(0);
-        }
-        let n = self.frame_len;
-        buf[..n].copy_from_slice(&self.frame[..n]);
-        self.frame_pos = n;
-        Ok(n)
-    }
-}
-
-impl<S: Write> CobsFramed<S> {
-    async fn drain(&mut self) -> Result<(), LinkError<S::Error>> {
-        while self.tx_pos < self.tx_len {
-            let n = self
-                .inner
-                .write(&self.tx[self.tx_pos..self.tx_len])
-                .await
-                .map_err(LinkError::Io)?;
-            if n == 0 {
-                return Err(LinkError::WriteZero);
-            }
-            self.tx_pos += n;
-        }
-        Ok(())
+        self.rx.read_frame(&mut self.inner, buf).await
     }
 }
 
 impl<S: Write> Write for CobsFramed<S> {
     async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-        if self.tx_pos >= self.tx_len {
-            if buf.is_empty() {
-                return Ok(0);
-            }
-            let n = buf.len().min(MAX_FRAME_PAYLOAD);
-            // Encoding into memory cannot overflow `tx`.
-            let len = encode_from_slice_including_sentinels(&buf[..n], &mut self.tx)
-                .map_err(|_| LinkError::WriteZero)?;
-            self.tx_len = len;
-            self.tx_pos = 0;
-            self.tx_accepted = n;
-        }
-        self.drain().await?;
-        self.tx_len = 0;
-        self.tx_pos = 0;
-        Ok(self.tx_accepted)
+        self.tx.write(&mut self.inner, buf).await
     }
 
     async fn flush(&mut self) -> Result<(), Self::Error> {
-        self.drain().await?;
-        self.tx_len = 0;
-        self.tx_pos = 0;
-        self.inner.flush().await.map_err(LinkError::Io)
+        self.tx.flush(&mut self.inner).await
     }
+}
+
+/// The read half of a COBS stream, from [`cobs_split`].
+///
+/// Reads exactly as [`CobsFramed`] does, and shares no state with the write
+/// half, so a pending read never waits on a write and the reverse.
+pub struct CobsReader<R> {
+    inner: R,
+    rx: RxState,
+}
+
+impl<R> CobsReader<R> {
+    /// Unwrap the raw read half.
+    pub fn into_inner(self) -> R {
+        self.inner
+    }
+}
+
+impl<R: ErrorType> ErrorType for CobsReader<R> {
+    type Error = LinkError<R::Error>;
+}
+
+impl<R: Read> Read for CobsReader<R> {
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+        self.rx.read(&mut self.inner, buf).await
+    }
+}
+
+impl<R: Read> CobsReader<R> {
+    /// [`CobsFramed::read_frame`] on this half.
+    pub async fn read_frame(
+        &mut self,
+        buf: &mut [u8; MAX_FRAME_PAYLOAD],
+    ) -> Result<usize, LinkError<R::Error>> {
+        self.rx.read_frame(&mut self.inner, buf).await
+    }
+}
+
+/// The write half of a COBS stream, from [`cobs_split`].
+///
+/// Writes exactly as [`CobsFramed`] does. A frame half sent when its write
+/// future was dropped is finished by the next write, which must repeat the same
+/// data, and nothing is encoded twice.
+pub struct CobsWriter<W> {
+    inner: W,
+    tx: TxState,
+}
+
+impl<W> CobsWriter<W> {
+    /// Unwrap the raw write half.
+    pub fn into_inner(self) -> W {
+        self.inner
+    }
+}
+
+impl<W: ErrorType> ErrorType for CobsWriter<W> {
+    type Error = LinkError<W::Error>;
+}
+
+impl<W: Write> Write for CobsWriter<W> {
+    async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+        self.tx.write(&mut self.inner, buf).await
+    }
+
+    async fn flush(&mut self) -> Result<(), Self::Error> {
+        self.tx.flush(&mut self.inner).await
+    }
+}
+
+/// Frame a raw stream as two independent COBS halves: a [`CobsReader`] and a
+/// [`CobsWriter`].
+///
+/// Both halves start with fresh state. Splitting an existing [`CobsFramed`]
+/// is not possible, so bytes it has buffered are never discarded by a split:
+/// split before the stream carries any frames.
+///
+/// The halves share no state, so a read can wait while a write is in progress
+/// on the other half. Each half has the same cancel-safety as [`CobsFramed`].
+pub fn cobs_split<R, W>(reader: R, writer: W) -> (CobsReader<R>, CobsWriter<W>) {
+    (
+        CobsReader {
+            inner: reader,
+            rx: RxState::new(),
+        },
+        CobsWriter {
+            inner: writer,
+            tx: TxState::new(),
+        },
+    )
 }
 
 /// [`CobsFramed`] as the framed lower transport of ARQ.
@@ -496,6 +638,43 @@ impl<S: Read + Write, Tmr: Timer> Write for ReliableLink<S, Tmr> {
         poll_fn(|cx| self.arq.poll_flush(cx))
             .await
             .map_err(ReliableError)
+    }
+}
+
+impl<S: Read + Write, Tmr: Timer> ReliableLink<S, Tmr> {
+    /// Poll for received bytes, as [`Read::read`] does, for drivers that keep
+    /// their own buffers. An empty `buf` is ready at once.
+    pub(crate) fn poll_read_bytes(
+        &mut self,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<Result<usize, ReliableError<S::Error>>> {
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        self.arq.poll_read(cx, buf).map_err(ReliableError)
+    }
+
+    /// Poll to accept bytes, as [`Write::write`] does. The same bytes must be
+    /// passed again until the poll is ready, which is what drivers do.
+    pub(crate) fn poll_write_bytes(
+        &mut self,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, ReliableError<S::Error>>> {
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        self.arq.poll_write(cx, buf).map_err(ReliableError)
+    }
+
+    /// Poll until everything accepted so far is acknowledged, as
+    /// [`Write::flush`] does.
+    pub(crate) fn poll_flush_bytes(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), ReliableError<S::Error>>> {
+        self.arq.poll_flush(cx).map_err(ReliableError)
     }
 }
 

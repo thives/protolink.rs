@@ -19,6 +19,7 @@ use core::time::Duration;
 use embedded_io::{Error as _, ErrorKind, Read, Write};
 
 use crate::builder::{DeadlinesUnspecified, client_config_methods, server_config_methods};
+use crate::error::client_failure_status;
 use crate::grpc::{
     self, BlockingStreamingCall, BlockingStreamingTransport, BlockingUnaryTransport, CallId,
     CallOptions, ClientConfig, Handler, Metadata, Next, Response, ServerConfig, Status,
@@ -552,6 +553,16 @@ impl<IO: Read + Write, C: Clock> Server<IO, C> {
     }
 }
 
+/// Ends the connection if the server has latched a failure. An output-limit
+/// failure leaves no room for a GOAWAY, so nothing more is read, written or
+/// flushed once it is set, and it is never taken for a clean closure.
+fn check_failed<E>(server: &grpc::Server) -> Result<(), Error<E>> {
+    match server.failure() {
+        Some(error) => Err(Error::from_connection(error.clone())),
+        None => Ok(()),
+    }
+}
+
 /// The serving loop of every [`Server`] configuration.
 ///
 /// `read` waits for input, at most for the timeout it is given (the time left
@@ -577,10 +588,13 @@ where
     let mut buf = [0u8; READ_CHUNK];
     loop {
         server.tick(clock.now(), &mut *handler);
-        // Producing output can make room for more, so poll until idle.
+        // Producing output can make room for more, so poll until idle. A failure
+        // latched by the tick or by a handler ends the connection before any I/O.
         loop {
             server.tick(clock.now(), &mut *handler);
+            check_failed::<IO::Error>(server)?;
             server.poll(&mut *handler, cx);
+            check_failed::<IO::Error>(server)?;
             if !server.has_output() {
                 break;
             }
@@ -594,6 +608,7 @@ where
         set_output(io, remaining(server.next_deadline(), clock.now()), true);
         io.flush().map_err(Error::Io)?;
         server.tick(clock.now(), &mut *handler);
+        check_failed::<IO::Error>(server)?;
         server.output_flushed();
         if server.has_output() {
             continue;
@@ -611,14 +626,19 @@ where
         };
         // Calls that start with this input get their deadline from now.
         server.tick(clock.now(), &mut *handler);
+        check_failed::<IO::Error>(server)?;
         if let Err(e) = server.recv(&buf[..n], handler) {
+            // An overload writes nothing more: the output is what is full.
+            if matches!(e, grpc::http2::Error::OutputLimitExceeded { .. }) {
+                return Err(Error::from_connection(e));
+            }
             if io.write_all(server.pending_output()).is_ok() {
                 server.consume_output(server.pending_output().len());
                 if io.flush().is_ok() {
                     server.output_flushed();
                 }
             }
-            return Err(Error::Protocol(e));
+            return Err(Error::from_connection(e));
         }
     }
 }
@@ -802,6 +822,19 @@ fn retire<IO>(state: &mut State<IO>, status: Status) {
     }
 }
 
+/// Retire the connection if the sans-IO client has latched a failure, so that
+/// no I/O starts on it. Returns whether the connection is still usable.
+///
+/// Every operation that can latch a failure calls this afterwards, including
+/// one whose result is an error: a failed mutation must not leave the transport
+/// usable.
+fn reconcile<IO>(state: &mut State<IO>) -> bool {
+    if let Some(status) = state.inner.failure().map(client_failure_status) {
+        retire(state, status);
+    }
+    state.terminal.is_none()
+}
+
 impl<IO: Read + Write, C: Clock> Client<IO, C> {
     fn from_parts(
         io: IO,
@@ -828,7 +861,10 @@ impl<IO: Read + Write, C: Clock> Client<IO, C> {
     /// Report the current time to the call state, expiring calls.
     fn tick(&self) {
         let now = self.clock.now();
-        self.with(|s| s.inner.tick(now));
+        self.with(|s| {
+            s.inner.tick(now);
+            reconcile(s);
+        });
     }
 
     /// Perform one unary call.
@@ -851,11 +887,20 @@ impl<IO: Read + Write, C: Clock> Client<IO, C> {
             if let Some(status) = &s.terminal {
                 return Err(status.clone());
             }
-            s.inner.start_unary_with(path, request, &options)
+            let started = s.inner.start_unary_with(path, request, &options);
+            reconcile(s);
+            started
         })?;
         loop {
             self.tick();
-            if let Some(result) = self.with(|s| s.inner.take_response(id)) {
+            // Consuming the result can release capacity that does not fit; the
+            // result itself is still returned.
+            let taken = self.with(|s| {
+                let taken = s.inner.take_response(id);
+                reconcile(s);
+                taken
+            });
+            if let Some(result) = taken {
                 return result;
             }
             if self.write_output() && self.with(|s| s.inner.is_pending(id)) {
@@ -884,7 +929,9 @@ impl<IO: Read + Write, C: Clock> Client<IO, C> {
             if let Some(status) = &s.terminal {
                 return Err(status.clone());
             }
-            s.inner.start_streaming_with(path, &options)
+            let started = s.inner.start_streaming_with(path, &options);
+            reconcile(s);
+            started
         })?;
         Ok(Call {
             client: self,
@@ -914,10 +961,13 @@ impl<IO: Read + Write, C: Clock> Client<IO, C> {
     /// transport failed.
     fn write_output(&self) -> bool {
         self.with(|s| {
-            if s.terminal.is_some() {
+            if !reconcile(s) {
                 return false;
             }
             s.inner.tick(self.clock.now());
+            if !reconcile(s) {
+                return false;
+            }
             while s.inner.has_output() {
                 let deadline = s.inner.next_deadline();
                 if let Some(set) = self.set_output_timeout {
@@ -932,7 +982,13 @@ impl<IO: Read + Write, C: Clock> Client<IO, C> {
                         return false;
                     }
                 }
+                // The tick after a short write can latch a failure, such as an expired
+                // call's reset that does not fit behind the bytes still queued. The
+                // rest of the output is then not written.
                 s.inner.tick(self.clock.now());
+                if !reconcile(s) {
+                    return false;
+                }
                 if self.set_output_timeout.is_some()
                     && deadline.is_some_and(|d| self.clock.now() >= d)
                 {
@@ -950,12 +1006,18 @@ impl<IO: Read + Write, C: Clock> Client<IO, C> {
                 retire(s, Status::unavailable("transport flush failed"));
                 return false;
             }
+            // The tick can expire calls whose resets then overflow the output.
+            // That latched failure is the diagnosis, so it is adopted before the
+            // generic output deadline below can replace it.
+            if !reconcile(s) {
+                return false;
+            }
             if self.set_output_timeout.is_some() && deadline.is_some_and(|d| self.clock.now() >= d)
             {
                 retire(s, Status::unavailable("transport output deadline exceeded"));
                 return false;
             }
-            true
+            reconcile(s)
         })
     }
 
@@ -963,10 +1025,13 @@ impl<IO: Read + Write, C: Clock> Client<IO, C> {
         let mut buf = [0u8; READ_CHUNK];
         let idle_timeouts = self.idle_timeouts;
         self.with(|s| {
-            if s.terminal.is_some() {
+            if !reconcile(s) {
                 return;
             }
             s.inner.tick(self.clock.now());
+            if !reconcile(s) {
+                return;
+            }
             // Output/expiry may have completed the last call. Never start an
             // unbounded read after its deadline has already elapsed.
             if !s.inner.is_pending(id) {
@@ -982,13 +1047,14 @@ impl<IO: Read + Write, C: Clock> Client<IO, C> {
             match result {
                 Ok(0) => retire(s, Status::unavailable("connection closed")),
                 Ok(n) => {
-                    if s.inner.recv(&buf[..n]).is_err() {
-                        retire(s, Status::unavailable("connection protocol error"));
+                    if let Err(error) = s.inner.recv(&buf[..n]) {
+                        retire(s, client_failure_status(&error));
                     }
                 }
                 Err(e) if idle_timeouts && timed_out(e.kind()) => {}
                 Err(_) => retire(s, Status::unavailable("transport read failed")),
             }
+            reconcile(s);
         });
     }
 }
@@ -1056,7 +1122,9 @@ impl<IO: Read + Write, C: Clock> Call<'_, IO, C> {
             if !s.inner.is_pending(id) {
                 return Ok(false);
             }
-            s.inner.send_message(id, message).map(|()| true)
+            let sent = s.inner.send_message(id, message).map(|()| true);
+            reconcile(s);
+            sent
         })?;
         if queued {
             client.write_output();
@@ -1071,11 +1139,16 @@ impl<IO: Read + Write, C: Clock> Call<'_, IO, C> {
         }
         let client = self.client;
         let id = self.id;
+        // Expire a call that is already due before queueing END_STREAM: a
+        // failure of that output must not replace its deadline.
+        client.tick();
         let queued = client.with(|s| {
             if !s.inner.is_pending(id) {
                 return Ok(false);
             }
-            s.inner.close_send(id).map(|()| true)
+            let closed = s.inner.close_send(id).map(|()| true);
+            reconcile(s);
+            closed
         })?;
         if queued {
             client.write_output();
@@ -1093,7 +1166,12 @@ impl<IO: Read + Write, C: Clock> Call<'_, IO, C> {
         let id = self.id;
         loop {
             client.tick();
-            match client.with(|s| s.inner.try_next(id)) {
+            let next = client.with(|s| {
+                let next = s.inner.try_next(id);
+                reconcile(s);
+                next
+            });
+            match next {
                 Some(Next::Message(m)) => return Ok(Some(m)),
                 Some(Next::Done(result)) => {
                     self.metadata = client.with(|s| s.inner.take_metadata(id));
@@ -1140,6 +1218,7 @@ impl<IO, C> Drop for Call<'_, IO, C> {
         // allowed.
         if let Ok(mut s) = self.client.state.try_borrow_mut() {
             s.inner.cancel(self.id);
+            reconcile(&mut s);
         }
     }
 }

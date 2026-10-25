@@ -8,6 +8,7 @@ use protolink_http2::{Config, Connection, Error, ErrorCode, Event, FlowControl, 
 
 use crate::compression::Compression;
 use crate::fields::{field, header};
+use crate::lifecycle::failure_status;
 use crate::status::decode_message;
 use crate::{
     CallId, Code, DEFAULT_MAX_MESSAGE_SIZE, Metadata, Next, Response, Status, lpm, timeout,
@@ -376,9 +377,13 @@ impl Client {
         }
         let frame = self.frame(request)?;
         let id = self.open(path, true, options)?;
-        self.conn
-            .send_data(id, frame, true)
-            .map_err(|_| Status::internal("failed to queue request"))?;
+        let queued = self.conn.send_data(id, frame, true);
+        if let Err(status) = self.queued(queued, "failed to queue request") {
+            // The call never started: it is forgotten, and the other calls have
+            // ended with the connection's failure.
+            self.cancel(id);
+            return Err(status);
+        }
         Ok(id)
     }
 
@@ -444,10 +449,18 @@ impl Client {
         }
         // Custom metadata goes after the headers gRPC defines.
         options.metadata.append_fields(&mut headers);
-        let id = self.conn.open_stream(headers, false).map_err(|e| match e {
-            Error::GoingAway => Status::unavailable("connection is going away"),
-            _ => Status::unavailable("connection failed"),
-        })?;
+        let id = match self.conn.open_stream(headers, false) {
+            Ok(id) => id,
+            Err(e) => {
+                // Opening can latch an output limit, which ends every call.
+                self.adopt_failure();
+                return Err(match e {
+                    Error::GoingAway => Status::unavailable("connection is going away"),
+                    Error::OutputLimitExceeded { .. } => failure_status(&e),
+                    _ => Status::unavailable("connection failed"),
+                });
+            }
+        };
         self.conn
             .retain_receive_capacity(id)
             .map_err(|_| Status::internal("failed to retain response capacity"))?;
@@ -487,9 +500,9 @@ impl Client {
         if call.send_closed {
             return Err(Status::failed_precondition("request stream already closed"));
         }
-        self.conn
-            .send_data(id, self.frame(message)?, false)
-            .map_err(|_| Status::internal("failed to queue request"))
+        let framed = self.frame(message)?;
+        let queued = self.conn.send_data(id, framed, false);
+        self.queued(queued, "failed to queue request")
     }
 
     /// Half-close a streaming call: no more request messages. Responses keep
@@ -500,9 +513,8 @@ impl Client {
             return Ok(());
         }
         call.send_closed = true;
-        self.conn
-            .send_data(id, Vec::new(), true)
-            .map_err(|_| Status::internal("failed to close request stream"))
+        let queued = self.conn.send_data(id, Vec::new(), true);
+        self.queued(queued, "failed to close request stream")
     }
 
     /// Whether [`send_message`](Self::send_message) can be called without
@@ -529,6 +541,8 @@ impl Client {
         if let Some(message) = call.inbound.take_message() {
             self.conn.release_capacity(id, message.credit);
             call.inbound.release_partial(&mut self.conn, id);
+            // A message received before a failure is still delivered.
+            self.adopt_failure();
             return Some(Next::Message(message.message));
         }
         let status = call.status.take()?;
@@ -572,10 +586,42 @@ impl Client {
         while let Some(event) = self.conn.poll_event() {
             self.on_event(event);
         }
-        if result.is_err() {
-            self.fail_all(Status::unavailable("connection error"));
+        // Handling the events can latch a failure too, such as a credit release
+        // that does not fit. The input is not successful then.
+        let result = match (result, self.conn.failure()) {
+            (Ok(()), Some(error)) => Err(error.clone()),
+            (result, _) => result,
+        };
+        if let Err(error) = &result {
+            self.fail_all(failure_status(error));
         }
         result
+    }
+
+    /// The connection's terminal failure, if it has one. Every call has then
+    /// completed; buffered responses stay available.
+    pub fn failure(&self) -> Option<&Error> {
+        self.conn.failure()
+    }
+
+    /// Adopt a failure that the connection latched while the client did work
+    /// for it. Every call still in flight completes with the failure's status,
+    /// keeping the responses it has already received. Returns that status.
+    fn adopt_failure(&mut self) -> Option<Status> {
+        let status = failure_status(self.conn.failure()?);
+        self.fail_all(status.clone());
+        Some(status)
+    }
+
+    /// The outcome of queueing on the connection: a failure that also ended
+    /// every call reports the failure, anything else `message`.
+    fn queued(&mut self, queued: Result<(), Error>, message: &'static str) -> Result<(), Status> {
+        match queued {
+            Ok(()) => Ok(()),
+            Err(_) => Err(self
+                .adopt_failure()
+                .unwrap_or_else(|| Status::internal(message))),
+        }
     }
 
     /// Report the current time and fail every call whose deadline has been
@@ -600,6 +646,7 @@ impl Client {
                 Some(ErrorCode::Cancel),
             );
         }
+        self.adopt_failure();
     }
 
     /// Latest time reported through [`tick`](Self::tick).
@@ -624,6 +671,8 @@ impl Client {
     pub fn take_response(&mut self, id: CallId) -> Option<Result<Response<Vec<u8>>, Status>> {
         let completed = self.done.remove(&id)?;
         self.conn.release_capacity(id, completed.credit);
+        // The result was received before the failure, so it is still returned.
+        self.adopt_failure();
         Some(completed.result)
     }
 
@@ -642,6 +691,7 @@ impl Client {
             self.conn.release_capacity(id, completed.credit);
         }
         self.finished_metadata.remove(&id);
+        self.adopt_failure();
     }
 
     /// Mark every in-flight call as failed with `status`, e.g. when the

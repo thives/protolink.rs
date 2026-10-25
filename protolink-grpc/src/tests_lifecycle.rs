@@ -244,3 +244,82 @@ fn trailers_only_success_and_error_carry_their_metadata() {
     assert_eq!(status.message, "denied");
     assert_eq!(status.metadata.get("x-status"), Some("error"));
 }
+
+/// A PING from the peer, which the lifecycle answers with a 17-byte frame.
+const PING: [u8; 17] = [0, 0, 8, 6, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8];
+
+#[test]
+fn flush_a_append_b_complete_a_defers_retirement() {
+    let mut peers = Peers::new(Compression::NONE);
+    let (_, id) = peers.start();
+    peers
+        .gateway
+        .finish(id, Ok(()), ResponseMetadata::default());
+    assert_eq!(peers.gateway.draining().len(), 1);
+
+    // Output A is written, and its flush begins.
+    let a = peers.gateway.pending_output().len();
+    assert!(a > 0);
+    peers.gateway.consume_output(a);
+
+    // Input appends B while that flush is pending.
+    peers.gateway.recv(&PING, |_| None).unwrap();
+    let b = peers.gateway.pending_output().len();
+    assert_eq!(b, 17);
+
+    // A's flush completes, but B is still unwritten: nothing is acknowledged,
+    // so the call's output stays accounted for.
+    peers.gateway.output_flushed();
+    assert_eq!(peers.gateway.draining().len(), 1);
+
+    // Flushing B completes the retirement.
+    peers.gateway.consume_output(b);
+    peers.gateway.output_flushed();
+    assert_eq!(peers.gateway.draining().len(), 0);
+}
+
+#[test]
+fn output_limit_during_finish_cancels_calls_and_keeps_no_draining() {
+    // Room for the server's handshake and the ACK of the caller's SETTINGS, and
+    // nothing more: a response cannot be queued once the call finishes.
+    let handshake = Lifecycle::<()>::new(ServerConfig::default())
+        .pending_output()
+        .len();
+    let limit = handshake + 9;
+    let mut peers = Peers {
+        caller: Client::new(ClientConfig {
+            compression: Compression::new(&ACCEPT_RLE),
+            ..ClientConfig::default()
+        }),
+        gateway: Lifecycle::new(ServerConfig {
+            max_message_size: LIMIT,
+            http2: protolink_http2::Config {
+                max_pending_output_bytes: limit,
+                ..ServerConfig::default().http2
+            },
+            ..ServerConfig::default()
+        }),
+    };
+    let caller_id = peers.caller.start_streaming(PATH).unwrap();
+    peers.caller.close_send(caller_id).unwrap();
+    peers.exchange();
+    assert!(peers.gateway.failure().is_none());
+    let Some(CallEvent::Started { id, .. }) = peers.gateway.poll_event() else {
+        panic!("call did not start");
+    };
+
+    peers
+        .gateway
+        .finish(id, Ok(()), ResponseMetadata::default());
+    assert!(matches!(
+        peers.gateway.failure(),
+        Some(protolink_http2::Error::OutputLimitExceeded { limit: l, .. }) if *l == limit
+    ));
+    assert!(
+        peers.gateway.draining().is_empty(),
+        "no delivery is awaited"
+    );
+    assert!(peers.gateway.is_closed());
+    assert!(peers.gateway.pending_output().len() <= limit);
+    assert!(!peers.gateway.has_call(id));
+}

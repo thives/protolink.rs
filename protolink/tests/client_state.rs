@@ -11,7 +11,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use protolink::grpc::{CallContext, CallId, Code, Handler, MethodKind, Next, Route, Status};
-use protolink::{CallOptions, StreamingTransport};
+use protolink::{CallOptions, Serial, StreamingTransport};
 
 const ECHO: &str = "/t.T/Echo";
 const CHAT: &str = "/t.T/Chat";
@@ -101,7 +101,7 @@ impl Handler for Echoes {
 /// A client connected to an `Echoes` server, and the server's cancel counter.
 fn connect() -> (
     protolink::Client<
-        protolink::tokio::FromTokio<tokio::io::DuplexStream>,
+        protolink::Serial<protolink::tokio::FromTokio<tokio::io::DuplexStream>>,
         protolink::tokio::TokioTimer,
     >,
     Arc<AtomicUsize>,
@@ -113,12 +113,12 @@ fn connect() -> (
         ..Echoes::default()
     };
     tokio::spawn(async move {
-        let _ = protolink::tokio::server(a)
+        let _ = protolink::tokio::server_serial(a)
             .build()
             .serve(&mut handler)
             .await;
     });
-    (protolink::tokio::client(b).build(), cancelled)
+    (protolink::tokio::client_serial(b).build(), cancelled)
 }
 
 async fn wait_for(counter: &AtomicUsize, expected: usize) {
@@ -290,12 +290,12 @@ async fn concurrent_peer_disconnect_fails_every_call() {
     let (a, b) = tokio::io::duplex(16 * 1024);
     let server = tokio::spawn(async move {
         let mut handler = Echoes::default();
-        let _ = protolink::tokio::server(a)
+        let _ = protolink::tokio::server_serial(a)
             .build()
             .serve(&mut handler)
             .await;
     });
-    let client = protolink::tokio::client(b).build();
+    let client = protolink::tokio::client_serial(b).build();
     with_timeout(async {
         let mut first = client.streaming(GATE).unwrap();
         let mut second = client.streaming(GATE).unwrap();
@@ -378,9 +378,9 @@ fn async_client_and_calls_are_send_and_sync() {
     fn send<T: Send>() {}
     fn sync<T: Sync>() {}
     type Io = protolink::tokio::FromTokio<tokio::io::DuplexStream>;
-    send::<protolink::Client<Io>>();
-    sync::<protolink::Client<Io>>();
-    send::<protolink::Call<'static, Io>>();
+    send::<protolink::Client<Serial<Io>>>();
+    sync::<protolink::Client<Serial<Io>>>();
+    send::<protolink::Call<'static, Serial<Io>>>();
 }
 
 #[cfg(feature = "blocking")]

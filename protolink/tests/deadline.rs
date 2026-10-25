@@ -89,7 +89,7 @@ impl Handler for Peer {
 }
 
 type TokioClient = protolink::Client<
-    protolink::tokio::FromTokio<tokio::io::DuplexStream>,
+    protolink::Serial<protolink::tokio::FromTokio<tokio::io::DuplexStream>>,
     protolink::tokio::TokioTimer,
 >;
 
@@ -109,7 +109,7 @@ fn connect() -> (TokioClient, Arc<AtomicUsize>) {
             .serve(&mut handler)
             .await;
     });
-    (protolink::tokio::client(b).build(), cancelled)
+    (protolink::tokio::client_serial(b).build(), cancelled)
 }
 
 async fn wait_for(counter: &AtomicUsize, expected: usize) {
@@ -134,7 +134,7 @@ fn assert_elapsed(start: Instant, at_least: Duration, below: Duration) {
 #[tokio::test(start_paused = true)]
 async fn unary_times_out_without_an_answer() {
     let (_server, b) = tokio::io::duplex(16 * 1024);
-    let mut client = protolink::tokio::client(b).build();
+    let mut client = protolink::tokio::client_serial(b).build();
     let start = Instant::now();
     let err = with_timeout(client.unary_with(ECHO, b"hi", CallOptions::timeout(ms(250))))
         .await
@@ -150,7 +150,9 @@ async fn default_timeout_applies_to_every_call() {
         default_timeout: Some(ms(100)),
         ..ClientConfig::default()
     };
-    let mut client = protolink::tokio::client(b).with_config(config).build();
+    let mut client = protolink::tokio::client_serial(b)
+        .with_config(config)
+        .build();
     let start = Instant::now();
     let err = with_timeout(client.unary(ECHO, b"hi")).await.unwrap_err();
     assert_eq!(err.code, Code::DeadlineExceeded);
@@ -167,7 +169,7 @@ async fn default_timeout_applies_to_every_call() {
 #[tokio::test(start_paused = true)]
 async fn zero_timeout_fails_without_sending() {
     let (mut server, b) = tokio::io::duplex(16 * 1024);
-    let mut client = protolink::tokio::client(b).build();
+    let mut client = protolink::tokio::client_serial(b).build();
     let err = client
         .unary_with(ECHO, b"hi", CallOptions::timeout(Duration::ZERO))
         .await
@@ -318,7 +320,7 @@ async fn server_enforces_the_deadline_for_a_client_without_a_clock() {
         ..Peer::default()
     };
     tokio::spawn(async move {
-        let _ = protolink::tokio::server(a)
+        let _ = protolink::tokio::server_serial(a)
             .build()
             .serve(&mut handler)
             .await;
@@ -427,12 +429,12 @@ async fn aborting_server_task_cancels_each_active_call_once() {
         cancelled: cancelled.clone(),
     };
     let server = tokio::spawn(async move {
-        protolink::tokio::server(a)
+        protolink::tokio::server_serial(a)
             .build()
             .serve(&mut handler)
             .await
     });
-    let client = protolink::tokio::client(b).build();
+    let client = protolink::tokio::client_serial(b).build();
     let mut first = client.streaming(QUIET).unwrap();
     let mut second = client.streaming(QUIET).unwrap();
     first.send(b"one").await.unwrap();

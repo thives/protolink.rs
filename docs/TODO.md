@@ -1,4 +1,4 @@
-1. Make blocked writes compatible with ongoing reads. Drivers don't read while a transport write is blocked, so bidi traffic can stall on transports with small buffers. Interleaving sends and receives, or using a transport with more buffering, is the current workaround ("Known limitations" in `STREAMING_GAP.md`). A split read/write transport API would fix this.
+1. Done for the duplex, split COBS and coordinated reliable endpoints: blocked writes no longer stop reads, as the small-pipe and sustained transfer tests show (see the [implementation plan](TRANSPORT_BACKPRESSURE.md)). Serialized and blocking paths keep their documented limits, and the interleaving workaround in `STREAMING_GAP.md` still applies to them.
 
 Add:
 * reflection?

@@ -17,7 +17,7 @@ use cobs_io_async::sync::{decode_to_slice, encode_from_slice_including_sentinels
 use embedded_io_async::{Error as _, ErrorKind, ErrorType, Read, Write};
 use protolink::link::{
     CobsFramed, CobsTransport, LinkError, MAX_FRAME_PAYLOAD, ReliableError, StdTimer, Timer,
-    reliable,
+    cobs_split, reliable,
 };
 use protolink::tokio::FromTokio;
 
@@ -1291,6 +1291,208 @@ async fn dropped_upper_read_loses_no_data_and_strands_nothing() {
         };
         let ((), got) = tokio::join!(writer, reader);
         assert_eq!(&got, b"after the drop");
+    })
+    .await;
+}
+
+// --- Split COBS halves ---------------------------------------------------------
+
+/// Accepts up to three bytes per call until `limit` bytes were accepted, then
+/// never completes a write: a transmit that stalls part-way through a frame.
+struct StallAfter {
+    sent: Rc<RefCell<Vec<u8>>>,
+    limit: usize,
+}
+
+impl ErrorType for StallAfter {
+    type Error = Infallible;
+}
+
+impl Write for StallAfter {
+    async fn write(&mut self, buf: &[u8]) -> Result<usize, Infallible> {
+        let sent = self.sent.borrow().len();
+        if sent >= self.limit {
+            return core::future::pending().await;
+        }
+        let n = buf.len().min(3).min(self.limit - sent);
+        self.sent.borrow_mut().extend_from_slice(&buf[..n]);
+        Ok(n)
+    }
+
+    async fn flush(&mut self) -> Result<(), Infallible> {
+        core::future::pending().await
+    }
+}
+
+/// A frame cut off by its write future and sent again with the same data is
+/// finished by the retry: it is neither encoded nor sent twice.
+#[test]
+fn cobs_split_writer_resumes_without_replay() {
+    let wire = Trickle::new(Vec::new());
+    let written = wire.written.clone();
+    let (_rx, mut tx) = cobs_split(Trickle::new(Vec::new()), wire);
+    let frame: Vec<u8> = (0..100u8).collect();
+    let encoded = encode_frame(&frame);
+    let mut cx = Context::from_waker(Waker::noop());
+
+    // Drop the write once part of the frame has gone out.
+    {
+        let mut partial = pin!(tx.write(&frame));
+        for _ in 0..10_000 {
+            if written.borrow().len() >= 3 {
+                break;
+            }
+            assert!(partial.as_mut().poll(&mut cx).is_pending());
+        }
+    }
+    assert!(
+        written.borrow().len() < encoded.len(),
+        "the frame was already sent in full"
+    );
+
+    let (n, _) = poll_until(|cx| {
+        let mut retry = pin!(tx.write(&frame));
+        retry.as_mut().poll(cx)
+    });
+    assert_eq!(n.unwrap(), frame.len());
+    assert_eq!(*written.borrow(), encoded);
+
+    // The next frame starts cleanly.
+    let (n, _) = poll_until(|cx| {
+        let mut next = pin!(tx.write(&[7, 0, 7]));
+        next.as_mut().poll(cx)
+    });
+    assert_eq!(n.unwrap(), 3);
+    let mut all = encoded;
+    all.extend(encode_frame(&[7, 0, 7]));
+    assert_eq!(*written.borrow(), all);
+}
+
+/// The read half keeps receiving while the write half is stuck part-way
+/// through a frame, because the two halves share no state.
+#[tokio::test]
+async fn cobs_split_rx_progresses_during_partial_encoded_write() {
+    let sent = Rc::new(RefCell::new(Vec::new()));
+    let (mut rx, mut tx) = cobs_split(
+        Trickle::new(encode_frame(&[4, 5, 6])),
+        StallAfter {
+            sent: sent.clone(),
+            limit: 5,
+        },
+    );
+    let mut buf = [0u8; MAX_FRAME_PAYLOAD];
+    let n = with_timeout(async {
+        let send = async { tx.write(&[9; 20]).await.unwrap() };
+        let receive = async { rx.read_frame(&mut buf).await.unwrap() };
+        tokio::select! {
+            biased;
+            n = receive => n,
+            _ = send => panic!("a write completed past the stall"),
+        }
+    })
+    .await;
+    assert_eq!(&buf[..n], &[4, 5, 6]);
+    assert_eq!(sent.borrow().len(), 5, "the write stalled part-way");
+}
+
+/// Noise on the read half: the split reader yields to its caller within a
+/// bounded amount of work, and the frame after the noise is still delivered.
+#[test]
+fn cobs_split_reader_yields_during_noise_and_keeps_the_following_frame() {
+    let cases = [
+        (vec![0; 8192], 1),
+        (vec![0; 8192], usize::MAX),
+        ([1, 0].repeat(4096), usize::MAX),
+        ([255, 0].repeat(4096), 7),
+    ];
+    for (garbage, chunk) in cases {
+        let mut bytes = garbage;
+        bytes.extend(encode_frame(&[3, 0, 7, 8]));
+        let input = Rc::new(RefCell::new(Pipe {
+            bytes: bytes.into(),
+            reader: None,
+        }));
+        let stats = Rc::new(RefCell::new(ReadyStats::default()));
+        let idle_writer = ReadyWire {
+            input: Rc::new(RefCell::new(Pipe {
+                bytes: VecDeque::new(),
+                reader: None,
+            })),
+            noise: Rc::new(Cell::new(None)),
+            stats: stats.clone(),
+            chunk,
+        };
+        let reader = ReadyWire {
+            input,
+            noise: Rc::new(Cell::new(None)),
+            stats: stats.clone(),
+            chunk,
+        };
+        let (mut rx, _tx) = cobs_split(reader, idle_writer);
+
+        let wakes = Arc::new(CountWake::default());
+        let waker = Waker::from(wakes.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut buf = [0; MAX_FRAME_PAYLOAD];
+        let mut delivered = false;
+        for poll in 0..100_000 {
+            let before_reads = stats.borrow().reads;
+            let before_wakes = wakes.0.load(Ordering::Relaxed);
+            let result = pin!(rx.read_frame(&mut buf)).poll(&mut cx);
+            assert!(stats.borrow().reads - before_reads <= 32);
+            if poll == 0 {
+                assert!(result.is_pending(), "unbounded noise scan: chunk {chunk}");
+            }
+            match result {
+                Poll::Pending => {
+                    assert!(wakes.0.load(Ordering::Relaxed) > before_wakes);
+                }
+                Poll::Ready(result) => {
+                    let n = result.unwrap();
+                    assert_eq!(&buf[..n], &[3, 0, 7, 8]);
+                    delivered = true;
+                    break;
+                }
+            }
+        }
+        assert!(delivered, "following frame lost: chunk {chunk}");
+    }
+}
+
+/// Two pairs of halves over a pipe exchange frames in both directions.
+#[tokio::test]
+async fn cobs_split_halves_exchange_frames_both_ways() {
+    let (a, b) = tokio::io::duplex(64);
+    let (a_rd, a_wr) = tokio::io::split(a);
+    let (b_rd, b_wr) = tokio::io::split(b);
+    let (mut a_rx, mut a_tx) = cobs_split(FromTokio::new(a_rd), FromTokio::new(a_wr));
+    let (mut b_rx, mut b_tx) = cobs_split(FromTokio::new(b_rd), FromTokio::new(b_wr));
+    let frames: Vec<Vec<u8>> = (0..20u8).map(|i| vec![i, 0, i.wrapping_mul(3)]).collect();
+
+    with_timeout(async {
+        let a_side = async {
+            for frame in &frames {
+                a_tx.write_all(frame).await.unwrap();
+            }
+            a_tx.flush().await.unwrap();
+            let mut buf = [0u8; MAX_FRAME_PAYLOAD];
+            let n = a_rx.read_frame(&mut buf).await.unwrap();
+            buf[..n].to_vec()
+        };
+        let b_side = async {
+            let mut got = Vec::new();
+            let mut buf = [0u8; MAX_FRAME_PAYLOAD];
+            for _ in 0..20 {
+                let n = b_rx.read_frame(&mut buf).await.unwrap();
+                got.push(buf[..n].to_vec());
+            }
+            b_tx.write_all(b"reply").await.unwrap();
+            b_tx.flush().await.unwrap();
+            got
+        };
+        let (reply, got) = tokio::join!(a_side, b_side);
+        assert_eq!(got, frames);
+        assert_eq!(reply, b"reply");
     })
     .await;
 }

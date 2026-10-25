@@ -96,7 +96,7 @@ async fn h2_client_metadata_reaches_the_handler_and_comes_back() {
     let (a, b) = tokio::io::duplex(16 * 1024);
     tokio::spawn(async move {
         let mut handler = Reflect;
-        protolink::tokio::server(a)
+        protolink::tokio::server_serial(a)
             .build()
             .serve(&mut handler)
             .await
@@ -192,7 +192,7 @@ async fn protolink_client_metadata_against_an_h2_server() {
         }
     });
     with_timeout(async {
-        let mut client = protolink::tokio::client(b).build();
+        let mut client = protolink::tokio::client_serial(b).build();
         let options = || {
             let mut md = Metadata::new();
             md.insert("x-req", "r").unwrap();

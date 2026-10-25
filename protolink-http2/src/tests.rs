@@ -3,6 +3,8 @@ extern crate std;
 use super::*;
 use alloc::vec;
 
+#[path = "output_regressions.rs"]
+mod output_regressions;
 #[path = "regressions.rs"]
 mod regressions;
 #[path = "review_regressions.rs"]

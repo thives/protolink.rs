@@ -113,7 +113,7 @@ fn serve(server: Compression) -> tokio::io::DuplexStream {
             compression: server,
             ..ServerConfig::default()
         };
-        protolink::tokio::server(a)
+        protolink::tokio::server_serial(a)
             .with_config(config)
             .build()
             .serve(&mut h)
@@ -252,7 +252,7 @@ async fn protolink_client_sends_and_reads_gzip() {
     let (a, b) = tokio::io::duplex(16 * 1024);
     tokio::spawn(gzip_echo_h2_server(a));
     with_timeout(async {
-        let mut client = protolink::tokio::client(b)
+        let mut client = protolink::tokio::client_serial(b)
             .with_compression(Compression::gzip())
             .build();
         let data = text();
@@ -272,7 +272,7 @@ async fn protolink_client_and_server_agree_on_gzip() {
             compression: Compression::gzip(),
             ..ServerConfig::default()
         };
-        protolink::tokio::server(a)
+        protolink::tokio::server_serial(a)
             .with_config(config)
             .build()
             .serve(&mut h)
@@ -280,7 +280,7 @@ async fn protolink_client_and_server_agree_on_gzip() {
             .unwrap();
     });
     with_timeout(async {
-        let mut client = protolink::tokio::client(b)
+        let mut client = protolink::tokio::client_serial(b)
             .with_compression(Compression::gzip())
             .build();
         let data = text();

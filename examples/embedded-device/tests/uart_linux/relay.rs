@@ -14,9 +14,11 @@
 //! COBS frames and inspects the ARQ frames in them, only as far as one
 //! fault-injection test needs:
 //!
-//! 1. It rebuilds the server's byte stream from the in-order DAT payloads and
-//!    finds the HTTP/2 frame that completes the third client request stream (the
-//!    `EventSubscribe` call): the trailing `HEADERS` frame with `END_STREAM`.
+//! 1. It rebuilds the server's byte stream from the in-order DAT and FIN
+//!    payloads and finds the HTTP/2 frame that completes the third client
+//!    request stream (the `EventSubscribe` call): the trailing `HEADERS` frame
+//!    with `END_STREAM`. It rebuilds the client's stream the same way, to find
+//!    the request streams.
 //! 2. The DAT sequence number that carries the last byte of that frame is the
 //!    target.
 //! 3. It drops the first client ACK that covers the target, and records the
@@ -284,12 +286,27 @@ impl H2 {
     }
 }
 
+/// Whether `seq` is the next sequence number of its direction. If it is, the
+/// expectation advances. A retransmission, or a DAT resent with an ACK request,
+/// repeats a sequence number that has been taken already, so it is not stream
+/// data again. FIN payload is stream data too: the receiver delivers it.
+fn take_in_order(expected: &mut u16, seq: u16) -> bool {
+    if seq != *expected {
+        return false;
+    }
+    *expected = (*expected + 1) & SEQ_MASK;
+    true
+}
+
 struct Inspector {
     mode: Mode,
     crc: crc::Crc<u16>,
     client: H2,
     server: H2,
-    next_seq: u16,
+    /// The next client sequence number, from 0 as the client's ARQ starts.
+    client_next: u16,
+    /// The next server sequence number, from 0 as the server's ARQ starts.
+    server_next: u16,
 }
 
 impl Inspector {
@@ -299,7 +316,8 @@ impl Inspector {
             crc: crc::Crc::<u16>::new(&crc::CRC_16_IBM_SDLC),
             client: H2::new(true),
             server: H2::new(false),
-            next_seq: 0,
+            client_next: 0,
+            server_next: 0,
         }
     }
 
@@ -308,6 +326,8 @@ impl Inspector {
     }
 
     /// Decide what to do with one decoded-COBS-frame `body` (without delimiters).
+    /// Only inspection depends on the decisions here: the frame is forwarded
+    /// unchanged unless it is an ACK the test drops.
     fn frame(&mut self, direction: Direction, body: &[u8], observed: &mut Observed) -> Verdict {
         let mut decoded = [0u8; 256];
         let mut framed = vec![0u8];
@@ -328,8 +348,8 @@ impl Inspector {
                 Verdict::Forward
             }
             (Direction::ServerToClient, FRAME_ACK) => Verdict::Forward,
-            (Direction::ServerToClient, ty) => {
-                self.server_data(bytes, ty, observed);
+            (Direction::ServerToClient, _) => {
+                self.server_data(bytes, observed);
                 Verdict::Forward
             }
         }
@@ -346,12 +366,12 @@ impl Inspector {
     }
 
     fn client_data(&mut self, bytes: &[u8], observed: &mut Observed) {
-        let Some((_, payload)) = Self::payload(bytes) else {
+        let Some((seq, payload)) = Self::payload(bytes) else {
             return;
         };
-        // Duplicates would corrupt the rebuilt stream; the client's frames are
-        // never retransmitted in these tests, since the relay drops nothing
-        // toward the server.
+        if !take_in_order(&mut self.client_next, seq) {
+            return;
+        }
         for frame in self.client.push(payload) {
             if frame.ty == TYPE_HEADERS && !observed.request_streams.contains(&frame.stream) {
                 observed.request_streams.push(frame.stream);
@@ -362,18 +382,14 @@ impl Inspector {
         }
     }
 
-    fn server_data(&mut self, bytes: &[u8], ty: u8, observed: &mut Observed) {
+    fn server_data(&mut self, bytes: &[u8], observed: &mut Observed) {
         let Some((seq, payload)) = Self::payload(bytes) else {
             return;
         };
         observed.server_data.push(seq);
-        // FIN carries no stream data. A retransmission repeats a sequence number
-        // that has been taken already.
-        const FIN: u8 = 0b11;
-        if ty == FIN || seq != self.next_seq {
+        if !take_in_order(&mut self.server_next, seq) {
             return;
         }
-        self.next_seq = (self.next_seq + 1) & SEQ_MASK;
 
         let final_stream = observed.request_streams.get(2).copied();
         for frame in self.server.push(payload) {
@@ -423,5 +439,199 @@ impl Inspector {
                 Verdict::Forward
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DAT_ACK_REQ: u8 = 0b00;
+    const DAT: u8 = 0b10;
+    const FIN: u8 = 0b11;
+    const END_HEADERS: u8 = 0x4;
+
+    fn inspector() -> Inspector {
+        Inspector::new(Mode::ReliableFault {
+            hold_replacement_until: None,
+        })
+    }
+
+    /// An ARQ frame as a sender builds it, before COBS. The inspector does not
+    /// check the CRC, so it is left zero.
+    fn arq(ty: u8, seq: u16, payload: &[u8]) -> Vec<u8> {
+        let pkt_id = (seq << 2) | u16::from(ty);
+        let mut frame = pkt_id.to_le_bytes().to_vec();
+        frame.extend_from_slice(&[payload.len() as u8, 0, 0]);
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    fn h2(ty: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+        let mut frame = (payload.len() as u32).to_be_bytes()[1..].to_vec();
+        frame.extend_from_slice(&[ty, flags]);
+        frame.extend_from_slice(&stream.to_be_bytes());
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    /// The client's HTTP/2 bytes: the preface, then a request `HEADERS` frame
+    /// for each stream.
+    fn requests(streams: &[u32]) -> Vec<u8> {
+        let mut bytes = vec![0; PREFACE_LEN];
+        for &stream in streams {
+            bytes.extend(h2(TYPE_HEADERS, END_HEADERS, stream, b"request"));
+        }
+        bytes
+    }
+
+    /// Hand one ARQ frame to the inspector as the relay reads it: as an
+    /// undelimited COBS body. The frame must be forwarded.
+    fn receive(
+        inspector: &mut Inspector,
+        direction: Direction,
+        observed: &mut Observed,
+        frame: &[u8],
+    ) {
+        let mut body = [0u8; 512];
+        let len = cobs_io_async::sync::encode_from_slice(frame, &mut body).unwrap();
+        assert!(matches!(
+            inspector.frame(direction, &body[..len], observed),
+            Verdict::Forward
+        ));
+    }
+
+    /// The HTTP/2 stream was inspected exactly once: nothing is left over, and
+    /// the parser is on a frame boundary.
+    fn assert_client_consumed(inspector: &Inspector) {
+        assert_eq!(inspector.client.skip, 0);
+        assert!(
+            inspector.client.buf.is_empty(),
+            "left over: {:?}",
+            inspector.client.buf
+        );
+    }
+
+    /// A client resends a DAT with an ACK request, as a flush does: the same
+    /// sequence number and payload arrive twice, and the next fresh sequence
+    /// resumes the stream.
+    #[test]
+    fn a_resent_client_dat_is_not_inspected_again() {
+        let mut inspector = inspector();
+        let mut observed = Observed::default();
+        let stream = requests(&[1, 3, 5]);
+        for (seq, chunk) in stream.chunks(10).enumerate() {
+            let seq = seq as u16;
+            receive(
+                &mut inspector,
+                Direction::ClientToServer,
+                &mut observed,
+                &arq(DAT, seq, chunk),
+            );
+            if seq == 2 {
+                receive(
+                    &mut inspector,
+                    Direction::ClientToServer,
+                    &mut observed,
+                    &arq(DAT_ACK_REQ, seq, chunk),
+                );
+            }
+        }
+        assert_eq!(observed.request_streams, vec![1, 3, 5]);
+        assert_client_consumed(&inspector);
+    }
+
+    /// Sequence numbers wrap at `SEQ_MASK`, and a resend just before the wrap
+    /// is still recognised.
+    #[test]
+    fn client_sequence_wraps_past_a_resent_dat() {
+        let mut inspector = inspector();
+        inspector.client_next = SEQ_MASK - 1;
+        let mut observed = Observed::default();
+        let stream = requests(&[1, 3, 5]);
+        for (i, chunk) in stream.chunks(10).enumerate() {
+            let seq = (SEQ_MASK - 1 + i as u16) & SEQ_MASK;
+            receive(
+                &mut inspector,
+                Direction::ClientToServer,
+                &mut observed,
+                &arq(DAT, seq, chunk),
+            );
+            if i == 1 {
+                receive(
+                    &mut inspector,
+                    Direction::ClientToServer,
+                    &mut observed,
+                    &arq(DAT_ACK_REQ, seq, chunk),
+                );
+            }
+        }
+        assert_eq!(observed.request_streams, vec![1, 3, 5]);
+        assert_eq!(inspector.client_next, 6, "the sequence wrapped to 6");
+        assert_client_consumed(&inspector);
+    }
+
+    /// FIN payload is stream data, and a resent FIN is not inspected again.
+    #[test]
+    fn fin_payload_is_stream_data_and_a_resent_fin_is_ignored() {
+        let mut inspector = inspector();
+        let mut observed = Observed::default();
+        let stream = requests(&[1, 3, 5]);
+        let (head, tail) = stream.split_at(50);
+        receive(
+            &mut inspector,
+            Direction::ClientToServer,
+            &mut observed,
+            &arq(DAT, 0, head),
+        );
+        receive(
+            &mut inspector,
+            Direction::ClientToServer,
+            &mut observed,
+            &arq(FIN, 1, tail),
+        );
+        receive(
+            &mut inspector,
+            Direction::ClientToServer,
+            &mut observed,
+            &arq(FIN, 1, tail),
+        );
+        assert_eq!(observed.request_streams, vec![1, 3, 5]);
+        assert_client_consumed(&inspector);
+    }
+
+    /// The server's completing frame is found once, and its resend does not
+    /// change the target or inspect the bytes again.
+    #[test]
+    fn a_resent_completing_server_dat_is_inspected_once() {
+        let mut inspector = inspector();
+        let mut observed = Observed {
+            request_streams: vec![1, 3, 5],
+            ..Observed::default()
+        };
+        let response = [
+            h2(TYPE_HEADERS, END_HEADERS, 1, b"ok"),
+            h2(TYPE_DATA, 0, 5, b"partial"),
+            h2(TYPE_DATA, END_STREAM, 5, b"done"),
+        ];
+        for (seq, payload) in response.iter().enumerate() {
+            let seq = seq as u16;
+            receive(
+                &mut inspector,
+                Direction::ServerToClient,
+                &mut observed,
+                &arq(DAT, seq, payload),
+            );
+        }
+        receive(
+            &mut inspector,
+            Direction::ServerToClient,
+            &mut observed,
+            &arq(DAT_ACK_REQ, 2, &response[2]),
+        );
+        assert_eq!(observed.target, Some(2));
+        assert_eq!(observed.server_data, vec![0, 1, 2, 2]);
+        assert_eq!(observed.target_retransmissions(), 1);
+        assert!(inspector.server.buf.is_empty(), "left over");
     }
 }

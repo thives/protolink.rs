@@ -1,25 +1,33 @@
 //! Async drivers over `embedded_io_async`.
+//!
+//! A driver is built over a [`Mode`]: [`Serial`] for one transport read and
+//! written in turn, [`Duplex`] for independent halves, or
+//! [`CoordinatedReliable`] for a reliable link. The same protocol code runs in
+//! every mode; only the workers that move bytes differ.
 
-use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::future::{Future, poll_fn};
-use core::pin::{Pin, pin};
-use core::task::{Context, Poll, Waker};
-use core::time::Duration;
+use core::pin::pin;
+use core::task::{Poll, Waker};
 
 use embedded_io_async::{Read, Write};
 
+use crate::Error;
 use crate::builder::{DeadlinesUnspecified, client_config_methods, server_config_methods};
-use crate::driver;
+use crate::coordinator::{self, Delivery, Halt, Lane, Outbound, RouterNode, ServerNode, earliest};
+use crate::driver::{self, Port};
+use crate::error::client_failure_status;
 use crate::grpc::{
     self, CallId, CallOptions, ClientConfig, Handler, Metadata, Next, Response, Router,
     ServerConfig, Status, StreamingCall, StreamingTransport, UnaryTransport,
 };
+use crate::link::{ReliableLink, Timer as LinkTimer};
+use crate::mode::{CoordinatedReliable, Duplex, Mode, Serial};
 use crate::shared::Shared;
 use crate::timer::{NoTimer, Timer};
-use crate::{Error, READ_CHUNK};
 
-/// Start building an async gRPC server on one connection.
+/// Start building an async gRPC server on one connection, served in serial
+/// mode (see [`Serial`]).
 ///
 /// Configure the factory with `.with_*` methods and choose a deadline policy,
 /// then [`build`](ServerBuilder::build) it and
@@ -49,26 +57,60 @@ use crate::{Error, READ_CHUNK};
 /// ```
 ///
 /// On tokio, [`tokio::server`](crate::tokio::server) supplies the timer.
-pub fn server<IO: Read + Write>(io: IO) -> ServerBuilder<IO> {
+pub fn server<IO: Read + Write>(io: IO) -> ServerBuilder<Serial<IO>> {
     ServerBuilder {
-        io,
+        mode: Serial::new(io),
         config: ServerConfig::default(),
         timer: DeadlinesUnspecified,
     }
 }
 
-/// Factory of an async [`Server`], created by [`server`].
+/// Start building an async gRPC server whose read and write halves are
+/// independent, served in duplex mode (see [`Duplex`]).
 ///
-/// `T` is the deadline policy: [`DeadlinesUnspecified`] until one is chosen,
-/// then the [`Timer`] (or [`NoTimer`]) the server will use.
+/// Input is read while output is blocked on the same connection, so a
+/// bidirectional exchange does not stall when the transport buffers less than
+/// the data in flight.
+pub fn server_split<R, W>(reader: R, writer: W) -> ServerBuilder<Duplex<R, W>>
+where
+    R: Read,
+    W: Write<Error = R::Error>,
+{
+    ServerBuilder {
+        mode: Duplex::new(reader, writer),
+        config: ServerConfig::default(),
+        timer: DeadlinesUnspecified,
+    }
+}
+
+/// Start building an async gRPC server on a built reliable link, served as one
+/// coordinated engine (see [`CoordinatedReliable`]).
+pub fn server_reliable<S, L>(link: ReliableLink<S, L>) -> ServerBuilder<CoordinatedReliable<S, L>>
+where
+    S: Read + Write,
+    L: LinkTimer,
+{
+    ServerBuilder {
+        mode: CoordinatedReliable::new(link),
+        config: ServerConfig::default(),
+        timer: DeadlinesUnspecified,
+    }
+}
+
+/// Factory of an async [`Server`], created by [`server`], [`server_split`] or
+/// [`server_reliable`].
+///
+/// `M` is the [`Mode`] the transport is served in, and `T` the deadline policy:
+/// [`DeadlinesUnspecified`] until one is chosen, then the [`Timer`] (or
+/// [`NoTimer`]) the server will use.
 #[derive(Debug)]
-pub struct ServerBuilder<IO, T = DeadlinesUnspecified> {
-    io: IO,
+pub struct ServerBuilder<M, T = DeadlinesUnspecified> {
+    mode: M,
     config: ServerConfig,
     timer: T,
 }
 
-impl<IO, T> ServerBuilder<IO, T> {
+impl<M, T> ServerBuilder<M, T> {
     /// Enforce each call's `grpc-timeout` with `timer`.
     ///
     /// A call's deadline starts when its request headers arrive. When it is
@@ -82,9 +124,9 @@ impl<IO, T> ServerBuilder<IO, T> {
     /// unary-only servers. Writes and flushes are raced too; expiry during
     /// output closes the connection with [`Error::OutputDeadline`] rather than
     /// reusing indeterminate wire state.
-    pub fn with_deadline_timer<U: Timer>(self, timer: U) -> ServerBuilder<IO, U> {
+    pub fn with_deadline_timer<U: Timer>(self, timer: U) -> ServerBuilder<M, U> {
         ServerBuilder {
-            io: self.io,
+            mode: self.mode,
             config: self.config,
             timer,
         }
@@ -93,37 +135,38 @@ impl<IO, T> ServerBuilder<IO, T> {
     /// Do not enforce deadlines locally. Calls still receive their
     /// `grpc-timeout` in [`CallContext::deadline`](crate::CallContext::deadline),
     /// on a clock that never advances.
-    pub fn without_deadlines(self) -> ServerBuilder<IO, NoTimer> {
+    pub fn without_deadlines(self) -> ServerBuilder<M, NoTimer> {
         self.with_deadline_timer(NoTimer)
     }
 
     server_config_methods!();
 }
 
-impl<IO: Read + Write, T: Timer> ServerBuilder<IO, T> {
+impl<M: Mode, T: Timer> ServerBuilder<M, T> {
     /// Construct the server. Performs no I/O; the HTTP/2 SETTINGS are sent
     /// once [`serve`](Server::serve) runs.
-    pub fn build(self) -> Server<IO, T> {
+    pub fn build(self) -> Server<M, T> {
         Server {
-            io: self.io,
+            mode: self.mode,
             config: self.config,
             timer: self.timer,
         }
     }
 }
 
-/// An async gRPC server driver for one connection, built by [`server`].
+/// An async gRPC server driver for one connection, built by [`server`],
+/// [`server_split`] or [`server_reliable`].
 ///
 /// It owns the transport, the configuration and the deadline timer. The
 /// application's services are only joined to it by [`serve`](Self::serve).
 #[derive(Debug)]
-pub struct Server<IO, T = NoTimer> {
-    io: IO,
+pub struct Server<M, T = NoTimer> {
+    mode: M,
     config: ServerConfig,
     timer: T,
 }
 
-impl<IO: Read + Write, T: Timer> Server<IO, T> {
+impl<M: Mode, T: Timer> Server<M, T> {
     /// Serve gRPC on this connection until the peer disconnects or the
     /// connection fails.
     ///
@@ -132,25 +175,19 @@ impl<IO: Read + Write, T: Timer> Server<IO, T> {
     /// for the whole connection and receives every call on it; call state
     /// keyed by [`CallId`] is therefore connection-local.
     ///
-    /// Streaming handlers are polled with this future's waker: when one returns
-    /// `Poll::Pending` and later wakes the waker, the pending transport `read`
-    /// is dropped so the new responses can be written. Serving streaming
-    /// methods whose handlers return `Pending` therefore requires a
-    /// cancel-safe `read` (as tokio streams,
-    /// [`CobsFramed`](crate::link::CobsFramed) and the [`link`](crate::link)
-    /// stack are); unary-only servers without deadlines never drop a read.
+    /// Streaming handlers are polled with this future's waker. When the
+    /// connection needs the transport for output, a pending read is dropped
+    /// (serial mode), or continues in the background (duplex and reliable
+    /// modes); see [`Mode`].
     ///
     /// When the connection ends, normally or with an error, every active
     /// streaming call is reported to [`Handler::on_cancel`] before this
     /// returns. Dropping the future before it completes drops the transport
     /// and makes the same `on_cancel` calls from the destructor; nothing is
     /// written to the peer in that case.
-    pub async fn serve<H: Handler + ?Sized>(
-        self,
-        services: &mut H,
-    ) -> Result<(), Error<IO::Error>> {
+    pub async fn serve<H: Handler + ?Sized>(self, services: &mut H) -> Result<(), Error<M::Error>> {
         let Self {
-            mut io,
+            mut mode,
             config,
             timer,
         } = self;
@@ -158,7 +195,17 @@ impl<IO: Read + Write, T: Timer> Server<IO, T> {
             server: grpc::Server::new(config),
             handler: services,
         };
-        serve_connection(&mut io, &mut serving.server, &mut *serving.handler, &timer).await
+        let port = Shared::new(Port::new());
+        let outcome = {
+            let mut node = ServerNode {
+                server: &mut serving.server,
+                handler: &mut *serving.handler,
+            };
+            let mut gateway = Lane::new(&port, mode.worker(&port));
+            let mut no_lanes: [Lane<'_, core::future::Ready<()>, _>; 0] = [];
+            coordinator::drive(&mut node, &mut gateway, &mut no_lanes, &timer).await
+        };
+        finish_gateway(&mut mode, &port, &mut serving.server, &timer, outcome).await
     }
 
     /// Serve gRPC on this connection with `router`, which serves its local
@@ -169,10 +216,9 @@ impl<IO: Read + Write, T: Timer> Server<IO, T> {
     /// gateway connection and every downstream are driven by this one future.
     /// Each transport has its own operations: a write or flush that stays
     /// pending on one of them does not hold up the others, the local services,
-    /// or the deadlines. A transport still runs one operation at a time, so its
-    /// read is dropped when that transport has output to write, and reads must
-    /// be cancel-safe as for [`serve`](Self::serve). Deadlines come from the
-    /// timer of this server, and from the router's calls.
+    /// or the deadlines. A downstream is served in serial mode, so its read is
+    /// dropped when it has output to write; use
+    /// [`serve_router_split`](Self::serve_router_split) for duplex downstreams.
     ///
     /// A downstream whose transport fails (read, write, flush or protocol error),
     /// or whose output stays blocked past the deadline of its calls, is marked
@@ -199,510 +245,151 @@ impl<IO: Read + Write, T: Timer> Server<IO, T> {
         self,
         router: &mut Router,
         downstream: &mut [B],
-    ) -> Result<(), Error<IO::Error>>
+    ) -> Result<(), Error<M::Error>>
     where
-        B: Read + Write<Error = IO::Error>,
+        B: Read + Write<Error = M::Error>,
     {
-        assert_eq!(
-            router.backend_count(),
-            downstream.len(),
-            "serve_router needs one transport per downstream of the router"
-        );
-        let Self { mut io, timer, .. } = self;
-        let mut routing = Routing { router, downstream };
-        serve_router_connection(&mut io, &mut routing, &timer).await
+        assert_backends(router, downstream.len());
+        let Self {
+            mut mode, timer, ..
+        } = self;
+        let ports = coordinator::ports::<M::Error>(downstream.len());
+        let mut lanes: Vec<_> = downstream
+            .iter_mut()
+            .zip(&ports)
+            .map(|(transport, port)| Lane::new(port, driver::run_serial(transport, port)))
+            .collect();
+        serve_routed(&mut mode, &timer, router, &mut lanes).await
+    }
+
+    /// [`serve_router`](Self::serve_router) with duplex downstreams: each one's
+    /// read and write halves are polled independently, so a downstream whose
+    /// output is blocked keeps delivering its responses.
+    ///
+    /// # Panics
+    ///
+    /// As [`serve_router`](Self::serve_router).
+    pub async fn serve_router_split<R, W>(
+        self,
+        router: &mut Router,
+        downstream: &mut [Duplex<R, W>],
+    ) -> Result<(), Error<M::Error>>
+    where
+        R: Read,
+        W: Write<Error = R::Error>,
+        M: Mode<Error = R::Error>,
+    {
+        assert_backends(router, downstream.len());
+        let Self {
+            mut mode, timer, ..
+        } = self;
+        let ports = coordinator::ports::<R::Error>(downstream.len());
+        let mut lanes: Vec<_> = downstream
+            .iter_mut()
+            .zip(&ports)
+            .map(|(transport, port)| Lane::new(port, transport.worker(port)))
+            .collect();
+        serve_routed(&mut mode, &timer, router, &mut lanes).await
+    }
+
+    /// [`serve_router`](Self::serve_router) with coordinated reliable
+    /// downstreams, each polled as one engine.
+    ///
+    /// # Panics
+    ///
+    /// As [`serve_router`](Self::serve_router).
+    pub async fn serve_router_reliable<S, L>(
+        self,
+        router: &mut Router,
+        downstream: &mut [CoordinatedReliable<S, L>],
+    ) -> Result<(), Error<M::Error>>
+    where
+        S: Read + Write,
+        L: LinkTimer,
+        M: Mode<Error = crate::link::ReliableError<S::Error>>,
+    {
+        assert_backends(router, downstream.len());
+        let Self {
+            mut mode, timer, ..
+        } = self;
+        let ports = coordinator::ports::<M::Error>(downstream.len());
+        let mut lanes: Vec<_> = downstream
+            .iter_mut()
+            .zip(&ports)
+            .map(|(transport, port)| Lane::new(port, transport.worker(port)))
+            .collect();
+        serve_routed(&mut mode, &timer, router, &mut lanes).await
     }
 }
 
-/// The router and its downstream transports for one `serve_router`. Dropping
-/// it cancels every call.
-struct Routing<'a, B> {
-    router: &'a mut Router,
-    downstream: &'a mut [B],
+fn assert_backends(router: &Router, transports: usize) {
+    assert_eq!(
+        router.backend_count(),
+        transports,
+        "serve_router needs one transport per downstream of the router"
+    );
 }
 
-impl<B> Drop for Routing<'_, B> {
+/// Drive a router whose gateway is served in `mode`, with its downstream lanes.
+/// The router cancels its calls when the future ends or is dropped.
+async fn serve_routed<M: Mode, T: Timer, G: Future<Output = ()>>(
+    mode: &mut M,
+    timer: &T,
+    router: &mut Router,
+    lanes: &mut [Lane<'_, G, M::Error>],
+) -> Result<(), Error<M::Error>> {
+    let routing = RouterGuard(router);
+    let port = Shared::new(Port::new());
+    let outcome = {
+        let mut node = RouterNode {
+            router: &mut *routing.0,
+        };
+        let mut gateway = Lane::new(&port, mode.worker(&port));
+        coordinator::drive(&mut node, &mut gateway, lanes, timer).await
+    };
+    finish_gateway(mode, &port, &mut *routing.0, timer, outcome).await
+}
+
+/// The router, cancelled when dropped.
+struct RouterGuard<'a>(&'a mut Router);
+
+impl Drop for RouterGuard<'_> {
     fn drop(&mut self) {
-        self.router.cancel_all();
+        self.0.cancel_all();
     }
 }
 
-/// Output of one connection: the gateway's router or a downstream client.
-trait Outbound {
-    fn pending_output(&self) -> &[u8];
-    fn consume_output(&mut self, n: usize);
-    fn has_output(&self) -> bool;
-    /// When output still blocked at this time retires the connection: the
-    /// deadline of its own calls and of output awaiting delivery.
-    fn output_deadline(&self) -> Option<Duration>;
-    /// Called after a successful flush. Clients keep no flush state.
-    fn output_flushed(&mut self);
-}
-
-impl Outbound for Router {
-    fn pending_output(&self) -> &[u8] {
-        Router::pending_output(self)
-    }
-
-    fn consume_output(&mut self, n: usize) {
-        Router::consume_output(self, n);
-    }
-
-    fn has_output(&self) -> bool {
-        Router::has_output(self)
-    }
-
-    fn output_deadline(&self) -> Option<Duration> {
-        Router::gateway_next_deadline(self)
-    }
-
-    fn output_flushed(&mut self) {
-        Router::output_flushed(self);
-    }
-}
-
-impl Outbound for grpc::Client {
-    fn pending_output(&self) -> &[u8] {
-        grpc::Client::pending_output(self)
-    }
-
-    fn consume_output(&mut self, n: usize) {
-        grpc::Client::consume_output(self, n);
-    }
-
-    fn has_output(&self) -> bool {
-        grpc::Client::has_output(self)
-    }
-
-    fn output_deadline(&self) -> Option<Duration> {
-        grpc::Client::next_deadline(self)
-    }
-
-    fn output_flushed(&mut self) {}
-}
-
-/// Write everything `out` has pending, then flush, as `serve_connection` does.
-/// An output deadline or a failed write is an error for this connection.
-async fn write_pending<S: Write, O: Outbound, T: Timer>(
-    io: &mut S,
+/// Finish a connection whose coordinator stopped. A protocol error is answered
+/// with a GOAWAY, best effort, when the gateway's output allows it.
+async fn finish_gateway<M, T, O, E>(
+    mode: &mut M,
+    port: &Shared<Port<E>>,
     out: &mut O,
     timer: &T,
-) -> Result<(), Error<S::Error>> {
-    while out.has_output() {
-        let n = output_until(timer, out.output_deadline(), io.write(out.pending_output()))
-            .await
-            .ok_or(Error::OutputDeadline)?
-            .map_err(Error::Io)?;
-        if n == 0 {
-            return Err(Error::WriteZero);
-        }
-        out.consume_output(n);
-    }
-    output_until(timer, out.output_deadline(), io.flush())
-        .await
-        .ok_or(Error::OutputDeadline)?
-        .map_err(Error::Io)?;
-    out.output_flushed();
-    Ok(())
-}
-
-/// What went wrong with one transport operation.
-enum Failure<E> {
-    Io(E),
-    WriteZero,
-}
-
-/// The operation a lane has in flight.
-#[derive(Clone, Copy)]
-struct Op {
-    /// Bytes requested by a write; `0` for a flush.
-    len: usize,
-    /// The earliest deadline of the connection's output seen while the operation
-    /// is in flight. It only moves earlier, so the operation stays armed after the
-    /// call that caused it has ended.
-    deadline: Option<Duration>,
-}
-
-/// The coordinator's side of one transport: the port its worker reports
-/// through, the worker, and the operation in flight.
-struct Lane<'p, F, E> {
-    port: &'p Shared<driver::Port<E>>,
-    /// `None` once the transport has been retired. Its worker is dropped then,
-    /// so nothing is written to it again.
-    worker: Option<Pin<Box<F>>>,
-    op: Option<Op>,
-    /// Bytes were written since the transport was last flushed.
-    unflushed: bool,
-}
-
-impl<'p, F: Future<Output = ()>, E> Lane<'p, F, E> {
-    fn new(port: &'p Shared<driver::Port<E>>, worker: Pin<Box<F>>) -> Self {
-        Self {
-            port,
-            worker: Some(worker),
-            op: None,
-            unflushed: false,
-        }
-    }
-
-    fn live(&self) -> bool {
-        self.worker.is_some()
-    }
-
-    /// Poll the worker, which never completes: polling it lets it make progress.
-    fn poll_worker(&mut self, cx: &mut Context<'_>) {
-        if let Some(worker) = self.worker.as_mut() {
-            let _ = worker.as_mut().poll(cx);
-        }
-    }
-
-    /// Whether a reply or input is waiting to be taken.
-    fn has_event(&self) -> bool {
-        self.live() && self.port.with(|p| p.has_event())
-    }
-
-    /// Whether [`issue`](Self::issue) would start an operation.
-    fn wants_issue<O: Outbound>(&self, out: &O) -> bool {
-        self.live() && self.op.is_none() && (out.has_output() || self.unflushed)
-    }
-
-    /// Start a write of the output, or a flush once the output is all written.
-    /// The bytes are copied now; the core keeps them until the reply says how
-    /// many were accepted.
-    fn issue<O: Outbound>(&mut self, out: &O) {
-        if !self.wants_issue(out) {
-            return;
-        }
-        let len = if out.has_output() {
-            self.port.with(|p| p.request_write(out.pending_output()))
-        } else {
-            self.port.with(|p| p.request_flush());
-            0
-        };
-        self.op = Some(Op {
-            len,
-            deadline: out.output_deadline(),
-        });
-    }
-
-    /// Take the reply of the operation, if it has come back, and apply it to
-    /// `out`. Returns the failure if the operation failed.
-    fn reap<O: Outbound>(&mut self, out: &mut O) -> Option<Failure<E>> {
-        let op = self.op?;
-        let reply = self.port.with(|p| p.take_reply())?;
-        self.op = None;
-        match reply {
-            driver::Reply::Written(Ok(n)) => match n.min(op.len) {
-                0 => Some(Failure::WriteZero),
-                n => {
-                    out.consume_output(n);
-                    self.unflushed = true;
-                    None
-                }
-            },
-            driver::Reply::Flushed(Ok(())) => {
-                out.output_flushed();
-                self.unflushed = false;
-                None
-            }
-            driver::Reply::Written(Err(e)) | driver::Reply::Flushed(Err(e)) => Some(Failure::Io(e)),
-        }
-    }
-
-    /// Take the outcome of the last read, if it has come back. For `Ok(n)` the
-    /// bytes are in the port's inbox, until the next read starts.
-    fn take_input(&mut self) -> Option<Result<usize, E>> {
-        self.port.with(|p| p.take_read())
-    }
-
-    /// Run `f` on the bytes of the last read, `n` of them.
-    fn with_input<R>(&self, n: usize, f: impl FnOnce(&[u8]) -> R) -> R {
-        self.port.with(|p| f(&p.inbox()[..n]))
-    }
-
-    /// Keep the operation's deadline no later than the connection's current one.
-    fn arm<O: Outbound>(&mut self, out: &O) {
-        if let Some(op) = self.op.as_mut() {
-            op.deadline = earliest([op.deadline, out.output_deadline()]);
-        }
-    }
-
-    /// The deadline of the operation in flight.
-    fn deadline(&self) -> Option<Duration> {
-        self.op.and_then(|op| op.deadline)
-    }
-
-    /// Whether the operation in flight has passed its deadline.
-    fn overdue(&self, now: Duration) -> bool {
-        self.deadline().is_some_and(|d| now >= d)
-    }
-
-    /// Drop the worker, abandoning any operation it has in flight.
-    fn retire(&mut self) {
-        self.worker = None;
-        self.op = None;
-        self.unflushed = false;
-    }
-}
-
-/// The earliest of the deadlines that are set.
-fn earliest(deadlines: impl IntoIterator<Item = Option<Duration>>) -> Option<Duration> {
-    deadlines.into_iter().flatten().min()
-}
-
-/// Retire downstream `backend`: its transport can no longer be used, and its
-/// calls end with `status`. Only that downstream is affected.
-fn retire_backend<F, E>(
-    lane: &mut Lane<'_, F, E>,
-    router: &mut Router,
-    backend: usize,
-    status: Status,
-) where
-    F: Future<Output = ()>,
-{
-    lane.retire();
-    router.backend_failed(backend, status);
-}
-
-/// Why [`drive_router`] stopped with an error.
-enum Halt<E> {
-    /// Reported to the caller as it is.
-    Error(Error<E>),
-    /// The gateway received bytes that break the protocol. `goaway` says whether
-    /// the gateway's output is in a state that allows a GOAWAY to be written.
-    Protocol {
-        error: grpc::http2::Error,
-        goaway: bool,
-    },
-}
-
-/// Serve a router's connection. A protocol error on the gateway is the one failure
-/// answered on the wire, and only as far as [`Halt::Protocol`] allows: the GOAWAY
-/// is best effort, and is written only when no output operation of the gateway was
-/// in flight. Failures of the transports, and deadlines, never write again.
-async fn serve_router_connection<IO, B, T>(
-    io: &mut IO,
-    routing: &mut Routing<'_, B>,
-    timer: &T,
-) -> Result<(), Error<IO::Error>>
+    outcome: Result<(), Halt<E>>,
+) -> Result<(), Error<E>>
 where
-    IO: Read + Write,
-    B: Read + Write<Error = IO::Error>,
+    M: Mode<Error = E>,
     T: Timer,
+    O: Outbound,
 {
-    match drive_router(&mut *io, routing, timer).await {
+    match outcome {
         Ok(()) => Ok(()),
         Err(Halt::Error(error)) => Err(error),
         Err(Halt::Protocol { error, goaway }) => {
-            if goaway {
-                // The gateway's worker has been dropped, so nothing else is writing.
-                let _ = write_pending(io, &mut *routing.router, timer).await;
+            // An overload writes nothing more: the gateway's output is what is full.
+            let overload = matches!(error, grpc::http2::Error::OutputLimitExceeded { .. });
+            if goaway && !overload {
+                // The coordinator's worker is gone, so nothing else is writing.
+                let mut lane = Lane::new(port, mode.worker(port));
+                coordinator::deliver(&mut lane, out, timer).await;
             }
-            Err(Error::Protocol(error))
+            Err(Error::from_connection(error))
         }
     }
 }
 
-/// Drive a router's connections: the gateway's transport and each downstream
-/// transport, all through one future.
-///
-/// The coordinator (this function) owns the router, the handlers and the clock.
-/// Each transport has a worker that borrows it and performs one write, flush or
-/// read at a time; the coordinator asks for operations and collects their
-/// results through the transport's port. A slow transport therefore delays only
-/// its own operations. Reads of a transport are dropped only when its output
-/// needs the transport, and writes are never restarted.
-///
-/// Deadlines come before progress. Each pass reads the clock once, keeps the
-/// deadline of every output in flight, and ticks the router with that reading;
-/// output still past its deadline then retires its connection, before any worker
-/// is polled again. The wait ends as soon as a deadline is due, before the router
-/// or a worker is polled, so no handler runs on a clock that has passed the
-/// deadline of its call.
-async fn drive_router<IO, B, T>(
-    io: &mut IO,
-    routing: &mut Routing<'_, B>,
-    timer: &T,
-) -> Result<(), Halt<IO::Error>>
-where
-    IO: Read + Write,
-    B: Read + Write<Error = IO::Error>,
-    T: Timer,
-{
-    let router = &mut *routing.router;
-    let downstream = &mut *routing.downstream;
-    let count = downstream.len();
-    let gateway_port = Shared::new(driver::Port::new());
-    let ports: Vec<Shared<driver::Port<IO::Error>>> = (0..count)
-        .map(|_| Shared::new(driver::Port::new()))
-        .collect();
-    let mut gateway = Lane::new(&gateway_port, Box::pin(driver::run(io, &gateway_port)));
-    let mut lanes: Vec<_> = downstream
-        .iter_mut()
-        .zip(&ports)
-        .map(|(transport, port)| Lane::new(port, Box::pin(driver::run(transport, port))))
-        .collect();
-    // The downstream lanes are visited in turn, from a rotating start.
-    let mut turn = 0;
-    loop {
-        // One reading of the clock decides the whole pass, and the router is
-        // ticked with that same reading.
-        let now = timer.now();
-        // Output in flight keeps the deadline it was issued with, even when the
-        // tick below ends the call that caused it.
-        gateway.arm(router);
-        for (backend, lane) in lanes.iter_mut().enumerate() {
-            if let Some(client) = router.backend(backend) {
-                lane.arm(&*client);
-            }
-        }
-        // Calls that are due end first, with their own status, so that retiring
-        // the output they were waiting on does not replace it.
-        router.tick(now);
-        // Output that is still in flight past its deadline retires its
-        // connection. For a downstream only that downstream is failed.
-        if gateway.overdue(now) {
-            return Err(Halt::Error(Error::OutputDeadline));
-        }
-        for step in 0..count {
-            let backend = (turn + step) % count;
-            if lanes[backend].overdue(now) {
-                retire_backend(
-                    &mut lanes[backend],
-                    router,
-                    backend,
-                    Status::unavailable("downstream output deadline exceeded"),
-                );
-            }
-        }
-
-        // Replies to the operations in flight.
-        if let Some(failure) = gateway.reap(router) {
-            return Err(Halt::Error(match failure {
-                Failure::Io(e) => Error::Io(e),
-                Failure::WriteZero => Error::WriteZero,
-            }));
-        }
-        for step in 0..count {
-            let backend = (turn + step) % count;
-            let lane = &mut lanes[backend];
-            if !lane.live() {
-                continue;
-            }
-            let client = router.backend(backend).expect("a lane per downstream");
-            if lane.reap(client).is_some() {
-                retire_backend(
-                    lane,
-                    router,
-                    backend,
-                    Status::unavailable("downstream write failed"),
-                );
-            }
-        }
-
-        // Input. A read that ended the transport retires it; the gateway's
-        // ends the serving.
-        match gateway.take_input() {
-            Some(Err(e)) => return Err(Halt::Error(Error::Io(e))),
-            Some(Ok(0)) => return Ok(()),
-            Some(Ok(n)) => {
-                if let Err(error) = gateway.with_input(n, |bytes| router.recv(bytes)) {
-                    // The reply of any operation has been taken above. One still
-                    // outstanding (queued, pending or partly performed) leaves
-                    // its bytes unknown, so it is not written on.
-                    let goaway = gateway.op.is_none();
-                    return Err(Halt::Protocol { error, goaway });
-                }
-            }
-            None => {}
-        }
-        for step in 0..count {
-            let backend = (turn + step) % count;
-            let lane = &mut lanes[backend];
-            let Some(read) = lane.take_input() else {
-                continue;
-            };
-            let delivered = match read {
-                Ok(0) => Err("downstream closed"),
-                Ok(n) => lane
-                    .with_input(n, |bytes| router.backend_recv(backend, bytes))
-                    .map_err(|_| "downstream protocol error"),
-                Err(_) => Err("downstream read failed"),
-            };
-            if let Err(reason) = delivered {
-                retire_backend(lane, router, backend, Status::unavailable(reason));
-            }
-        }
-
-        // Output: start what each idle transport needs.
-        gateway.issue(router);
-        for step in 0..count {
-            let backend = (turn + step) % count;
-            if let Some(client) = router.backend(backend) {
-                lanes[backend].issue(&*client);
-            }
-        }
-        turn = (turn + 1) % count.max(1);
-
-        // Closed, with everything delivered: the gateway is finished. Its
-        // peer's hang-up or any downstream's output does not matter.
-        if router.is_closed() && gateway.op.is_none() && !gateway.unflushed && !router.has_output()
-        {
-            return Ok(());
-        }
-
-        // Wait until a worker has a result, a transport can take output, or a
-        // deadline is due.
-        gateway.arm(router);
-        for (backend, lane) in lanes.iter_mut().enumerate() {
-            if let Some(client) = router.backend(backend) {
-                lane.arm(&*client);
-            }
-        }
-        let wake = earliest(
-            core::iter::once(router.next_deadline())
-                .chain(core::iter::once(gateway.deadline()))
-                .chain(lanes.iter().map(Lane::deadline)),
-        );
-        let mut sleep = pin!(wake.map(|d| timer.sleep_until(d)));
-        let due = || wake.is_some_and(|d| timer.now() >= d);
-        poll_fn(|cx| {
-            // A due deadline returns to the loop before anything is polled. The
-            // loop ticks the router with the clock, so a handler is never polled
-            // with a clock that has passed its call's deadline.
-            if due() {
-                return Poll::Ready(());
-            }
-            if let Some(sleep) = sleep.as_mut().as_pin_mut()
-                && sleep.poll(cx).is_ready()
-            {
-                return Poll::Ready(());
-            }
-            router.poll(cx);
-            // Handlers run synchronously, and may have moved the clock on.
-            if due() {
-                return Poll::Ready(());
-            }
-            gateway.poll_worker(cx);
-            for lane in lanes.iter_mut() {
-                lane.poll_worker(cx);
-            }
-            let output = gateway.wants_issue(router)
-                || (0..count).any(|backend| {
-                    router
-                        .backend(backend)
-                        .is_some_and(|client| lanes[backend].wants_issue(&*client))
-                });
-            let event = gateway.has_event() || lanes.iter().any(Lane::has_event);
-            if output || event {
-                return Poll::Ready(());
-            }
-            Poll::Pending
-        })
-        .await;
-    }
-}
-
+/// The server and its handler for one connection. Dropping it cancels every call.
 struct Serving<'a, H: Handler + ?Sized> {
     server: grpc::Server,
     handler: &'a mut H,
@@ -711,115 +398,6 @@ struct Serving<'a, H: Handler + ?Sized> {
 impl<H: Handler + ?Sized> Drop for Serving<'_, H> {
     fn drop(&mut self) {
         self.server.cancel_all(self.handler);
-    }
-}
-
-/// Output cancellation can leave an indeterminate prefix on the wire. The
-/// caller must close/retire the connection if this returns `None`.
-async fn output_until<T: Timer, F: Future>(
-    timer: &T,
-    deadline: Option<core::time::Duration>,
-    output: F,
-) -> Option<F::Output> {
-    let mut output = pin!(output);
-    let mut sleep = pin!(deadline.map(|d| timer.sleep_until(d)));
-    poll_fn(|cx| {
-        if deadline.is_some_and(|d| timer.now() >= d)
-            || sleep
-                .as_mut()
-                .as_pin_mut()
-                .is_some_and(|s| s.poll(cx).is_ready())
-        {
-            return Poll::Ready(None);
-        }
-        let result = output.as_mut().poll(cx);
-        if deadline.is_some_and(|d| timer.now() >= d) {
-            Poll::Ready(None)
-        } else {
-            result.map(Some)
-        }
-    })
-    .await
-}
-
-async fn serve_connection<IO, H, T>(
-    io: &mut IO,
-    server: &mut grpc::Server,
-    handler: &mut H,
-    timer: &T,
-) -> Result<(), Error<IO::Error>>
-where
-    IO: Read + Write,
-    H: Handler + ?Sized,
-    T: Timer,
-{
-    let mut buf = [0u8; READ_CHUNK];
-    loop {
-        server.tick(timer.now(), &mut *handler);
-        while server.has_output() {
-            let n = output_until(
-                timer,
-                server.next_deadline(),
-                io.write(server.pending_output()),
-            )
-            .await
-            .ok_or(Error::OutputDeadline)?
-            .map_err(Error::Io)?;
-            if n == 0 {
-                return Err(Error::WriteZero);
-            }
-            server.consume_output(n);
-            server.tick(timer.now(), &mut *handler);
-        }
-        output_until(timer, server.next_deadline(), io.flush())
-            .await
-            .ok_or(Error::OutputDeadline)?
-            .map_err(Error::Io)?;
-        server.output_flushed();
-        if server.is_closed() {
-            return Ok(());
-        }
-        // Wait for input, for a streaming handler to produce output, or for
-        // a deadline.
-        let read = {
-            let mut read = pin!(io.read(&mut buf));
-            let mut sleep = pin!(server.next_deadline().map(|d| timer.sleep_until(d)));
-            poll_fn(|cx| {
-                server.tick(timer.now(), &mut *handler);
-                server.poll(&mut *handler, cx);
-                if server.has_output() {
-                    return Poll::Ready(None);
-                }
-                if let Some(sleep) = sleep.as_mut().as_pin_mut()
-                    && sleep.poll(cx).is_ready()
-                {
-                    return Poll::Ready(None);
-                }
-                read.as_mut().poll(cx).map(Some)
-            })
-            .await
-        };
-        let Some(read) = read else {
-            continue;
-        };
-        let n = read.map_err(Error::Io)?;
-        if n == 0 {
-            return Ok(());
-        }
-        // Calls that start with this input get their deadline from now.
-        server.tick(timer.now(), &mut *handler);
-        if let Err(e) = server.recv(&buf[..n], handler) {
-            // Best effort: deliver the GOAWAY before giving up.
-            let _ = output_until(timer, server.next_deadline(), async {
-                io.write_all(server.pending_output()).await?;
-                server.consume_output(server.pending_output().len());
-                io.flush().await?;
-                server.output_flushed();
-                Ok::<(), IO::Error>(())
-            })
-            .await;
-            return Err(Error::Protocol(e));
-        }
     }
 }
 
@@ -869,16 +447,16 @@ where
 /// no further transport I/O is attempted. Transport/protocol errors likewise
 /// permanently retire the connection; buffered messages remain retrievable.
 #[derive(Debug)]
-pub struct Client<IO, T = NoTimer> {
-    shared: Shared<State<IO>>,
+pub struct Client<M, T = NoTimer> {
+    shared: Shared<State<M>>,
     timer: T,
 }
 
 #[derive(Debug)]
-struct State<IO> {
+struct State<M> {
     inner: grpc::Client,
     /// The transport, or `None` while an operation has it checked out.
-    io: Option<IO>,
+    io: Option<M>,
     /// Tasks waiting for the transport to be checked back in.
     waiters: Vec<(usize, Waker)>,
     next_waiter: usize,
@@ -886,54 +464,57 @@ struct State<IO> {
     terminal: Option<Status>,
     /// A unary call whose future was dropped before it completed.
     stale_unary: Option<CallId>,
-    /// Some call has output to write while the transport is busy: a pending
-    /// read should be dropped.
-    want_io: bool,
-    /// Waker of the operation that is reading, so that it can be asked to
-    /// give up the transport.
-    holder: Option<Waker>,
+    /// Some operation waits for the transport. The owner gives it up at its
+    /// next point where nothing is in flight.
+    handoff: bool,
+    /// Waker of the operation that owns the transport, so that it is woken when
+    /// the state it waits for changes.
+    owner: Option<Waker>,
+    /// The delivery obligation of the transport, kept across leases so that
+    /// neither the flush nor the deadline of unacknowledged output is forgotten
+    /// by a handoff.
+    delivery: Delivery,
+    /// The owner must act: output was queued, credit was released, or a call
+    /// came due and so queued output. Taken and woken by [`State::take_wakers`].
+    dirty_owner: bool,
+    /// Waiters must check their completion again: a call ended, input was
+    /// applied, or the client was retired.
+    dirty_waiters: bool,
 }
 
 /// The transport, checked out of a [`Client`]. Dropping the guard checks it
 /// back in and wakes the tasks waiting for it.
-struct IoGuard<'a, IO, T> {
-    client: &'a Client<IO, T>,
-    io: Option<IO>,
-    output_in_flight: bool,
+struct IoGuard<'a, M, T> {
+    client: &'a Client<M, T>,
+    io: Option<M>,
+    /// An output operation is in flight, so its outcome is unknown if the owner
+    /// is dropped now.
+    in_flight: bool,
 }
 
-impl<IO, T> IoGuard<'_, IO, T> {
-    fn io(&mut self) -> &mut IO {
-        self.io
-            .as_mut()
-            .expect("the transport is held until the guard is dropped")
-    }
-}
-
-impl<IO, T> Drop for IoGuard<'_, IO, T> {
+impl<M, T> Drop for IoGuard<'_, M, T> {
     fn drop(&mut self) {
         let io = self.io.take();
-        let (waiters, holder) = self.client.shared.with(|s| {
-            if self.output_in_flight {
+        let wakers = self.client.shared.with(|s| {
+            if self.in_flight {
                 retire(s, Status::unavailable("transport output cancelled"));
             }
             s.io = io;
-            (core::mem::take(&mut s.waiters), s.holder.take())
+            s.owner = None;
+            s.dirty_waiters = true;
+            s.take_wakers()
         });
-        drop(holder);
-        for (_, waiter) in waiters {
-            waiter.wake();
-        }
+        wake_all(wakers);
     }
 }
 
 /// Owns one waiter registration even when an acquisition is cancelled.
-struct Registration<'a, IO, T> {
-    client: &'a Client<IO, T>,
+struct Registration<'a, M, T> {
+    client: &'a Client<M, T>,
     id: Option<usize>,
 }
 
-impl<IO, T> Drop for Registration<'_, IO, T> {
+impl<M, T> Drop for Registration<'_, M, T> {
     fn drop(&mut self) {
         let removed = self.client.shared.with(|s| {
             self.id.and_then(|id| {
@@ -947,10 +528,59 @@ impl<IO, T> Drop for Registration<'_, IO, T> {
     }
 }
 
-fn retire<IO>(state: &mut State<IO>, status: Status) {
+fn retire<M>(state: &mut State<M>, status: Status) {
     if state.terminal.is_none() {
         state.inner.fail_all(status.clone());
         state.terminal = Some(status);
+        state.dirty_owner = true;
+        state.dirty_waiters = true;
+    }
+}
+
+/// Retire the client if its connection failed on its own, as a call's work
+/// can latch an output limit (for example a credit release that does not fit).
+fn adopt_connection_failure<M>(state: &mut State<M>) {
+    if let Some(status) = state.inner.failure().map(client_failure_status) {
+        retire(state, status);
+    }
+}
+
+impl<M> State<M> {
+    /// Output was queued, or credit released: the owner has to write it.
+    fn queued(&mut self) {
+        self.dirty_owner = true;
+    }
+
+    /// Tick the core at `now`. Only a call that came due changes anything: it
+    /// queues output for the owner and ends its waiting task, so an unchanged
+    /// tick notifies nobody.
+    fn tick(&mut self, now: core::time::Duration) {
+        let due = self.inner.next_deadline().is_some_and(|d| d <= now);
+        self.inner.tick(now);
+        if due {
+            self.dirty_owner = true;
+            self.dirty_waiters = true;
+        }
+    }
+
+    /// The wakers that the changes since the last call make due. They are woken
+    /// after the state's lock is released, by [`wake_all`].
+    fn take_wakers(&mut self) -> Vec<Waker> {
+        let mut wakers = Vec::new();
+        if core::mem::take(&mut self.dirty_owner) {
+            wakers.extend(self.owner.take());
+        }
+        if core::mem::take(&mut self.dirty_waiters) {
+            wakers.extend(self.waiters.drain(..).map(|(_, waiter)| waiter));
+        }
+        wakers
+    }
+}
+
+/// Wake tasks collected under the state's lock, now that it is released.
+fn wake_all(wakers: Vec<Waker>) {
+    for waker in wakers {
+        waker.wake();
     }
 }
 
@@ -979,32 +609,61 @@ fn retire<IO>(state: &mut State<IO>, status: Status) {
 /// let transport = protolink::client(io).build();
 /// # }
 /// ```
-pub fn client<IO: Read + Write>(io: IO) -> ClientBuilder<IO> {
+pub fn client<IO: Read + Write>(io: IO) -> ClientBuilder<Serial<IO>> {
     ClientBuilder {
-        io,
+        mode: Serial::new(io),
         config: ClientConfig::default(),
         timer: DeadlinesUnspecified,
     }
 }
 
-/// Factory of an async [`Client`], created by [`client`].
+/// Start building an async gRPC client whose read and write halves are
+/// independent, served in duplex mode (see [`Duplex`]).
+pub fn client_split<R, W>(reader: R, writer: W) -> ClientBuilder<Duplex<R, W>>
+where
+    R: Read,
+    W: Write<Error = R::Error>,
+{
+    ClientBuilder {
+        mode: Duplex::new(reader, writer),
+        config: ClientConfig::default(),
+        timer: DeadlinesUnspecified,
+    }
+}
+
+/// Start building an async gRPC client on a built reliable link, served as one
+/// coordinated engine (see [`CoordinatedReliable`]).
+pub fn client_reliable<S, L>(link: ReliableLink<S, L>) -> ClientBuilder<CoordinatedReliable<S, L>>
+where
+    S: Read + Write,
+    L: LinkTimer,
+{
+    ClientBuilder {
+        mode: CoordinatedReliable::new(link),
+        config: ClientConfig::default(),
+        timer: DeadlinesUnspecified,
+    }
+}
+
+/// Factory of an async [`Client`], created by [`client`], [`client_split`] or
+/// [`client_reliable`].
 ///
 /// `T` is the deadline policy: [`DeadlinesUnspecified`] until one is chosen,
 /// then the [`Timer`] (or [`NoTimer`]) the client will use.
 #[derive(Debug)]
-pub struct ClientBuilder<IO, T = DeadlinesUnspecified> {
-    io: IO,
+pub struct ClientBuilder<M, T = DeadlinesUnspecified> {
+    mode: M,
     config: ClientConfig,
     timer: T,
 }
 
-impl<IO, T> ClientBuilder<IO, T> {
+impl<M, T> ClientBuilder<M, T> {
     /// Enforce call timeouts locally with `timer`, see
     /// [Deadlines](Client#deadlines). The transport's `read` must then be
     /// cancel-safe even with a single call.
-    pub fn with_deadline_timer<U: Timer>(self, timer: U) -> ClientBuilder<IO, U> {
+    pub fn with_deadline_timer<U: Timer>(self, timer: U) -> ClientBuilder<M, U> {
         ClientBuilder {
-            io: self.io,
+            mode: self.mode,
             config: self.config,
             timer,
         }
@@ -1012,33 +671,69 @@ impl<IO, T> ClientBuilder<IO, T> {
 
     /// Do not enforce timeouts locally. They are still sent as
     /// `grpc-timeout`, so a server with a timer enforces them.
-    pub fn without_deadlines(self) -> ClientBuilder<IO, NoTimer> {
+    pub fn without_deadlines(self) -> ClientBuilder<M, NoTimer> {
         self.with_deadline_timer(NoTimer)
     }
 
     client_config_methods!();
 }
 
-impl<IO: Read + Write, T: Timer> ClientBuilder<IO, T> {
+impl<M: Mode, T: Timer> ClientBuilder<M, T> {
     /// Construct the client. Performs no I/O: the HTTP/2 preface is sent with
     /// the first call.
-    pub fn build(self) -> Client<IO, T> {
-        Client::from_parts(self.io, self.config, self.timer)
+    pub fn build(self) -> Client<M, T> {
+        Client::from_parts(self.mode, self.config, self.timer)
     }
 }
 
-impl<IO: Read + Write, T: Timer> Client<IO, T> {
-    fn from_parts(io: IO, config: ClientConfig, timer: T) -> Self {
+impl<IO, T> Client<Serial<IO>, T> {
+    /// Unwrap the transport of a serial client.
+    pub fn into_io(self) -> IO {
+        self.shared
+            .into_inner()
+            .io
+            .expect("the transport is checked in when no operation is running")
+            .into_inner()
+    }
+}
+
+impl<R: Read, W: Write<Error = R::Error>, T> Client<Duplex<R, W>, T> {
+    /// Unwrap the two halves of a duplex client. They are not reunited.
+    pub fn into_parts(self) -> (R, W) {
+        self.shared
+            .into_inner()
+            .io
+            .expect("the transport is checked in when no operation is running")
+            .into_parts()
+    }
+}
+
+impl<S: Read + Write, L: LinkTimer, T> Client<CoordinatedReliable<S, L>, T> {
+    /// Unwrap the reliable link of a coordinated client.
+    pub fn into_link(self) -> ReliableLink<S, L> {
+        self.shared
+            .into_inner()
+            .io
+            .expect("the transport is checked in when no operation is running")
+            .into_link()
+    }
+}
+
+impl<M: Mode, T: Timer> Client<M, T> {
+    fn from_parts(mode: M, config: ClientConfig, timer: T) -> Self {
         Self {
             shared: Shared::new(State {
                 inner: grpc::Client::new(config),
-                io: Some(io),
+                io: Some(mode),
                 waiters: Vec::new(),
                 next_waiter: 0,
                 terminal: None,
                 stale_unary: None,
-                want_io: false,
-                holder: None,
+                handoff: false,
+                owner: None,
+                delivery: Delivery::default(),
+                dirty_owner: false,
+                dirty_waiters: false,
             }),
             timer,
         }
@@ -1061,18 +756,24 @@ impl<IO: Read + Write, T: Timer> Client<IO, T> {
         options: CallOptions,
     ) -> Result<Response<Vec<u8>>, Status> {
         let now = self.timer.now();
-        let id = self.shared.with(|s| {
-            s.inner.tick(now);
+        let (started, wakers) = self.shared.with(|s| {
+            s.tick(now);
             cancel_stale_unary(s);
-            if let Some(status) = &s.terminal {
-                return Err(status.clone());
+            let started = match &s.terminal {
+                Some(status) => Err(status.clone()),
+                None => s.inner.start_unary_with(path, request, &options),
+            };
+            adopt_connection_failure(s);
+            if started.is_ok() {
+                s.queued();
             }
-            let id = s.inner.start_unary_with(path, request, &options)?;
-            s.stale_unary = Some(id);
-            Ok::<_, Status>(id)
-        })?;
+            (started, s.take_wakers())
+        });
+        wake_all(wakers);
+        let id = started?;
+        self.shared.with(|s| s.stale_unary = Some(id));
         let result = self
-            .drive(|c| match c.take_response(id) {
+            .drive(|c, _| match c.take_response(id) {
                 Some(result) => Some(result),
                 None if c.is_pending(id) => None,
                 None => Some(Err(Status::cancelled("call is not active"))),
@@ -1086,7 +787,7 @@ impl<IO: Read + Write, T: Timer> Client<IO, T> {
     ///
     /// The request headers are sent with the first operation on the
     /// returned [`Call`]. Dropping the call before it completes cancels it.
-    pub fn streaming(&self, path: &str) -> Result<Call<'_, IO, T>, Status> {
+    pub fn streaming(&self, path: &str) -> Result<Call<'_, M, T>, Status> {
         self.streaming_with(path, CallOptions::default())
     }
 
@@ -1096,27 +797,23 @@ impl<IO: Read + Write, T: Timer> Client<IO, T> {
         &self,
         path: &str,
         options: CallOptions,
-    ) -> Result<Call<'_, IO, T>, Status> {
+    ) -> Result<Call<'_, M, T>, Status> {
         let now = self.timer.now();
-        let id = self.shared.with(|s| {
-            s.inner.tick(now);
+        let (started, wakers) = self.shared.with(|s| {
+            s.tick(now);
             cancel_stale_unary(s);
-            if let Some(status) = &s.terminal {
-                return Err(status.clone());
+            let started = match &s.terminal {
+                Some(status) => Err(status.clone()),
+                None => s.inner.start_streaming_with(path, &options),
+            };
+            adopt_connection_failure(s);
+            if started.is_ok() {
+                s.queued();
             }
-            s.inner.start_streaming_with(path, &options)
-        })?;
-        let wake = self.shared.with(|s| {
-            if s.io.is_none() {
-                s.want_io = true;
-                s.holder.take()
-            } else {
-                None
-            }
+            (started, s.take_wakers())
         });
-        if let Some(waker) = wake {
-            waker.wake();
-        }
+        wake_all(wakers);
+        let id = started?;
         Ok(Call {
             client: self,
             id,
@@ -1132,36 +829,33 @@ impl<IO: Read + Write, T: Timer> Client<IO, T> {
         self.shared.with(|s| f(&s.inner))
     }
 
-    /// Unwrap the transport.
-    pub fn into_io(self) -> IO {
-        self.shared
-            .into_inner()
-            .io
-            .expect("the transport is checked in when no operation is running")
-    }
-
     /// Check the transport out, waiting while another operation has it.
     /// `done` is evaluated first, and whenever the client state may have
     /// changed; if it returns a value, that is returned instead of the
     /// transport.
     async fn acquire<R>(
         &self,
-        done: &mut impl FnMut(&mut grpc::Client) -> Option<R>,
-    ) -> Result<IoGuard<'_, IO, T>, R> {
+        done: &mut impl FnMut(&mut grpc::Client, bool) -> Option<R>,
+    ) -> Result<IoGuard<'_, M, T>, R> {
         let mut registration = Registration {
             client: self,
             id: None,
         };
         let acquired = poll_fn(|cx| {
-            let (poll, wake, discarded) = self.shared.with(|s| {
-                s.inner.tick(self.timer.now());
-                if let Some(value) = done(&mut s.inner) {
-                    return (Poll::Ready(Err(value)), None, None);
+            let (poll, wakers) = self.shared.with(|s| {
+                s.tick(self.timer.now());
+                adopt_connection_failure(s);
+                if let Some(value) = done(&mut s.inner, s.delivery.unflushed) {
+                    // Consuming a result may release credit, which the owner writes,
+                    // and whose output may not fit. The result itself is kept.
+                    s.queued();
+                    adopt_connection_failure(s);
+                    return (Poll::Ready(Err(value)), s.take_wakers());
                 }
                 match s.io.take() {
                     Some(io) => {
-                        s.want_io = false;
-                        (Poll::Ready(Ok(io)), None, None)
+                        s.handoff = false;
+                        (Poll::Ready(Ok(io)), Vec::new())
                     }
                     None => {
                         let id = *registration.id.get_or_insert_with(|| {
@@ -1184,235 +878,293 @@ impl<IO: Read + Write, T: Timer> Client<IO, T> {
                             s.waiters.push((id, cx.waker().clone()));
                             None
                         };
-                        // Output is waiting but the transport is busy,
-                        // probably in a read: ask it to give way.
-                        let wake = if s.inner.has_output() {
-                            s.want_io = true;
-                            s.holder.take()
+                        drop(discarded);
+                        // Only output needs the transport from another task. Input
+                        // is read by the owner, which feeds the state this waits on.
+                        // The owner gives the transport up at its next safe point.
+                        if s.inner.has_output() {
+                            s.handoff = true;
+                            s.dirty_owner = true;
+                            (Poll::Pending, s.take_wakers())
                         } else {
-                            None
-                        };
-                        (Poll::Pending, wake, discarded)
+                            (Poll::Pending, Vec::new())
+                        }
                     }
                 }
             });
-            drop(discarded);
-            if let Some(waker) = wake {
-                waker.wake();
-            }
+            wake_all(wakers);
             poll
         })
         .await;
         acquired.map(|io| IoGuard {
             client: self,
             io: Some(io),
-            output_in_flight: false,
+            in_flight: false,
         })
     }
 
-    /// Move the connection along (write pending output, read input) until
-    /// `step` returns a value.
-    async fn drive<R>(&self, mut step: impl FnMut(&mut grpc::Client) -> Option<R>) -> R {
+    /// Run the connection, as its owner, until `step` returns a value. Each
+    /// operation holds the transport only as long as it needs it; see [`pump`].
+    async fn drive<R>(&self, mut step: impl FnMut(&mut grpc::Client, bool) -> Option<R>) -> R {
         loop {
-            let now = self.timer.now();
-            self.shared.with(|s| s.inner.tick(now));
             let mut guard = match self.acquire(&mut step).await {
                 Ok(guard) => guard,
                 Err(value) => return value,
             };
-            if self.write_all(&mut guard).await {
-                if let Some(value) = self.shared.with(|s| step(&mut s.inner)) {
-                    return value;
+            match self.pump(&mut guard, &mut step).await {
+                Pumped::Value(value) => return value,
+                Pumped::Retired => {}
+                Pumped::Handoff => {
+                    drop(guard);
+                    yield_now().await;
                 }
-                self.read_once(guard.io()).await;
             }
         }
     }
 
-    /// Write all pending output.
+    /// Write all pending output and flush the transport, as the owner of the
+    /// transport. Transport failures fail every call.
     async fn flush(&self) {
-        if self.shared.with(|s| s.terminal.is_some()) {
-            return;
-        }
-        let mut done = |c: &mut grpc::Client| (!c.has_output()).then_some(());
-        if let Ok(mut guard) = self.acquire(&mut done).await {
-            self.write_all(&mut guard).await;
-        }
-    }
-
-    /// Write all pending output and flush the transport. Transport failures
-    /// fail every call and return `false`.
-    ///
-    /// Output is copied out in chunks and only consumed once the transport
-    /// accepted it, so no borrow of the client state is held while the
-    /// transport is awaited.
-    async fn write_all(&self, guard: &mut IoGuard<'_, IO, T>) -> bool {
-        if self.shared.with(|s| s.terminal.is_some()) {
-            return false;
-        }
-        let mut buf = [0u8; READ_CHUNK];
         loop {
-            let n = self.shared.with(|s| {
-                let pending = s.inner.pending_output();
-                let n = pending.len().min(buf.len());
-                buf[..n].copy_from_slice(&pending[..n]);
-                n
-            });
-            if n == 0 {
-                break;
+            if self.shared.with(|s| s.terminal.is_some()) {
+                return;
             }
-            guard.output_in_flight = true;
-            let result = self.output(guard.io().write(&buf[..n])).await;
-            guard.output_in_flight = false;
-            match result {
-                None => return false,
-                Some(Ok(0) | Err(_)) => {
-                    self.fail_all("transport write failed");
-                    return false;
+            let mut done = |c: &mut grpc::Client, unflushed: bool| {
+                (!c.has_output() && !unflushed).then_some(())
+            };
+            let mut guard = match self.acquire(&mut done).await {
+                Ok(guard) => guard,
+                Err(()) => return,
+            };
+            match self.pump(&mut guard, &mut done).await {
+                Pumped::Value(()) | Pumped::Retired => return,
+                Pumped::Handoff => {
+                    drop(guard);
+                    yield_now().await;
                 }
-                Some(Ok(written)) => self.shared.with(|s| s.inner.consume_output(written)),
             }
         }
-        guard.output_in_flight = true;
-        let result = self.output(guard.io().flush()).await;
-        guard.output_in_flight = false;
-        match result {
-            None => false,
-            Some(Err(_)) => {
-                self.fail_all("transport flush failed");
-                false
-            }
-            Some(Ok(())) => true,
-        }
     }
 
-    async fn output<F: Future>(&self, output: F) -> Option<F::Output> {
-        let mut output = pin!(output);
-        // This obligation belongs to the in-flight output, not to the core's
-        // mutable call set. A concurrent tick/cancellation may remove a call,
-        // but cannot make potentially non-cancel-safe output safe to reuse.
-        let mut deadline = self.shared.with(|s| s.inner.next_deadline());
-        let mut sleep = pin!(deadline.map(|d| self.timer.sleep_until(d)));
-        poll_fn(|cx| {
-            if deadline.is_some_and(|d| self.timer.now() >= d)
-                || sleep
-                    .as_mut()
-                    .as_pin_mut()
-                    .is_some_and(|s| s.poll(cx).is_ready())
-            {
-                self.output_expired();
-                return Poll::Ready(None);
-            }
-            let (next, discarded) = self.shared.with(|s| {
-                (
-                    s.inner.next_deadline(),
-                    s.holder.replace(cx.waker().clone()),
-                )
-            });
-            drop(discarded);
-            if next.is_some_and(|next| deadline.is_none_or(|armed| next < armed)) {
-                deadline = next;
-                sleep.set(deadline.map(|d| self.timer.sleep_until(d)));
-            }
-            if deadline.is_some_and(|d| self.timer.now() >= d)
-                || sleep
-                    .as_mut()
-                    .as_pin_mut()
-                    .is_some_and(|s| s.poll(cx).is_ready())
-            {
-                self.output_expired();
-                return Poll::Ready(None);
-            }
-            let result = output.as_mut().poll(cx);
-            // A ready transport may itself advance a platform clock.
-            if deadline.is_some_and(|d| self.timer.now() >= d) {
-                self.output_expired();
-                Poll::Ready(None)
-            } else {
-                result.map(Some)
-            }
-        })
-        .await
-    }
-
-    fn output_expired(&self) {
-        self.shared.with(|s| {
-            // Preserve DEADLINE_EXCEEDED for expired calls before failing peers.
-            s.inner.tick(self.timer.now());
-            retire(s, Status::unavailable("transport output deadline exceeded"));
-        });
-    }
-
-    /// Read once from the transport. Transport failures fail every call.
+    /// Move the connection along while this task owns the transport: write what
+    /// is pending, flush what was written, and read input into the core, until
+    /// `step` returns a value. `step` is only evaluated when no operation is in
+    /// flight, so a result is consumed only at a safe point. Input is read while
+    /// an output operation is pending on the same transport, see [`Mode`].
     ///
-    /// If another call wants to write while the read is pending, or the
-    /// earliest deadline is reached, the read is dropped (it must be
-    /// cancel-safe) and nothing is read.
-    async fn read_once(&self, io: &mut IO) {
-        let mut buf = [0u8; READ_CHUNK];
-        let deadline = self.shared.with(|s| s.inner.next_deadline());
-        let mut sleep = pin!(deadline.map(|d| self.timer.sleep_until(d)));
-        let result = {
-            let mut read = pin!(io.read(&mut buf));
-            poll_fn(|cx| {
-                if let Poll::Ready(result) = read.as_mut().poll(cx) {
-                    return Poll::Ready(Some(result));
+    /// The transport is only given up when nothing is in flight. Other
+    /// operations that wait for it request that, and the owner yields at the
+    /// first such point.
+    async fn pump<R>(
+        &self,
+        guard: &mut IoGuard<'_, M, T>,
+        step: &mut impl FnMut(&mut grpc::Client, bool) -> Option<R>,
+    ) -> Pumped<R> {
+        let port = Shared::new(driver::Port::new().write_first());
+        let io = guard
+            .io
+            .as_mut()
+            .expect("the transport is held until the guard is dropped");
+        let mut lane = Lane::new(&port, io.worker(&port));
+        lane.set_delivery(self.shared.with(|s| s.delivery));
+        loop {
+            let now = self.timer.now();
+            let settled = self.shared.with(|s| {
+                // The obligations of output in flight are latched before the calls
+                // that are due are expired, so that the deadline they set is kept.
+                lane.arm(&s.inner);
+                s.tick(now);
+                adopt_connection_failure(s);
+                if s.terminal.is_some() {
+                    lane.retire();
+                    return Settled::Retired;
                 }
-                if let Some(sleep) = sleep.as_mut().as_pin_mut()
-                    && sleep.poll(cx).is_ready()
-                {
-                    return Poll::Ready(None);
+                // Output past its deadline retires the client before a completion
+                // is taken: taking it would otherwise erase the obligation.
+                if lane.overdue(now) {
+                    // Expired calls end first, so that the retirement keeps their status.
+                    retire(s, Status::unavailable("transport output deadline exceeded"));
+                    lane.retire();
+                    return Settled::Retired;
                 }
-                let (yield_now, discarded) = self.shared.with(|s| {
-                    let discarded = if !s.want_io
-                        && !s.holder.as_ref().is_some_and(|w| w.will_wake(cx.waker()))
-                    {
-                        s.holder.replace(cx.waker().clone())
+                // The reply to an operation ends it. A failed one retires the client.
+                let flushing = lane.flushing();
+                if lane.reap(&mut s.inner).is_some() {
+                    let message = if flushing {
+                        "transport flush failed"
                     } else {
-                        None
+                        "transport write failed"
                     };
-                    (s.want_io, discarded)
-                });
-                drop(discarded);
-                if yield_now {
-                    Poll::Ready(None)
-                } else {
-                    Poll::Pending
+                    retire(s, Status::unavailable(message));
+                    lane.retire();
+                    return Settled::Retired;
                 }
-            })
-            .await
-        };
-        let Some(result) = result else {
-            return;
-        };
-        self.shared.with(|s| {
-            s.inner.tick(self.timer.now());
-            match result {
-                Ok(0) => retire(s, Status::unavailable("connection closed")),
-                Ok(n) => {
-                    if s.inner.recv(&buf[..n]).is_err() {
-                        retire(s, Status::unavailable("connection protocol error"));
+                // Input: one read outcome, fed to the core without handler work.
+                if let Some(read) = lane.take_input() {
+                    match read {
+                        Ok(0) => retire(s, Status::unavailable("connection closed")),
+                        Ok(n) => match lane.with_input(n, |bytes| s.inner.recv(bytes)) {
+                            Ok(()) => {
+                                s.dirty_waiters = true;
+                            }
+                            Err(error) => retire(s, client_failure_status(&error)),
+                        },
+                        Err(_) => retire(s, Status::unavailable("transport read failed")),
+                    }
+                    if s.terminal.is_some() {
+                        lane.retire();
+                        return Settled::Retired;
                     }
                 }
-                Err(_) => retire(s, Status::unavailable("transport read failed")),
+                // Output: the write or flush that is due, once nothing is in flight.
+                lane.issue(&s.inner);
+                if !lane.busy() {
+                    if let Some(value) = step(&mut s.inner, lane.unflushed()) {
+                        // The result was consumed, and its credit may not fit.
+                        adopt_connection_failure(s);
+                        return Settled::Value(value);
+                    }
+                    if s.handoff {
+                        return Settled::Handoff;
+                    }
+                }
+                Settled::Pending
+            });
+            // An operation in flight is what the guard must not lose: see IoGuard.
+            guard.in_flight = lane.busy();
+            // Input changed the calls, or the client ended: the tasks waiting for the
+            // transport may now be able to finish. The owner, which is this task, needs
+            // no wake of its own.
+            let wakers = self.shared.with(|s| {
+                s.dirty_owner = false;
+                s.take_wakers()
+            });
+            wake_all(wakers);
+            match settled {
+                Settled::Value(value) => return leave(self, &lane, Pumped::Value(value)),
+                Settled::Retired => return leave(self, &lane, Pumped::Retired),
+                Settled::Handoff => return leave(self, &lane, Pumped::Handoff),
+                Settled::Pending => {}
             }
-        });
-    }
-
-    fn fail_all(&self, message: &'static str) {
-        self.shared
-            .with(|s| retire(s, Status::unavailable(message)));
+            wait_for_pump(self, &mut lane).await;
+        }
     }
 }
 
+/// What a pump of the transport ended with.
+enum Pumped<R> {
+    /// `step` returned its value, at a safe point.
+    Value(R),
+    /// The client was retired; its calls have their statuses.
+    Retired,
+    /// Another operation waits for the transport, and nothing is in flight.
+    Handoff,
+}
+
+/// The outcome of one settling pass of a pump, taken under the state's lock.
+enum Settled<R> {
+    Value(R),
+    Retired,
+    Handoff,
+    Pending,
+}
+
+/// Record the flush obligation of a lane that is leaving the transport, so that
+/// the next owner inherits it.
+fn leave<M: Mode, T: Timer, F: Future<Output = ()>, R>(
+    client: &Client<M, T>,
+    lane: &Lane<'_, F, M::Error>,
+    pumped: Pumped<R>,
+) -> Pumped<R> {
+    client.shared.with(|s| s.delivery = lane.delivery());
+    pumped
+}
+
+/// Wait until the pump has something to do: its worker has an outcome, a
+/// deadline is due, or the state changed in a way the owner acts on. The owner's
+/// waker is registered under the state's lock, together with the readiness
+/// check, so that a change cannot slip in unnoticed.
+async fn wait_for_pump<M: Mode, T: Timer, F: Future<Output = ()>>(
+    client: &Client<M, T>,
+    lane: &mut Lane<'_, F, M::Error>,
+) {
+    let mut deadline = client
+        .shared
+        .with(|s| earliest([s.inner.next_deadline(), lane.deadline()]));
+    let mut sleep = pin!(deadline.map(|d| client.timer.sleep_until(d)));
+    poll_fn(|cx| {
+        // Register and inspect the state first, under one lock: a change made after
+        // this point wakes the owner, and one made before it is seen here. A
+        // terminal client needs no transport I/O, even with a write still pending.
+        let (previous, terminal, next) = client.shared.with(|s| {
+            let previous = s.owner.replace(cx.waker().clone());
+            let terminal = s.terminal.is_some();
+            (
+                previous,
+                terminal,
+                earliest([s.inner.next_deadline(), lane.deadline()]),
+            )
+        });
+        drop(previous);
+        // A call that started meanwhile may have brought an earlier deadline.
+        if next != deadline {
+            deadline = next;
+            sleep.set(deadline.map(|d| client.timer.sleep_until(d)));
+        }
+        // A due deadline returns to the pump before the worker is polled, so that
+        // no transport operation starts once output has expired.
+        if terminal
+            || deadline.is_some_and(|d| client.timer.now() >= d)
+            || sleep
+                .as_mut()
+                .as_pin_mut()
+                .is_some_and(|sleep| sleep.poll(cx).is_ready())
+        {
+            return Poll::Ready(());
+        }
+        lane.poll_worker(cx);
+        let ready = client.shared.with(|s| {
+            lane.has_event() || (!lane.busy() && (lane.wants_issue(&s.inner) || s.handoff))
+        });
+        if ready
+            || deadline.is_some_and(|d| client.timer.now() >= d)
+            || sleep
+                .as_mut()
+                .as_pin_mut()
+                .is_some_and(|sleep| sleep.poll(cx).is_ready())
+        {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await
+}
+
+/// Give other tasks a turn: returns `Pending` once, waking itself, then `Ready`.
+/// It does not depend on which executor polls the future.
+async fn yield_now() {
+    let mut yielded = false;
+    poll_fn(|cx| {
+        if yielded {
+            Poll::Ready(())
+        } else {
+            yielded = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    })
+    .await;
+}
+
 /// Cancel a unary call whose future was dropped.
-fn cancel_stale_unary<IO>(state: &mut State<IO>) {
+fn cancel_stale_unary<M>(state: &mut State<M>) {
     if let Some(stale) = state.stale_unary.take() {
         state.inner.cancel(stale);
     }
 }
 
-impl<IO: Read + Write, T: Timer> UnaryTransport for Client<IO, T> {
+impl<M: Mode, T: Timer> UnaryTransport for Client<M, T> {
     fn unary(
         &mut self,
         path: &str,
@@ -1423,9 +1175,9 @@ impl<IO: Read + Write, T: Timer> UnaryTransport for Client<IO, T> {
     }
 }
 
-impl<IO: Read + Write, T: Timer> StreamingTransport for Client<IO, T> {
+impl<M: Mode, T: Timer> StreamingTransport for Client<M, T> {
     type Call<'a>
-        = Call<'a, IO, T>
+        = Call<'a, M, T>
     where
         Self: 'a;
 
@@ -1453,8 +1205,8 @@ impl<IO: Read + Write, T: Timer> StreamingTransport for Client<IO, T> {
 /// requests without reading the responses can block both peers in `write`.
 /// Interleave `message` with `send`, or give the transport enough buffering.
 #[derive(Debug)]
-pub struct Call<'a, IO, T = NoTimer> {
-    client: &'a Client<IO, T>,
+pub struct Call<'a, M, T = NoTimer> {
+    client: &'a Client<M, T>,
     id: CallId,
     finished: Option<Result<(), Status>>,
     /// Response headers and trailers, taken from the client when the call
@@ -1462,7 +1214,7 @@ pub struct Call<'a, IO, T = NoTimer> {
     metadata: (Option<Metadata>, Metadata),
 }
 
-impl<IO: Read + Write, T: Timer> Call<'_, IO, T> {
+impl<M: Mode, T: Timer> Call<'_, M, T> {
     /// The call's id on the connection.
     pub fn id(&self) -> CallId {
         self.id
@@ -1478,15 +1230,24 @@ impl<IO: Read + Write, T: Timer> Call<'_, IO, T> {
         let client = self.client;
         let id = self.id;
         client
-            .drive(|c| (c.can_send(id) || !c.is_pending(id)).then_some(()))
+            .drive(|c, _| (c.can_send(id) || !c.is_pending(id)).then_some(()))
             .await;
-        let queued = client.shared.with(|s| {
-            if !s.inner.is_pending(id) {
+        let (queued, wakers) = client.shared.with(|s| {
+            let queued = if s.inner.is_pending(id) {
+                let queued = s.inner.send_message(id, message);
+                adopt_connection_failure(s);
+                queued.map(|()| true)
+            } else {
                 // Finished while waiting; the outcome is reported by `message`.
-                return Ok(false);
+                Ok(false)
+            };
+            if let Ok(true) = queued {
+                s.queued();
             }
-            s.inner.send_message(id, message).map(|()| true)
-        })?;
+            (queued, s.take_wakers())
+        });
+        wake_all(wakers);
+        let queued = queued?;
         if queued {
             client.flush().await;
         }
@@ -1500,12 +1261,21 @@ impl<IO: Read + Write, T: Timer> Call<'_, IO, T> {
         }
         let client = self.client;
         let id = self.id;
-        let queued = client.shared.with(|s| {
-            if !s.inner.is_pending(id) {
-                return Ok(false);
+        let (queued, wakers) = client.shared.with(|s| {
+            let queued = if s.inner.is_pending(id) {
+                let queued = s.inner.close_send(id);
+                adopt_connection_failure(s);
+                queued.map(|()| true)
+            } else {
+                Ok(false)
+            };
+            if let Ok(true) = queued {
+                s.queued();
             }
-            s.inner.close_send(id).map(|()| true)
-        })?;
+            (queued, s.take_wakers())
+        });
+        wake_all(wakers);
+        let queued = queued?;
         if queued {
             client.flush().await;
         }
@@ -1522,7 +1292,7 @@ impl<IO: Read + Write, T: Timer> Call<'_, IO, T> {
         let id = self.id;
         let next = self
             .client
-            .drive(|c| match c.try_next(id) {
+            .drive(|c, _| match c.try_next(id) {
                 Some(next) => Some(next),
                 None if !c.is_pending(id) => {
                     Some(Next::Done(Err(Status::cancelled("call is not active"))))
@@ -1558,34 +1328,29 @@ impl<IO: Read + Write, T: Timer> Call<'_, IO, T> {
     }
 }
 
-fn client_take_metadata<IO, T>(client: &Client<IO, T>, id: CallId) -> (Option<Metadata>, Metadata) {
+fn client_take_metadata<M, T>(client: &Client<M, T>, id: CallId) -> (Option<Metadata>, Metadata) {
     client.shared.with(|s| s.inner.take_metadata(id))
 }
 
-impl<IO, T> Drop for Call<'_, IO, T> {
+impl<M, T> Drop for Call<'_, M, T> {
     fn drop(&mut self) {
         if self.finished.is_some() {
             return;
         }
         let id = self.id;
-        let wake = self.client.shared.with(|s| {
+        let wakers = self.client.shared.with(|s| {
             s.inner.cancel(id);
-            // The cancellation is written by whichever operation uses the
-            // transport next. If one is reading right now, ask it to flush.
-            if s.io.is_none() && s.inner.has_output() {
-                s.want_io = true;
-                s.holder.take()
-            } else {
-                None
-            }
+            adopt_connection_failure(s);
+            // The cancellation is written by the owner of the transport, which
+            // is woken to do so.
+            s.queued();
+            s.take_wakers()
         });
-        if let Some(waker) = wake {
-            waker.wake();
-        }
+        wake_all(wakers);
     }
 }
 
-impl<IO: Read + Write, T: Timer> StreamingCall for Call<'_, IO, T> {
+impl<M: Mode, T: Timer> StreamingCall for Call<'_, M, T> {
     fn send(&mut self, message: &[u8]) -> impl Future<Output = Result<(), Status>> {
         Call::send(self, message)
     }
@@ -1624,7 +1389,9 @@ mod tests {
     use embedded_io_async::ErrorType;
 
     use super::*;
-    use crate::grpc::{CallContext, Dispatcher, MethodDescriptor, MethodKind, Route};
+    use crate::grpc::{
+        CallContext, Code, Dispatcher, FnHandler, MethodDescriptor, MethodKind, Route,
+    };
 
     const GATE: &str = "/t.T/Gate";
     const OPEN: &str = "/t.T/Open";
@@ -1812,7 +1579,7 @@ mod tests {
         panic!("future did not complete");
     }
 
-    fn loopback_client(peer: &Rc<RefCell<Peer>>) -> Client<Loopback> {
+    fn loopback_client(peer: &Rc<RefCell<Peer>>) -> Client<Serial<Loopback>> {
         client(Loopback(peer.clone())).without_deadlines().build()
     }
 
@@ -1831,7 +1598,6 @@ mod tests {
         {
             let mut a_message = pin!(a.message());
             assert!(poll_once(a_message.as_mut(), &wake_a).is_pending());
-            assert_eq!(peer.borrow().reads_dropped, 0);
             assert_eq!(a_wakes.count(), 0);
 
             // B queues its request, but the transport is busy with A's read.
@@ -1845,7 +1611,6 @@ mod tests {
                 panic!("A should complete once B's request was written");
             };
             assert_eq!(reply.unwrap().unwrap(), b"open");
-            assert_eq!(peer.borrow().reads_dropped, 1);
 
             // B's request went out with A's turn; B is woken and completes.
             assert!(b_wakes.count() >= 1);
@@ -1894,7 +1659,6 @@ mod tests {
             panic!("the gate call's reply was read by the other call");
         };
         assert_eq!(reply.unwrap().unwrap(), b"open");
-        assert_eq!(peer.borrow().reads_dropped, 0, "nobody had to yield");
     }
 
     /// Dropping a call while another call is reading gets the cancellation
@@ -1916,7 +1680,8 @@ mod tests {
         assert_eq!(wakes.count(), 1, "the reader is asked to yield");
         assert!(poll_once(quiet_message.as_mut(), &wake).is_pending());
         assert_eq!(peer.borrow().script.cancelled, 1);
-        assert_eq!(peer.borrow().reads_dropped, 1);
+        // The cancel took the reader's read away; leases may drop reads too.
+        assert!(peer.borrow().reads_dropped >= 1);
     }
 
     /// A call that gave up waiting for the transport doesn't disturb the
@@ -2065,6 +1830,10 @@ mod tests {
                     // Invalid SETTINGS frame on stream 1.
                     buf[..9].copy_from_slice(&[0, 0, 0, 4, 0, 0, 0, 0, 1]);
                     Ok(9)
+                }
+                // A stalled transport has no input to give, rather than an end.
+                Fault::WritePending | Fault::FlushPending | Fault::FlushWaking => {
+                    core::future::pending().await
                 }
                 _ => Ok(0),
             }
@@ -2568,7 +2337,9 @@ mod tests {
         run(call.send(b"x")).unwrap();
         let bytes: Vec<u8> = peer.borrow_mut().rx.drain(..).collect();
         client.shared.with(|s| s.inner.recv(&bytes).unwrap());
-        client.fail_all("scripted transport failure");
+        client
+            .shared
+            .with(|s| retire(s, Status::unavailable("scripted transport failure")));
         assert_eq!(run(call.message()).unwrap().unwrap(), b"open");
         assert_eq!(
             run(call.message()).unwrap_err().code,
@@ -3109,5 +2880,912 @@ mod tests {
             Poll::Ready(Err(Error::Protocol(_)))
         ));
         assert_eq!(io.0.borrow().written, [&before[..], &goaway[..]].concat());
+    }
+
+    /// A transport that accepts every write, never completes a read, and keeps
+    /// what was written.
+    #[derive(Clone, Default)]
+    struct Sink(Rc<RefCell<Vec<u8>>>);
+
+    impl embedded_io_async::ErrorType for Sink {
+        type Error = Infallible;
+    }
+
+    impl Read for Sink {
+        async fn read(&mut self, _: &mut [u8]) -> Result<usize, Infallible> {
+            core::future::pending().await
+        }
+    }
+
+    impl Write for Sink {
+        async fn write(&mut self, buf: &[u8]) -> Result<usize, Infallible> {
+            self.0.borrow_mut().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        async fn flush(&mut self) -> Result<(), Infallible> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_connection_whose_handshake_exceeds_the_output_limit_writes_nothing() {
+        let limit = 10;
+        let io = Sink::default();
+        let server = server(io.clone())
+            .without_deadlines()
+            .with_http2(crate::grpc::http2::Config {
+                max_pending_output_bytes: limit,
+                ..Default::default()
+            })
+            .build();
+        let mut services = FnHandler(|_: &str, req: &[u8]| Some(Ok(req.to_vec())));
+        let result = run(server.serve(&mut services));
+        assert!(matches!(
+            result,
+            Err(Error::OutputLimitExceeded { limit: l, pending: 0, .. }) if l == limit
+        ));
+        assert!(io.0.borrow().is_empty(), "no partial handshake is written");
+    }
+
+    #[test]
+    fn a_client_whose_handshake_exceeds_the_output_limit_fails_with_an_overload() {
+        let mut client = client(Sink::default())
+            .without_deadlines()
+            .with_http2(crate::grpc::http2::Config {
+                max_pending_output_bytes: 10,
+                ..Default::default()
+            })
+            .build();
+        let status = run(client.unary("/test/Echo", b"x")).unwrap_err();
+        assert_eq!(status.code, Code::Unavailable);
+        assert!(
+            status.message.contains("output limit"),
+            "{}",
+            status.message
+        );
+    }
+
+    /// The input half of a split transport: chunks the test pushes, waking the
+    /// reader that waits for them.
+    #[derive(Clone, Default)]
+    struct SplitIn(Rc<RefCell<SplitInState>>);
+
+    #[derive(Default)]
+    struct SplitInState {
+        chunks: VecDeque<Vec<u8>>,
+        waker: Option<Waker>,
+    }
+
+    impl SplitIn {
+        fn push(&self, bytes: Vec<u8>) {
+            let mut state = self.0.borrow_mut();
+            state.chunks.push_back(bytes);
+            if let Some(waker) = state.waker.take() {
+                waker.wake();
+            }
+        }
+    }
+
+    impl embedded_io_async::ErrorType for SplitIn {
+        type Error = Infallible;
+    }
+
+    impl Read for SplitIn {
+        async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Infallible> {
+            poll_fn(|cx| {
+                let mut state = self.0.borrow_mut();
+                match state.chunks.pop_front() {
+                    Some(chunk) => {
+                        let n = chunk.len().min(buf.len());
+                        buf[..n].copy_from_slice(&chunk[..n]);
+                        // What the buffer could not take is read next.
+                        if n < chunk.len() {
+                            state.chunks.push_front(chunk[n..].to_vec());
+                        }
+                        Poll::Ready(Ok(n))
+                    }
+                    None => {
+                        state.waker = Some(cx.waker().clone());
+                        Poll::Pending
+                    }
+                }
+            })
+            .await
+        }
+    }
+
+    /// The output half of a split transport: what it accepted, and whether its
+    /// writes are stalled.
+    #[derive(Clone, Default)]
+    struct SplitOut {
+        written: Rc<RefCell<Vec<u8>>>,
+        stalled: Rc<core::cell::Cell<bool>>,
+    }
+
+    impl embedded_io_async::ErrorType for SplitOut {
+        type Error = Infallible;
+    }
+
+    impl Write for SplitOut {
+        async fn write(&mut self, buf: &[u8]) -> Result<usize, Infallible> {
+            poll_fn(|_| {
+                if self.stalled.get() {
+                    return Poll::Pending;
+                }
+                self.written.borrow_mut().extend_from_slice(buf);
+                Poll::Ready(Ok(buf.len()))
+            })
+            .await
+        }
+
+        async fn flush(&mut self) -> Result<(), Infallible> {
+            Ok(())
+        }
+    }
+
+    /// A response that arrives on the input half while the owner's write is
+    /// blocked completes its waiting call, without the write being finished.
+    #[test]
+    fn response_waiter_completes_while_owner_tx_is_pending() {
+        use crate::grpc::http2::{Config as H2, Connection as Peer, HeaderField};
+        let input = SplitIn::default();
+        let output = SplitOut::default();
+        let client = client_split(input.clone(), output.clone())
+            .without_deadlines()
+            .build();
+        let mut b = client.streaming(QUIET).unwrap();
+        run(b.send(b"hi")).unwrap();
+
+        // The peer answers the call B has started, and nothing else.
+        let mut peer = Peer::server(H2::default());
+        peer.recv(&output.written.borrow()).unwrap();
+        let field = |name: &str, value: &str| HeaderField {
+            name: name.into(),
+            value: value.into(),
+        };
+        let b_id = b.id();
+        peer.send_headers(
+            b_id,
+            alloc::vec![
+                field(":status", "200"),
+                field("content-type", "application/grpc"),
+            ],
+            false,
+        )
+        .unwrap();
+        peer.send_data(b_id, crate::grpc::lpm::encode(b"reply").unwrap(), false)
+            .unwrap();
+
+        // The owner's write is now blocked, so the owner is A.
+        output.stalled.set(true);
+        let (wake_a, _) = Wakes::waker();
+        let (wake_b, _) = Wakes::waker();
+        let mut a = client.streaming(QUIET).unwrap();
+        let mut a_send = pin!(a.send(&[7; 2000]));
+        assert!(poll_once(a_send.as_mut(), &wake_a).is_pending());
+
+        // B waits for the transport, since it holds no result yet.
+        let mut b_message = pin!(b.message());
+        assert!(poll_once(b_message.as_mut(), &wake_b).is_pending());
+
+        // The response reaches the reader. A reads it while its write stays blocked, and
+        // B returns the message without taking the transport.
+        input.push(peer.take_output());
+        assert!(poll_once(a_send.as_mut(), &wake_a).is_pending());
+        let Poll::Ready(Ok(Some(message))) = poll_once(b_message.as_mut(), &wake_b) else {
+            panic!("the response waiter did not complete while the write was blocked");
+        };
+        assert_eq!(message, b"reply");
+        assert!(
+            poll_once(a_send.as_mut(), &wake_a).is_pending(),
+            "the owner's write is still blocked"
+        );
+    }
+
+    /// Bytes a peer sends to answer `call` with one message.
+    fn peer_reply(
+        peer: &mut crate::grpc::http2::Connection,
+        call: CallId,
+        message: &[u8],
+    ) -> Vec<u8> {
+        use crate::grpc::http2::HeaderField;
+        let field = |name: &str, value: &str| HeaderField {
+            name: name.into(),
+            value: value.into(),
+        };
+        peer.send_headers(
+            call,
+            alloc::vec![
+                field(":status", "200"),
+                field("content-type", "application/grpc"),
+            ],
+            false,
+        )
+        .unwrap();
+        peer.send_data(call, crate::grpc::lpm::encode(message).unwrap(), false)
+            .unwrap();
+        peer.take_output()
+    }
+
+    /// A waiter that consumes its response releases the credit it occupied, and
+    /// the owner, whose write is blocked, is woken to write that credit.
+    #[test]
+    fn consuming_waiter_response_wakes_owner_for_credit() {
+        use crate::grpc::http2::{Config as H2, Connection as Peer};
+        let input = SplitIn::default();
+        let output = SplitOut::default();
+        let config = crate::grpc::ClientConfig {
+            max_message_size: 64 * 1024,
+            ..crate::grpc::ClientConfig::default()
+        };
+        let client = client_split(input.clone(), output.clone())
+            .with_config(config)
+            .without_deadlines()
+            .build();
+        let mut b = client.streaming(QUIET).unwrap();
+        run(b.send(b"hi")).unwrap();
+        let mut peer = Peer::server(H2::default());
+        peer.recv(&output.written.borrow()).unwrap();
+        // Large enough that consuming it passes the window update threshold.
+        let reply = peer_reply(&mut peer, b.id(), &[9; 40_000]);
+
+        output.stalled.set(true);
+        let (wake_a, counted_a) = Wakes::waker();
+        let (wake_b, _) = Wakes::waker();
+        let mut a = client.streaming(QUIET).unwrap();
+        let mut a_send = pin!(a.send(&[7; 2000]));
+        assert!(poll_once(a_send.as_mut(), &wake_a).is_pending());
+
+        let mut b_message = pin!(b.message());
+        assert!(poll_once(b_message.as_mut(), &wake_b).is_pending());
+        input.push(reply);
+        // The owner reads the response in as many polls as its read buffer needs,
+        // while its own write stays blocked.
+        let before = counted_a.count();
+        let mut result = None;
+        for _ in 0..1_000 {
+            assert!(poll_once(a_send.as_mut(), &wake_a).is_pending());
+            if let Poll::Ready(outcome) = poll_once(b_message.as_mut(), &wake_b) {
+                result = Some(outcome);
+                break;
+            }
+        }
+        let Some(Ok(Some(message))) = result else {
+            panic!("the waiter did not receive its response: {result:?}");
+        };
+        assert_eq!(message.len(), 40_000);
+        assert!(
+            counted_a.count() > before,
+            "consuming the response did not wake the owner for the credit it released"
+        );
+    }
+
+    /// The owner's own reply is read while its write is blocked. It stays
+    /// buffered until the write completes, and is then returned.
+    #[test]
+    fn owner_result_stays_buffered_until_safe_return() {
+        use crate::grpc::http2::{Config as H2, Connection as Peer};
+        let input = SplitIn::default();
+        let output = SplitOut::default();
+        let client = client_split(input.clone(), output.clone())
+            .without_deadlines()
+            .build();
+        let mut x = client.streaming(QUIET).unwrap();
+        run(x.send(b"hi")).unwrap();
+        let mut peer = Peer::server(H2::default());
+        peer.recv(&output.written.borrow()).unwrap();
+        input.push(peer_reply(&mut peer, x.id(), b"reply"));
+
+        output.stalled.set(true);
+        let (wake_x, _) = Wakes::waker();
+        {
+            let mut send = pin!(x.send(&[7; 2000]));
+            // The owner reads the reply while its write is blocked, and keeps it.
+            assert!(poll_once(send.as_mut(), &wake_x).is_pending());
+            assert!(poll_once(send.as_mut(), &wake_x).is_pending());
+
+            output.stalled.set(false);
+            assert!(matches!(
+                poll_once(send.as_mut(), &wake_x),
+                Poll::Ready(Ok(()))
+            ));
+        }
+        let message = run(x.message()).unwrap();
+        assert_eq!(message, Some(b"reply".to_vec()));
+    }
+
+    /// The owner's write is blocked, and a contender waits for the transport.
+    /// When the owner's write completes, it gives the transport up at that
+    /// safe point and wakes the contender, which then writes.
+    #[test]
+    fn safe_handoff_gives_contender_a_turn() {
+        let input = SplitIn::default();
+        let output = SplitOut::default();
+        let client = client_split(input.clone(), output.clone())
+            .without_deadlines()
+            .build();
+        let mut a = client.streaming(QUIET).unwrap();
+        let mut b = client.streaming(QUIET).unwrap();
+
+        output.stalled.set(true);
+        let (wake_a, _) = Wakes::waker();
+        let (wake_b, counted_b) = Wakes::waker();
+        let mut a_send = pin!(a.send(&[7; 2000]));
+        assert!(poll_once(a_send.as_mut(), &wake_a).is_pending());
+        let mut b_send = pin!(b.send(b"hi"));
+        assert!(poll_once(b_send.as_mut(), &wake_b).is_pending());
+
+        output.stalled.set(false);
+        let before = counted_b.count();
+        assert!(matches!(
+            poll_once(a_send.as_mut(), &wake_a),
+            Poll::Ready(Ok(()))
+        ));
+        assert!(
+            counted_b.count() > before,
+            "the contender was not woken at the handoff"
+        );
+        assert!(matches!(
+            poll_once(b_send.as_mut(), &wake_b),
+            Poll::Ready(Ok(()))
+        ));
+        assert!(output.written.borrow().ends_with(b"hi"));
+    }
+
+    /// A waiter cancelled while the owner's write is blocked leaves no
+    /// registration behind, so the owner's progress does not wake its waker.
+    #[test]
+    fn cancelled_registration_is_removed_during_duplex_tx() {
+        let input = SplitIn::default();
+        let output = SplitOut::default();
+        let client = client_split(input.clone(), output.clone())
+            .without_deadlines()
+            .build();
+        let mut a = client.streaming(QUIET).unwrap();
+        let mut b = client.streaming(QUIET).unwrap();
+
+        output.stalled.set(true);
+        let (wake_a, _) = Wakes::waker();
+        let (wake_b, counted_b) = Wakes::waker();
+        let mut a_send = pin!(a.send(&[7; 2000]));
+        assert!(poll_once(a_send.as_mut(), &wake_a).is_pending());
+        {
+            let mut b_message = pin!(b.message());
+            assert!(poll_once(b_message.as_mut(), &wake_b).is_pending());
+            assert_eq!(client.shared.with(|s| s.waiters.len()), 1);
+        }
+        assert_eq!(client.shared.with(|s| s.waiters.len()), 0);
+
+        output.stalled.set(false);
+        assert!(matches!(
+            poll_once(a_send.as_mut(), &wake_a),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(counted_b.count(), 0, "the cancelled waiter was woken");
+    }
+
+    /// A transport whose writes accept only the bytes the test grants, and
+    /// whose flushes stall while the test says so. Its input is fed by the test.
+    #[derive(Clone, Default)]
+    struct Gated(Rc<RefCell<GatedState>>);
+
+    #[derive(Default)]
+    struct GatedState {
+        inbound: VecDeque<Vec<u8>>,
+        reader: Option<Waker>,
+        grant: usize,
+        flushes_stalled: bool,
+        written: Vec<u8>,
+        /// Writes and flushes started.
+        writes_started: usize,
+        flushes_started: usize,
+    }
+
+    impl Gated {
+        fn feed(&self, bytes: Vec<u8>) {
+            let mut state = self.0.borrow_mut();
+            state.inbound.push_back(bytes);
+            if let Some(waker) = state.reader.take() {
+                waker.wake();
+            }
+        }
+
+        fn grant(&self, bytes: usize) {
+            self.0.borrow_mut().grant = bytes;
+        }
+    }
+
+    impl embedded_io_async::ErrorType for Gated {
+        type Error = Infallible;
+    }
+
+    impl Read for Gated {
+        async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Infallible> {
+            poll_fn(|cx| {
+                let mut state = self.0.borrow_mut();
+                match state.inbound.pop_front() {
+                    Some(chunk) => {
+                        let n = chunk.len().min(buf.len());
+                        buf[..n].copy_from_slice(&chunk[..n]);
+                        Poll::Ready(Ok(n))
+                    }
+                    None => {
+                        state.reader = Some(cx.waker().clone());
+                        Poll::Pending
+                    }
+                }
+            })
+            .await
+        }
+    }
+
+    impl Write for Gated {
+        async fn write(&mut self, buf: &[u8]) -> Result<usize, Infallible> {
+            self.0.borrow_mut().writes_started += 1;
+            poll_fn(|_| {
+                let mut state = self.0.borrow_mut();
+                if state.grant == 0 {
+                    return Poll::Pending;
+                }
+                let n = buf.len().min(state.grant);
+                state.grant -= n;
+                state.written.extend_from_slice(&buf[..n]);
+                Poll::Ready(Ok(n))
+            })
+            .await
+        }
+
+        async fn flush(&mut self) -> Result<(), Infallible> {
+            self.0.borrow_mut().flushes_started += 1;
+            poll_fn(|_| {
+                if self.0.borrow().flushes_stalled {
+                    Poll::Pending
+                } else {
+                    Poll::Ready(Ok(()))
+                }
+            })
+            .await
+        }
+    }
+
+    /// Answers every call with messages until the call is cancelled.
+    struct Endless;
+
+    impl Handler for Endless {
+        fn route(&self, _: &str) -> Option<Route> {
+            Some(Route::new(MethodKind::ServerStreaming, 0))
+        }
+
+        fn on_message(&mut self, _: &mut CallContext<'_>, _: &[u8]) -> Result<(), Status> {
+            Ok(())
+        }
+
+        fn poll_response(
+            &mut self,
+            _: &mut CallContext<'_>,
+            _: &mut Context<'_>,
+        ) -> Poll<Next<Vec<u8>>> {
+            Poll::Ready(Next::Message(alloc::vec![7; 300]))
+        }
+    }
+
+    /// The server's stream of output has been partly written, and the call that
+    /// produced it is then reset by its client. The rest of the output still has
+    /// to be delivered by the call's deadline, which must not be forgotten when
+    /// the call goes: `variant` decides whether the next operation is a write or
+    /// the flush.
+    fn reset_call_output_expires(flush_next: bool) {
+        use core::time::Duration;
+        let now = Rc::new(core::cell::Cell::new(Duration::ZERO));
+        let io = Gated::default();
+        let server = server(io.clone())
+            .with_deadline_timer(ManualTimer(now.clone()))
+            .build();
+        let mut caller = crate::grpc::Client::new(crate::grpc::ClientConfig::default());
+        let id = caller
+            .start_streaming_with(
+                "/test/Stream",
+                &crate::grpc::CallOptions::timeout(Duration::from_millis(100)),
+            )
+            .unwrap();
+        caller.send_message(id, b"request").unwrap();
+        caller.close_send(id).unwrap();
+        io.feed(caller.take_output());
+
+        let mut handler = Endless;
+        let mut serving = pin!(server.serve(&mut handler));
+        // Output is produced, and no write can complete yet.
+        assert!(poll_once(serving.as_mut(), Waker::noop()).is_pending());
+
+        now.set(Duration::from_millis(10));
+        caller.cancel(id);
+        io.feed(caller.take_output());
+        assert!(poll_once(serving.as_mut(), Waker::noop()).is_pending());
+
+        // One byte is accepted, and the output after it stays blocked.
+        now.set(Duration::from_millis(20));
+        if flush_next {
+            // Everything is accepted, and the flush that follows stalls.
+            io.0.borrow_mut().flushes_stalled = true;
+            io.grant(usize::MAX);
+        } else {
+            io.grant(1);
+        }
+        assert!(poll_once(serving.as_mut(), Waker::noop()).is_pending());
+
+        // The call's deadline has passed: the connection's output is retired.
+        now.set(Duration::from_millis(100));
+        let Poll::Ready(Err(error)) = poll_once(serving.as_mut(), Waker::noop()) else {
+            panic!("the reset call's output was not held to its deadline");
+        };
+        assert!(matches!(error, Error::OutputDeadline));
+    }
+
+    #[test]
+    fn delivery_deadline_survives_reset_and_short_write() {
+        reset_call_output_expires(false);
+    }
+
+    #[test]
+    fn delivery_deadline_survives_reset_and_completed_writes_before_flush() {
+        reset_call_output_expires(true);
+    }
+
+    /// An unflushed delivery carried into a new owner keeps its deadline, though
+    /// the call that wrote the output is no longer part of the client's state.
+    #[test]
+    fn client_delivery_deadline_survives_owner_handoff() {
+        use core::time::Duration;
+        let now = Rc::new(core::cell::Cell::new(Duration::ZERO));
+        let io = Gated::default();
+        {
+            let mut wire = io.0.borrow_mut();
+            wire.flushes_stalled = true;
+        }
+        io.grant(usize::MAX);
+        let client = client(io.clone())
+            .with_deadline_timer(ManualTimer(now.clone()))
+            .build();
+        // A previous owner left written output that is not flushed yet.
+        client.shared.with(|s| {
+            s.delivery = Delivery {
+                unflushed: true,
+                deadline: Some(Duration::from_millis(100)),
+            };
+        });
+        let mut call = client.streaming(QUIET).unwrap();
+        let mut message = pin!(call.message());
+        assert!(poll_once(message.as_mut(), Waker::noop()).is_pending());
+
+        now.set(Duration::from_millis(100));
+        let Poll::Ready(Err(status)) = poll_once(message.as_mut(), Waker::noop()) else {
+            panic!("the carried delivery deadline was disarmed");
+        };
+        assert_eq!(status.code, grpc::Code::Unavailable);
+        assert!(
+            status.message.contains("output deadline"),
+            "{}",
+            status.message
+        );
+    }
+
+    /// Output that becomes ready at the instant its deadline is due is not
+    /// progress: the expiry is processed first, and nothing is written after it.
+    #[test]
+    fn ready_tx_at_expired_deadline_cannot_disarm_retirement() {
+        use core::time::Duration;
+        let now = Rc::new(core::cell::Cell::new(Duration::ZERO));
+        let io = Gated::default();
+        let mut client = client(io.clone())
+            .with_deadline_timer(ManualTimer(now.clone()))
+            .build();
+        {
+            let mut call = client
+                .streaming_with(QUIET, CallOptions::timeout(Duration::from_millis(100)))
+                .unwrap();
+            let mut message = pin!(call.message());
+            assert!(poll_once(message.as_mut(), Waker::noop()).is_pending());
+
+            now.set(Duration::from_millis(100));
+            io.grant(usize::MAX);
+            let Poll::Ready(result) = poll_once(message.as_mut(), Waker::noop()) else {
+                panic!("the due output did not end the call");
+            };
+            assert_eq!(result.unwrap_err().code, grpc::Code::DeadlineExceeded);
+        }
+        assert!(
+            io.0.borrow().written.is_empty(),
+            "the due write was not performed"
+        );
+        let status = run(client.unary("/t.T/Echo", b"x")).unwrap_err();
+        assert_eq!(status.code, grpc::Code::Unavailable);
+        assert!(
+            status.message.contains("output deadline"),
+            "{}",
+            status.message
+        );
+    }
+
+    /// Answers a call with one `first` message, then, once released, with a
+    /// message of `second` bytes. Until then it is pending, and it wakes the
+    /// task that polled it when released.
+    struct Released {
+        released: Rc<core::cell::Cell<bool>>,
+        waker: Rc<RefCell<Option<Waker>>>,
+        first: usize,
+        second: usize,
+        answered: usize,
+        cancelled: Rc<core::cell::Cell<usize>>,
+    }
+
+    impl Handler for Released {
+        fn route(&self, _: &str) -> Option<Route> {
+            Some(Route::new(MethodKind::ServerStreaming, 0))
+        }
+
+        fn on_message(&mut self, _: &mut CallContext<'_>, _: &[u8]) -> Result<(), Status> {
+            Ok(())
+        }
+
+        fn poll_response(
+            &mut self,
+            _: &mut CallContext<'_>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Next<Vec<u8>>> {
+            self.answered += 1;
+            if self.answered == 1 {
+                return Poll::Ready(Next::Message(alloc::vec![1; self.first]));
+            }
+            if !self.released.get() {
+                *self.waker.borrow_mut() = Some(cx.waker().clone());
+                return Poll::Pending;
+            }
+            Poll::Ready(Next::Message(alloc::vec![2; self.second]))
+        }
+
+        fn on_cancel(&mut self, _: &mut CallContext<'_>) {
+            self.cancelled.set(self.cancelled.get() + 1);
+        }
+    }
+
+    /// A handler's output that does not fit, produced while the server's output
+    /// is blocked: the connection ends at once, with no further transport
+    /// operation and with the call cancelled once. `flush_blocked` says whether
+    /// the blocked operation is the flush, after the first message was written.
+    fn handler_output_limit_during_pending_tx(flush_blocked: bool) {
+        use core::time::Duration;
+        let limit = 1024;
+        let now = Rc::new(core::cell::Cell::new(Duration::ZERO));
+        let io = Gated::default();
+        let server = server(io.clone())
+            .with_deadline_timer(ManualTimer(now.clone()))
+            .with_http2(crate::grpc::http2::Config {
+                max_pending_output_bytes: limit,
+                ..Default::default()
+            })
+            .build();
+        let mut caller = crate::grpc::Client::new(crate::grpc::ClientConfig::default());
+        let id = caller.start_streaming("/test/Released").unwrap();
+        caller.send_message(id, b"request").unwrap();
+        caller.close_send(id).unwrap();
+        io.feed(caller.take_output());
+
+        let released = Rc::new(core::cell::Cell::new(false));
+        let waker = Rc::new(RefCell::new(None));
+        let cancelled = Rc::new(core::cell::Cell::new(0));
+        let mut handler = Released {
+            released: released.clone(),
+            waker: waker.clone(),
+            first: 100,
+            second: 2048,
+            answered: 0,
+            cancelled: cancelled.clone(),
+        };
+        if flush_blocked {
+            // The first message is accepted, and its flush stalls.
+            io.0.borrow_mut().flushes_stalled = true;
+            io.grant(usize::MAX);
+        }
+        // Boxed, so that dropping it ends the connection's future.
+        let mut serving = alloc::boxed::Box::pin(server.serve(&mut handler));
+        assert!(poll_once(serving.as_mut(), Waker::noop()).is_pending());
+        let (writes, flushes) = {
+            let wire = io.0.borrow();
+            (wire.writes_started, wire.flushes_started)
+        };
+
+        // The handler is released, and its output does not fit the cap.
+        released.set(true);
+        let wake = waker.borrow_mut().take().expect("the handler is pending");
+        wake.wake();
+        let Poll::Ready(result) = poll_once(serving.as_mut(), Waker::noop()) else {
+            panic!("the output limit did not end the connection while the transport was blocked");
+        };
+        assert!(matches!(
+            result,
+            Err(Error::OutputLimitExceeded { limit: l, .. }) if l == limit
+        ));
+        assert_eq!(cancelled.get(), 1, "the call was cancelled once");
+        drop(serving);
+        assert_eq!(cancelled.get(), 1, "the call is not cancelled again");
+        let wire = io.0.borrow();
+        assert_eq!(
+            (wire.writes_started, wire.flushes_started),
+            (writes, flushes)
+        );
+        let _ = id;
+    }
+
+    #[test]
+    fn handler_output_limit_ends_server_during_pending_tx() {
+        handler_output_limit_during_pending_tx(false);
+    }
+
+    #[test]
+    fn handler_output_limit_ends_server_during_pending_flush() {
+        handler_output_limit_during_pending_tx(true);
+    }
+
+    /// A call that cannot be queued ends the connection for every call: the
+    /// owner, blocked on a write, and the task waiting for the transport are both
+    /// told, and the owner retires without writing again.
+    #[test]
+    fn external_output_limit_wakes_and_retires_busy_owner() {
+        let io = Gated::default();
+        let client = client(io.clone())
+            .without_deadlines()
+            .with_http2(crate::grpc::http2::Config {
+                max_pending_output_bytes: 1024,
+                ..Default::default()
+            })
+            .build();
+        let (wake_a, a_wakes) = Wakes::waker();
+        let (wake_c, c_wakes) = Wakes::waker();
+        let mut a = client.streaming(QUIET).unwrap();
+        let mut a_message = pin!(a.message());
+        assert!(poll_once(a_message.as_mut(), &wake_a).is_pending());
+        let mut c = client.streaming(QUIET).unwrap();
+        let mut c_message = pin!(c.message());
+        assert!(poll_once(c_message.as_mut(), &wake_c).is_pending());
+        // Starting C woke the owner, which registers again when it is polled.
+        assert!(poll_once(a_message.as_mut(), &wake_a).is_pending());
+        let (a_before, c_before) = (a_wakes.count(), c_wakes.count());
+
+        // The metadata of this call does not fit the cap, so it cannot start.
+        let mut metadata = crate::grpc::Metadata::new();
+        metadata.insert("x-big", &"a".repeat(2000)).unwrap();
+        let Err(status) = client.streaming_with(
+            QUIET,
+            crate::grpc::CallOptions::default().with_metadata(metadata),
+        ) else {
+            panic!("the call started with a header block over the cap");
+        };
+        assert_eq!(status.code, grpc::Code::Unavailable);
+        assert!(
+            status.message.contains("output limit"),
+            "{}",
+            status.message
+        );
+        assert!(a_wakes.count() > a_before, "the owner is woken to retire");
+        assert!(c_wakes.count() > c_before, "the waiting call is notified");
+
+        // The owner retires without its blocked write completing, and the waiter
+        // observes the same failure.
+        let Poll::Ready(Err(status)) = poll_once(a_message.as_mut(), &wake_a) else {
+            panic!("the owner did not retire while its write was blocked");
+        };
+        assert_eq!(status.code, grpc::Code::Unavailable);
+        let Poll::Ready(Err(status)) = poll_once(c_message.as_mut(), &wake_c) else {
+            panic!("the waiting call did not observe the failure");
+        };
+        assert_eq!(status.code, grpc::Code::Unavailable);
+        assert!(
+            io.0.borrow().written.is_empty(),
+            "nothing was written after the failure"
+        );
+    }
+
+    /// A terminal owner leaves its wait loop even while its write is still
+    /// pending, and without being woken: the state it waits on is already final.
+    #[test]
+    fn terminal_owner_readiness_does_not_depend_on_tx_completion() {
+        let io = Gated::default();
+        let client = client(io.clone()).without_deadlines().build();
+        let (wake, _) = Wakes::waker();
+        let mut a = client.streaming(QUIET).unwrap();
+        let mut a_message = pin!(a.message());
+        assert!(poll_once(a_message.as_mut(), &wake).is_pending());
+
+        // Retired by something other than this owner, with no notification.
+        client
+            .shared
+            .with(|s| retire(s, Status::unavailable("external failure")));
+        let Poll::Ready(Err(status)) = poll_once(a_message.as_mut(), &wake) else {
+            panic!("a terminal owner waited on its pending write");
+        };
+        assert_eq!(status.code, grpc::Code::Unavailable);
+        assert!(io.0.borrow().written.is_empty());
+    }
+
+    /// The reset written when a call expires is blocked, but the expiry ends the
+    /// waiting call at once: its task is notified, and it returns its deadline
+    /// status without the transport being released.
+    #[test]
+    fn deadline_tick_notifies_waiter_while_reset_write_is_blocked() {
+        use core::time::Duration;
+        let now = Rc::new(core::cell::Cell::new(Duration::ZERO));
+        let io = Gated::default();
+        // The first output is written, so the owner is idle with a pending read.
+        io.grant(usize::MAX);
+        let client = client(io.clone())
+            .with_deadline_timer(ManualTimer(now.clone()))
+            .build();
+        let (wake_a, _) = Wakes::waker();
+        let (wake_b, b_wakes) = Wakes::waker();
+        let mut a = client.streaming(QUIET).unwrap();
+        let mut b = client
+            .streaming_with(QUIET, CallOptions::timeout(Duration::from_millis(100)))
+            .unwrap();
+        let mut a_message = pin!(a.message());
+        assert!(poll_once(a_message.as_mut(), &wake_a).is_pending());
+        let mut b_message = pin!(b.message());
+        assert!(poll_once(b_message.as_mut(), &wake_b).is_pending());
+
+        // From now on writes stall, so the reset written at expiry is blocked.
+        io.grant(0);
+        let written = io.0.borrow().written.len();
+        now.set(Duration::from_millis(100));
+        assert!(poll_once(a_message.as_mut(), &wake_a).is_pending());
+        assert!(b_wakes.count() >= 1, "the expired call's task is notified");
+        let Poll::Ready(Err(status)) = poll_once(b_message.as_mut(), &wake_b) else {
+            panic!("the expired call did not finish");
+        };
+        assert_eq!(status.code, grpc::Code::DeadlineExceeded);
+        assert_eq!(
+            io.0.borrow().written.len(),
+            written,
+            "the transport was not released"
+        );
+    }
+
+    /// A clock reading that changes nothing notifies nobody: waiters keep their
+    /// wait, and the owner is not woken.
+    #[test]
+    fn unchanged_tick_does_not_wake_waiters() {
+        use core::time::Duration;
+        let now = Rc::new(core::cell::Cell::new(Duration::ZERO));
+        let io = Gated::default();
+        io.grant(usize::MAX);
+        let client = client(io.clone())
+            .with_deadline_timer(ManualTimer(now.clone()))
+            .build();
+        let (wake_a, a_wakes) = Wakes::waker();
+        let (wake_b, b_wakes) = Wakes::waker();
+        let mut a = client
+            .streaming_with(QUIET, CallOptions::timeout(Duration::from_millis(100)))
+            .unwrap();
+        let mut b = client.streaming(QUIET).unwrap();
+        let mut a_message = pin!(a.message());
+        assert!(poll_once(a_message.as_mut(), &wake_a).is_pending());
+        let mut b_message = pin!(b.message());
+        assert!(poll_once(b_message.as_mut(), &wake_b).is_pending());
+        let (a_before, b_before) = (a_wakes.count(), b_wakes.count());
+
+        for step in [10, 20, 30] {
+            now.set(Duration::from_millis(step));
+            assert!(poll_once(a_message.as_mut(), &wake_a).is_pending());
+            assert!(poll_once(b_message.as_mut(), &wake_b).is_pending());
+        }
+        assert_eq!(
+            b_wakes.count(),
+            b_before,
+            "a waiter was woken by an unchanged tick"
+        );
+        assert_eq!(
+            a_wakes.count(),
+            a_before,
+            "the owner was woken by an unchanged tick"
+        );
     }
 }

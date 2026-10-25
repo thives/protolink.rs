@@ -42,6 +42,9 @@ The same words are used everywhere:
 |---|---|---|---|
 | `protolink::server(io)` | `with_deadline_timer`, `without_deadlines`, `with_max_message_size`, `with_compression`, `with_config`, ... | `Server` | `serve(&mut services).await` |
 | `protolink::client(io)` | `with_deadline_timer`, `without_deadlines`, `with_default_timeout`, ... | `Client` (a transport for generated clients) | its calls |
+| `protolink::client_split(reader, writer)`, `protolink::server_split(reader, writer)` | as above | `Client`, `Server` on separate halves | as above |
+| `protolink::client_reliable(link)`, `protolink::server_reliable(link)` | as above | `Client`, `Server` on one coordinated link | as above |
+| `protolink::link::cobs_split(reader, writer)` | — | `(CobsReader, CobsWriter)`, the halves of a COBS stream | passed to `client_split` or `server_split` |
 | `protolink::tokio::{server, client}(stream)` | as above; the deadline timer is already chosen | `Server`, `Client` | as above |
 | `protolink::blocking::{server, client}(io)` | `with_deadline_clock`, `without_deadlines`, `with_output_timeouts`, `with_wakeable_reads` (server) | `blocking::Server`, `blocking::Client` | `serve(&mut services)` |
 | `protolink::link::reliable(raw)` | `with_retransmission_timer` | `ReliableLink` | used as the driver's byte stream |
@@ -251,7 +254,9 @@ async fn embedded_server<IO: Read + Write, T: protolink::Timer>(
     server.serve(&mut ServiceDispatch::new(device)).await
 }
 
-fn embedded_client<IO: Read + Write>(io: IO) -> ServiceClient<protolink::Client<IO>> {
+fn embedded_client<IO: Read + Write>(
+    io: IO,
+) -> ServiceClient<protolink::Client<protolink::Serial<IO>>> {
     // `grpc-timeout` is still sent; the server enforces it.
     ServiceClient::new(protolink::client(io).without_deadlines().build())
 }
@@ -371,6 +376,102 @@ where
     }
 }
 ```
+
+## Transport modes: raw, split COBS and coordinated reliable
+
+Three assemblies serve the same generated services. Each is shown on its own; the
+client side is the same with `protolink::client_split`, `client_reliable` or `client`.
+Every one needs a deadline policy, and each example takes `without_deadlines()`
+to keep the snippet short. Use `with_deadline_timer` in real code.
+
+Raw, split halves: any stream the application can split into a reader and a writer, such
+as the two halves of a UART or I²C port (see [UART.md](UART.md)). Each half is driven by its
+own future, so the server reads requests while its replies are blocked.
+
+```rust,no_run
+use embedded_device_example::{Device, ServiceDispatch};
+use embedded_io_async::{Read, Write};
+
+async fn device_over_split_halves<R, W>(reader: R, writer: W, device: &mut Device)
+where
+    R: Read,
+    W: Write<Error = R::Error>,
+{
+    let mut services = ServiceDispatch::new(device);
+    let _ = protolink::server_split(reader, writer)
+        .without_deadlines()
+        .build()
+        .serve(&mut services)
+        .await;
+}
+```
+
+Split COBS: the same halves framed with COBS, one zero-delimited frame per write. The
+halves share no state, so a read can wait while a write is in progress on the other half.
+Use it when the link does not need retransmission but the byte stream may carry noise:
+corrupt frames are dropped, and the next delimiter resynchronises the stream.
+
+```rust,no_run
+use embedded_device_example::{Device, ServiceDispatch};
+use embedded_io_async::{Read, Write};
+
+async fn device_over_split_cobs<R, W>(reader: R, writer: W, device: &mut Device)
+where
+    R: Read,
+    W: Write<Error = R::Error>,
+{
+    let (reader, writer) = protolink::link::cobs_split(reader, writer);
+    let mut services = ServiceDispatch::new(device);
+    let _ = protolink::server_split(reader, writer)
+        .without_deadlines()
+        .build()
+        .serve(&mut services)
+        .await;
+}
+```
+
+Coordinated reliable: ARQ over COBS over a raw stream. It retransmits lost frames, so it
+needs a retransmission timer. One engine owns both directions, so the link is not split.
+
+```rust,no_run
+use embedded_device_example::{Device, ServiceDispatch};
+use embedded_io_async::{Read, Write};
+use protolink::link::Timer;
+
+async fn device_over_reliable<S, T>(raw: S, arq_timer: T, device: &mut Device)
+where
+    S: Read + Write,
+    T: Timer,
+{
+    let link = protolink::link::reliable(raw)
+        .with_retransmission_timer(arq_timer)
+        .build();
+    let mut services = ServiceDispatch::new(device);
+    let _ = protolink::server_reliable(link)
+        .without_deadlines()
+        .build()
+        .serve(&mut services)
+        .await;
+}
+```
+
+Restrictions:
+
+- **Serial mode is not duplex.** `protolink::client(io)`, `protolink::server(io)` and
+  `protolink::tokio::{client_serial, server_serial}` read only when they are not writing. On a
+  transport that buffers less than the data in flight, a call that sends many requests before
+  reading can block both peers. Use the split or duplex factories for that traffic, or interleave
+  `send` and `message`, as the streaming documentation describes.
+- **Blocking factories keep their limits.** `protolink::blocking::{server, client}` are not
+  duplex, and a blocking read cannot be interrupted. See [STREAMING_GAP.md](STREAMING_GAP.md).
+- **Error types are the same as the unsplit factories.** A split or reliable endpoint fails with
+  `protolink::Error<E>` for its transport error `E`, and a reliable link reports its ARQ failure
+  inside `ReliableError`. A link that ends because its peer hung up is reported as a closed link.
+  An output deadline or an overload is never a clean end.
+- **No background client progress.** A client has no task of its own. It reads and writes only
+  while one of its calls is polled, and a response that arrives while no call is polled waits
+  in the transport. Keep a call polled, for example by running the server and the application in
+  one `select`, when nothing else drives the connection.
 
 ## Ownership and cancellation
 

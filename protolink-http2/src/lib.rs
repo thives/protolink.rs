@@ -74,6 +74,27 @@ const MAX_WINDOW: i64 = 0x7fff_ffff;
 const DEFAULT_MAX_FRAME_SIZE: u32 = 16_384;
 /// Initial flow-control window defined by RFC 9113 §6.9.2.
 const DEFAULT_WINDOW: i64 = 65_535;
+/// Upper bound on the bytes one header field adds to an HPACK block without
+/// Huffman coding (which the encoder never uses): one representation byte plus
+/// two length integers of at most six bytes each, so 13 bytes, rounded up.
+const HPACK_FIELD_OVERHEAD: usize = 16;
+/// Dynamic table size update that opens every header block.
+const HPACK_TABLE_UPDATE_LEN: usize = 1;
+/// Default for [`Config::max_pending_output_bytes`].
+///
+/// Measured with the default gRPC configurations while the transport does not
+/// drain (the sizing regressions of `protolink-grpc`): eight streaming calls,
+/// the most a default server admits at once, each sending a 4 KiB message hold
+/// about 34 KiB; with 8 KiB of request metadata per call, about 99 KiB. A
+/// server-streaming response stream holds about 4.3 KiB, since its flow gate
+/// admits a message only while less than one maximum-size wire message is
+/// pending. The handshake is under 100 bytes. The margin above the worst case is
+/// for control frames answering a peer that keeps sending.
+///
+/// A single burst is bounded by the peer's flow-control windows rather than by
+/// `max_message_size`. Larger messages, larger windows or metadata-heavy calls
+/// must raise this limit through [`Config::max_pending_output_bytes`].
+pub const DEFAULT_MAX_PENDING_OUTPUT_BYTES: usize = 256 * 1024;
 
 /// Which side of the connection this endpoint is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,6 +146,20 @@ pub struct Config {
     pub connection_window_size: u32,
     /// Receive-side flow-control mode.
     pub flow_control: FlowControl,
+    /// Largest number of serialized bytes that may wait in
+    /// [`pending_output`](Connection::pending_output) for the transport. It
+    /// covers whole frames, including the connection preface.
+    ///
+    /// Frames are only appended when they fit entirely. Exceeding the limit
+    /// fails the connection with [`Error::OutputLimitExceeded`], which is
+    /// terminal: the serialized prefix is kept for delivery, but nothing more is
+    /// serialized and the connection must be retired. A peer that keeps sending
+    /// PING, SETTINGS or credit-releasing input while the transport is blocked
+    /// reaches this limit rather than growing the buffer.
+    ///
+    /// The default is [`DEFAULT_MAX_PENDING_OUTPUT_BYTES`]. A connection whose
+    /// handshake does not fit fails at construction with empty output.
+    pub max_pending_output_bytes: usize,
 }
 
 impl Default for Config {
@@ -135,6 +170,7 @@ impl Default for Config {
             max_header_list_size: 8 * 1024,
             connection_window_size: 65_535,
             flow_control: FlowControl::Automatic,
+            max_pending_output_bytes: DEFAULT_MAX_PENDING_OUTPUT_BYTES,
         }
     }
 }
@@ -201,6 +237,17 @@ pub enum Error {
     StreamIdExhausted,
     /// Invalid outbound HTTP message ordering or field section.
     InvalidHeaders(&'static str),
+    /// Serializing the next frame would exceed
+    /// [`Config::max_pending_output_bytes`]. Terminal, not a protocol violation
+    /// by the peer: the connection stops serializing and must be retired.
+    OutputLimitExceeded {
+        /// The configured limit.
+        limit: usize,
+        /// Bytes already waiting in the output when the frame was refused.
+        pending: usize,
+        /// Bytes of the refused frame, or of the whole batch at construction.
+        attempted: usize,
+    },
 }
 
 impl fmt::Display for Error {
@@ -214,6 +261,15 @@ impl fmt::Display for Error {
             Self::StreamLimit => f.write_str("peer concurrent stream limit reached"),
             Self::StreamIdExhausted => f.write_str("stream IDs exhausted"),
             Self::InvalidHeaders(reason) => write!(f, "invalid HTTP message: {reason}"),
+            Self::OutputLimitExceeded {
+                limit,
+                pending,
+                attempted,
+            } => write!(
+                f,
+                "pending output limit of {limit} bytes exceeded \
+                 ({pending} pending, {attempted} more needed)"
+            ),
         }
     }
 }
@@ -449,6 +505,42 @@ impl Connection {
         // table, which keeps us correct whatever SETTINGS_HEADER_TABLE_SIZE the
         // peer advertises.
         let encoder = Encoder::with_max_size(0);
+        let mut settings = alloc::vec![
+            Setting {
+                id: SettingId::MaxConcurrentStreams,
+                value: config.max_concurrent_streams,
+            },
+            Setting {
+                id: SettingId::InitialWindowSize,
+                value: config.initial_window_size,
+            },
+            Setting {
+                id: SettingId::MaxHeaderListSize,
+                value: config.max_header_list_size,
+            },
+        ];
+        if role == Role::Client {
+            settings.push(Setting {
+                id: SettingId::EnablePush,
+                value: 0,
+            });
+        }
+        let conn_window = i64::from(config.connection_window_size).min(MAX_WINDOW);
+        let window_update = (conn_window > DEFAULT_WINDOW).then(|| {
+            let inc = (conn_window - DEFAULT_WINDOW) as u32;
+            (inc, FRAME_HEADER_LEN + 4)
+        });
+        // The handshake is written as one batch, so it either fits entirely or
+        // the connection fails before writing anything.
+        let preface = if role == Role::Client {
+            CLIENT_PREFACE.len()
+        } else {
+            0
+        };
+        let handshake = preface
+            .saturating_add(FRAME_HEADER_LEN)
+            .saturating_add(settings.len() * 6)
+            .saturating_add(window_update.map_or(0, |(_, len)| len));
         let mut conn = Self {
             role,
             config,
@@ -475,33 +567,19 @@ impl Connection {
             goaway_received: false,
             failed: None,
         };
+        if handshake > config.max_pending_output_bytes {
+            conn.failed = Some(Error::OutputLimitExceeded {
+                limit: config.max_pending_output_bytes,
+                pending: 0,
+                attempted: handshake,
+            });
+            return conn;
+        }
         if role == Role::Client {
             conn.output.extend_from_slice(CLIENT_PREFACE);
         }
-        let mut settings = alloc::vec![
-            Setting {
-                id: SettingId::MaxConcurrentStreams,
-                value: config.max_concurrent_streams,
-            },
-            Setting {
-                id: SettingId::InitialWindowSize,
-                value: config.initial_window_size,
-            },
-            Setting {
-                id: SettingId::MaxHeaderListSize,
-                value: config.max_header_list_size,
-            },
-        ];
-        if role == Role::Client {
-            settings.push(Setting {
-                id: SettingId::EnablePush,
-                value: 0,
-            });
-        }
         conn.write_frame(FrameType::Settings, 0, 0, &encode_settings(&settings));
-        let conn_window = i64::from(config.connection_window_size).min(MAX_WINDOW);
-        if conn_window > DEFAULT_WINDOW {
-            let inc = (conn_window - DEFAULT_WINDOW) as u32;
+        if let Some((inc, _)) = window_update {
             conn.write_frame(FrameType::WindowUpdate, 0, 0, &encode_window_update(inc));
             conn.conn_recv_window = conn_window;
         }
@@ -610,10 +688,19 @@ impl Connection {
                 result = Err(e);
                 break;
             }
+            // A reply that did not fit latched the output limit: nothing else
+            // is processed, since its consequences could not be written.
+            if let Some(e) = &self.failed {
+                result = Err(e.clone());
+                break;
+            }
         }
         input.drain(..pos);
         if result.is_ok() {
             self.flush_streams();
+            if let Some(e) = &self.failed {
+                result = Err(e.clone());
+            }
         }
         result
     }
@@ -1065,7 +1152,7 @@ impl Connection {
         self.next_local_id += 2;
         self.streams.insert(id, stream);
         self.flush_stream(id);
-        Ok(id)
+        self.check_failed().map(|()| id)
     }
 
     /// Queue a header block (response headers or trailers) on a stream.
@@ -1075,10 +1162,11 @@ impl Connection {
         headers: Vec<HeaderField>,
         end_stream: bool,
     ) -> Result<(), Error> {
+        self.check_failed()?;
         let stream = self.streams.get_mut(&id).ok_or(Error::UnknownStream(id))?;
         stream.queue_headers(id, headers, self.role == Role::Client, end_stream)?;
         self.flush_stream(id);
-        Ok(())
+        self.check_failed()
     }
 
     /// Queue body bytes on a stream. Data beyond the peer's flow-control
@@ -1093,6 +1181,7 @@ impl Connection {
         data: Vec<u8>,
         end_stream: bool,
     ) -> Result<(), Error> {
+        self.check_failed()?;
         let stream = self.streams.get_mut(&id).ok_or(Error::UnknownStream(id))?;
         if !stream.can_send() {
             return Err(Error::StreamClosed(id));
@@ -1115,7 +1204,7 @@ impl Connection {
             end_stream,
         });
         self.flush_stream(id);
-        Ok(())
+        self.check_failed()
     }
 
     /// Abort a stream with RST_STREAM. Queued outbound data is discarded.
@@ -1126,8 +1215,12 @@ impl Connection {
         if !self.streams.contains_key(&id) {
             return Err(Error::UnknownStream(id));
         }
+        // Forgetting the stream is cleanup, and is done even on a failed
+        // connection. Only a failure that this reset latches is reported: a
+        // connection that already failed reported it when it failed.
+        let healthy = self.failed.is_none();
         self.reset(id, code);
-        Ok(())
+        if healthy { self.check_failed() } else { Ok(()) }
     }
 
     /// Send RST_STREAM once everything already queued on the stream (DATA and
@@ -1141,10 +1234,11 @@ impl Connection {
     /// [`Event::Reset`] is emitted when the reset is finally sent; call
     /// [`reset_stream`](Self::reset_stream) to abort immediately instead.
     pub fn reset_stream_after_flush(&mut self, id: StreamId, code: ErrorCode) -> Result<(), Error> {
+        self.check_failed()?;
         let stream = self.streams.get_mut(&id).ok_or(Error::UnknownStream(id))?;
         stream.reset_after_flush = Some(code);
         self.flush_stream(id);
-        Ok(())
+        self.check_failed()
     }
 
     /// Body bytes queued on the stream that have not been written to
@@ -1257,13 +1351,63 @@ impl Connection {
         self.write_frame(FrameType::GoAway, 0, 0, &payload);
     }
 
+    /// Latch a fatal protocol error, sending a best-effort GOAWAY. The first
+    /// failure is sticky: a later call returns it unchanged. If the GOAWAY does
+    /// not fit, the output limit is the failure that is latched and returned,
+    /// never a protocol error that would hide it.
     fn fail(&mut self, code: ErrorCode, reason: &'static str) -> Error {
-        let err = Error::Connection { code, reason };
-        if self.failed.is_none() {
-            self.send_goaway(code);
-            self.failed = Some(err.clone());
+        if let Some(e) = &self.failed {
+            return e.clone();
         }
+        self.send_goaway(code);
+        if let Some(e) = &self.failed {
+            return e.clone();
+        }
+        let err = Error::Connection { code, reason };
+        self.failed = Some(err.clone());
         err
+    }
+
+    /// Bytes that may still be appended to the output: none once the
+    /// connection has failed.
+    fn output_room(&self) -> usize {
+        if self.failed.is_some() {
+            return 0;
+        }
+        self.config
+            .max_pending_output_bytes
+            .saturating_sub(self.output.len())
+    }
+
+    /// Whether `len` bytes may be appended to the output now.
+    fn admits(&self, len: usize) -> bool {
+        len <= self.output_room()
+    }
+
+    /// Latch the output limit for a refused append of `attempted` bytes. A
+    /// failure that is already latched stays as it is.
+    fn refuse_output(&mut self, attempted: usize) {
+        if self.failed.is_none() {
+            self.failed = Some(Error::OutputLimitExceeded {
+                limit: self.config.max_pending_output_bytes,
+                pending: self.output.len(),
+                attempted,
+            });
+        }
+    }
+
+    /// The terminal failure of this connection, if it has one: a protocol
+    /// error, or an [`Error::OutputLimitExceeded`]. It is sticky, and draining
+    /// [`pending_output`](Self::pending_output) does not clear it. A connection
+    /// with a failure must be retired after its output is delivered.
+    pub fn failure(&self) -> Option<&Error> {
+        self.failed.as_ref()
+    }
+
+    /// The sticky failure as an error, for operations that refuse to queue
+    /// anything more on a failed connection.
+    fn check_failed(&self) -> Result<(), Error> {
+        self.failed.as_ref().map_or(Ok(()), |e| Err(e.clone()))
     }
 
     fn reset(&mut self, id: StreamId, code: ErrorCode) {
@@ -1391,6 +1535,12 @@ impl Connection {
     fn flush_stream(&mut self, id: StreamId) {
         let max_frame = self.peer.max_frame_size as usize;
         loop {
+            // Nothing more is serialized once the connection has failed, and a
+            // frame that does not fit ends the stream's output for good.
+            if self.failed.is_some() {
+                return;
+            }
+            let room = self.output_room();
             let Some(stream) = self.streams.get_mut(&id) else {
                 return;
             };
@@ -1400,6 +1550,18 @@ impl Connection {
             match front {
                 Outbound::Headers { fields, end_stream } => {
                     let end_stream = *end_stream;
+                    // Budget the whole block before encoding it, so that it is
+                    // either written completely or not at all.
+                    let update = if self.encoder_update_pending {
+                        HPACK_TABLE_UPDATE_LEN
+                    } else {
+                        0
+                    };
+                    let bound = header_block_bound(fields, update, max_frame);
+                    if bound > room {
+                        self.refuse_output(bound);
+                        return;
+                    }
                     let fields = core::mem::take(fields);
                     stream.outbound.pop_front();
                     let mut block = self.encoder.encode(&fields);
@@ -1434,6 +1596,12 @@ impl Connection {
                     if n == 0 && remaining > 0 {
                         break;
                     }
+                    // Admission comes before the copy and before any state
+                    // changes, so a refused frame leaves the stream untouched.
+                    if FRAME_HEADER_LEN + n > room {
+                        self.refuse_output(FRAME_HEADER_LEN + n);
+                        return;
+                    }
                     let chunk = buf[*offset..*offset + n].to_vec();
                     *offset += n;
                     let done = *offset == buf.len();
@@ -1462,13 +1630,21 @@ impl Connection {
         self.cleanup(id);
     }
 
+    /// Serialize one frame at the end of the output. The frame is appended
+    /// only if it fits entirely under the output limit; otherwise the limit is
+    /// latched and nothing is written. Returns whether the frame was written.
     fn write_frame(
         &mut self,
         frame_type: FrameType,
         flags: u8,
         stream_id: StreamId,
         payload: &[u8],
-    ) {
+    ) -> bool {
+        let len = FRAME_HEADER_LEN + payload.len();
+        if !self.admits(len) {
+            self.refuse_output(len);
+            return false;
+        }
         let header = FrameHeader {
             length: payload.len() as u32,
             frame_type,
@@ -1476,12 +1652,12 @@ impl Connection {
             stream_id,
         };
         let start = self.output.len();
-        self.output
-            .resize(start + FRAME_HEADER_LEN + payload.len(), 0);
+        self.output.resize(start + len, 0);
         // Payload sizes are bounded by the peer's max frame size by construction.
         let written =
             encode_frame(&header, payload, &mut self.output[start..], u32::MAX).unwrap_or(0);
         self.output.truncate(start + written);
+        written == len
     }
 
     fn encoded_header_limit(&self) -> usize {
@@ -1493,6 +1669,20 @@ impl Connection {
     fn local_max_frame_size(&self) -> u32 {
         DEFAULT_MAX_FRAME_SIZE
     }
+}
+
+/// Upper bound on the bytes a header block takes on the wire, once encoded
+/// without Huffman coding (see [`HPACK_FIELD_OVERHEAD`]), with `update` extra
+/// bytes for a table size update, and split into frames of `max_frame` bytes
+/// as [`Connection::flush_stream`] splits it.
+fn header_block_bound(fields: &[HeaderField], update: usize, max_frame: usize) -> usize {
+    let block = fields.iter().fold(update, |sum, field| {
+        sum.saturating_add(field.name.len())
+            .saturating_add(field.value.len())
+            .saturating_add(HPACK_FIELD_OVERHEAD)
+    });
+    let frames = block.div_ceil(max_frame.max(1)).max(1);
+    block.saturating_add(frames.saturating_mul(FRAME_HEADER_LEN))
 }
 
 fn strip_padding(flags: Flags, payload: &[u8]) -> Option<&[u8]> {

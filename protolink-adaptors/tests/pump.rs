@@ -811,3 +811,257 @@ async fn without_the_pump_arq_aborts_dma_transfers() {
     assert!(stats.aborted_writes.load(SeqCst) > 0);
     assert!(stats.lost_bytes.load(SeqCst) > 0);
 }
+
+// --- Split halves -------------------------------------------------------------
+
+/// A transmit half whose flush is held until the gate opens. Writes complete at
+/// once, so the only thing that stays pending is the HAL flush.
+#[derive(Clone, Default)]
+struct Gate(Arc<Mutex<(bool, Option<Waker>)>>);
+
+impl Gate {
+    fn open(&self) {
+        let waker = {
+            let mut g = self.0.lock().unwrap();
+            g.0 = true;
+            g.1.take()
+        };
+        if let Some(w) = waker {
+            w.wake();
+        }
+    }
+
+    async fn wait(&self) {
+        let gate = self.clone();
+        poll_fn(move |cx| {
+            let mut g = gate.0.lock().unwrap();
+            if g.0 {
+                Poll::Ready(())
+            } else {
+                g.1 = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        })
+        .await
+    }
+}
+
+struct HeldFlushTx {
+    wire: Wire,
+    gate: Gate,
+}
+
+impl ErrorType for HeldFlushTx {
+    type Error = Infallible;
+}
+
+impl Write for HeldFlushTx {
+    async fn write(&mut self, buf: &[u8]) -> Result<usize, Infallible> {
+        self.wire.push(buf);
+        Ok(buf.len())
+    }
+
+    async fn flush(&mut self) -> Result<(), Infallible> {
+        self.gate.wait().await;
+        Ok(())
+    }
+}
+
+/// Drive `pumps` alongside `fut` until `fut` completes. The pumps only end with
+/// a HAL failure, which the mocks here never produce.
+async fn alongside<F: Future>(pumps: impl Future<Output = Infallible>, fut: F) -> F::Output {
+    tokio::select! {
+        biased;
+        out = fut => out,
+        never = pumps => match never {},
+    }
+}
+
+#[tokio::test]
+async fn split_after_write_preserves_accepted_flush_target() {
+    let rx_wire = Wire::default();
+    let tx_wire = Wire::default();
+    let stats = Arc::new(Stats::default());
+    let (rx, tx) = dma(&rx_wire, &tx_wire, &stats);
+    let mut state = DefaultPumpState::new();
+    let (mut handle, mut rx_pump, mut tx_pump) = state.split(rx, tx);
+
+    // Before the split: 100 bytes accepted and flushed, so the flushed count
+    // is 100.
+    handle.write_all(&payload(100)).await.unwrap();
+    let pumps = async { run(&mut rx_pump, &mut tx_pump).await.unwrap() };
+    with_timeout(alongside(pumps, async { handle.flush().await.unwrap() })).await;
+
+    let (_reader, mut writer) = handle.into_split();
+    // After the split: 100 more. A count restarted at zero would equal the
+    // flushed count, and the flush would return with these bytes unwritten.
+    writer.write_all(&payload(100)).await.unwrap();
+    let pumps = async { run(&mut rx_pump, &mut tx_pump).await.unwrap() };
+    with_timeout(alongside(pumps, async { writer.flush().await.unwrap() })).await;
+
+    let mut expected = payload(100);
+    expected.extend(payload(100));
+    assert_eq!(
+        tx_wire.contents(),
+        expected,
+        "every accepted byte is written"
+    );
+    assert_eq!(stats.flushes.load(SeqCst), 2);
+}
+
+#[tokio::test]
+async fn split_reader_progresses_while_hal_flush_is_pending() {
+    let rx_wire = Wire::default();
+    rx_wire.push(&[1, 2, 3]);
+    let tx_wire = Wire::default();
+    let gate = Gate::default();
+    let (rx, _) = dma(&rx_wire, &tx_wire, &Arc::new(Stats::default()));
+    let tx = HeldFlushTx {
+        wire: tx_wire.clone(),
+        gate: gate.clone(),
+    };
+    let mut state = DefaultPumpState::new();
+    let (handle, mut rx_pump, mut tx_pump) = state.split(rx, tx);
+    let (mut reader, mut writer) = handle.into_split();
+
+    let pumps = async { run(&mut rx_pump, &mut tx_pump).await.unwrap() };
+    let got = with_timeout(alongside(pumps, async {
+        writer.write_all(&payload(10)).await.unwrap();
+        let flush = async { writer.flush().await.unwrap() };
+        let read = async {
+            let mut buf = [0u8; 8];
+            let n = reader.read(&mut buf).await.unwrap();
+            // The gate opens only after the read, so the read cannot be waiting
+            // for the flush. If it were, this would time out.
+            gate.open();
+            buf[..n].to_vec()
+        };
+        tokio::join!(flush, read).1
+    }))
+    .await;
+    assert_eq!(got, vec![1, 2, 3]);
+}
+
+#[tokio::test]
+async fn runner_drop_wakes_split_reader_and_writer() {
+    let mut state = DefaultPumpState::new();
+    let (handle, rx_pump, tx_pump) = state.split(IdleRx, IdleTx);
+    let (mut reader, mut writer) = handle.into_split();
+    writer.write_all(&payload(8)).await.unwrap();
+
+    // The read waits for data that never comes, and the flush waits for a HAL
+    // that never flushes. Dropping the runners must fail both, not hang them.
+    let read = async {
+        let mut buf = [0u8; 4];
+        reader.read(&mut buf).await
+    };
+    let flush = async { writer.flush().await };
+    let drop_runners = async move {
+        yield_once().await;
+        drop(rx_pump);
+        drop(tx_pump);
+    };
+    let (read, flush, ()) = with_timeout(async { tokio::join!(read, flush, drop_runners) }).await;
+    assert_eq!(read.unwrap_err(), PumpError::new(ErrorKind::BrokenPipe));
+    assert_eq!(flush.unwrap_err(), PumpError::new(ErrorKind::BrokenPipe));
+}
+
+/// Yield once, so the futures that are already waiting get polled first.
+async fn yield_once() {
+    let mut yielded = false;
+    poll_fn(|cx| {
+        if yielded {
+            Poll::Ready(())
+        } else {
+            yielded = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    })
+    .await
+}
+
+/// A transmit half that accepts every write and never finishes a flush.
+struct IdleTx;
+
+impl ErrorType for IdleTx {
+    type Error = Infallible;
+}
+
+impl Write for IdleTx {
+    async fn write(&mut self, buf: &[u8]) -> Result<usize, Infallible> {
+        Ok(buf.len())
+    }
+
+    async fn flush(&mut self) -> Result<(), Infallible> {
+        core::future::pending().await
+    }
+}
+
+/// 64 KiB each way: far more than the link's receive storage, so the transfer
+/// only completes if acknowledgements and the window keep moving. Each
+/// direction is drained while the other side is still writing, and no DMA
+/// transfer may be aborted or lose bytes, so ARQ never recovers from damage.
+#[tokio::test]
+async fn reliable_uart_duplex_exceeds_engine_receive_storage() {
+    with_timeout(async {
+        let ab = Wire::default();
+        let ba = Wire::default();
+        let stats = Arc::new(Stats::default());
+        let mut sa = DefaultPumpState::new();
+        let mut sb = DefaultPumpState::new();
+        let (ra, ta) = dma(&ba, &ab, &stats);
+        let (rb, tb) = dma(&ab, &ba, &stats);
+        let (ha, mut rxa, mut txa) = sa.split(ra, ta);
+        let (hb, mut rxb, mut txb) = sb.split(rb, tb);
+        let mut a = reliable(ha)
+            .with_retransmission_timer(StdTimer::new())
+            .build();
+        let mut b = reliable(hb)
+            .with_retransmission_timer(StdTimer::new())
+            .build();
+
+        let forward = payload(64 * 1024);
+        let backward: Vec<u8> = payload(64 * 1024).into_iter().rev().collect();
+
+        let app = async {
+            let ((), got) = tokio::join!(
+                async {
+                    a.write_all(&forward).await.unwrap();
+                    a.flush().await.unwrap();
+                },
+                async {
+                    let mut got = vec![0u8; forward.len()];
+                    b.read_exact(&mut got).await.unwrap();
+                    got
+                },
+            );
+            assert!(got == forward, "a -> b: the bytes differ");
+
+            let ((), got) = tokio::join!(
+                async {
+                    b.write_all(&backward).await.unwrap();
+                    b.flush().await.unwrap();
+                },
+                async {
+                    let mut got = vec![0u8; backward.len()];
+                    a.read_exact(&mut got).await.unwrap();
+                    got
+                },
+            );
+            assert!(got == backward, "b -> a: the bytes differ");
+        };
+        tokio::select! {
+            r = run(&mut rxa, &mut txa) => panic!("pump a ended: {r:?}"),
+            r = run(&mut rxb, &mut txb) => panic!("pump b ended: {r:?}"),
+            () = app => {}
+        }
+        assert_eq!(
+            stats.aborted_writes.load(SeqCst),
+            0,
+            "a DMA write was restarted"
+        );
+        assert_eq!(stats.lost_bytes.load(SeqCst), 0, "received bytes were lost");
+    })
+    .await;
+}

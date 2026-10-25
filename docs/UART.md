@@ -81,6 +81,10 @@ implementation.
 - `build()` only borrows the storage. It performs no hardware operation and spawns no task.
 - The port is the pump's `PumpHandle`, and the runner is `UartRunner`. Neither is forced into the
   I²C `Port` type.
+- `PumpHandle::into_split()` returns a `PumpReader` and a `PumpWriter`, for a stream whose reads and
+  writes run on different futures. Nothing is reset or copied, so splitting after writes keeps the
+  accepted count: a flush after the split still waits for every byte accepted before it. A split
+  reader keeps receiving while a split writer's HAL flush is pending.
 - The receive and transmit halves must be separately owned. A driver that cannot be split must be
   wrapped first.
 

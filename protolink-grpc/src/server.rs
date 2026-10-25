@@ -149,12 +149,24 @@ impl Server {
         let result = self.core.recv(bytes, |path| handler.route(path));
         self.flush(handler);
         // `recv` has no waker and must deliver all available non-bidi
-        // requests, so every call is driven without one.
+        // requests, so every call is driven without one. Once the connection
+        // has failed, no handler runs again: its calls were cancelled.
         for id in self.calls.ids() {
+            if self.core.failure().is_some() {
+                break;
+            }
             self.calls.drive(&mut self.core, id, handler, None);
             self.flush(handler);
         }
-        result
+        // Handlers can queue output that does not fit, after the input itself
+        // was accepted: that failure is this call's result too.
+        match result {
+            Err(error) => Err(error),
+            Ok(()) => self
+                .core
+                .failure()
+                .map_or(Ok(()), |error| Err(error.clone())),
+        }
     }
 
     /// Drive every streaming call: deliver request messages held back by
@@ -246,6 +258,13 @@ impl Server {
     /// The connection failed or finished shutting down.
     pub fn is_closed(&self) -> bool {
         self.core.is_closed()
+    }
+
+    /// The connection's terminal failure, if it has one: a protocol error or
+    /// an output limit. The calls have then been cancelled; write the pending
+    /// output and close the transport.
+    pub fn failure(&self) -> Option<&Error> {
+        self.core.failure()
     }
 }
 

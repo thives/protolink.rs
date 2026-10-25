@@ -83,7 +83,7 @@ async fn h2_client_against_protolink_server() {
     let (a, b) = tokio::io::duplex(16 * 1024);
     tokio::spawn(async move {
         let mut h = FnHandler(handler);
-        protolink::tokio::server(a)
+        protolink::tokio::server_serial(a)
             .build()
             .serve(&mut h)
             .await
@@ -161,7 +161,7 @@ async fn protolink_client_against_h2_server() {
         }
     });
     with_timeout(async {
-        let mut client = protolink::tokio::client(b).build();
+        let mut client = protolink::tokio::client_serial(b).build();
         assert_eq!(
             client.unary("/echo.Echo/Echo", b"abc").await.unwrap(),
             b"abc"
@@ -343,7 +343,7 @@ mod streaming {
         let server_streams = streams.clone();
         let server = tokio::spawn(async move {
             let mut h = server_streams;
-            protolink::tokio::server(a)
+            protolink::tokio::server_serial(a)
                 .build()
                 .serve(&mut h)
                 .await
@@ -681,7 +681,7 @@ mod streaming {
         let (a, b) = tokio::io::duplex(16 * 1024);
         spawn_h2_server(a);
         with_timeout(async {
-            let client = protolink::tokio::client(b).build();
+            let client = protolink::tokio::client_serial(b).build();
 
             // Bidi: replies arrive byte by byte, before the half-close.
             let mut call = client.streaming("/echo.Echo/Chat").unwrap();
@@ -812,7 +812,7 @@ mod deadlines {
     async fn h2_client() -> h2::client::SendRequest<Bytes> {
         let (a, b) = tokio::io::duplex(16 * 1024);
         tokio::spawn(async move {
-            let _ = protolink::tokio::server(a)
+            let _ = protolink::tokio::server_serial(a)
                 .build()
                 .serve(&mut QuietEcho)
                 .await;
@@ -935,7 +935,7 @@ mod deadlines {
             }
         });
         with_timeout(async {
-            let mut client = protolink::tokio::client(b).build();
+            let mut client = protolink::tokio::client_serial(b).build();
             let err = client
                 .unary_with(
                     "/echo.Echo/Hang",

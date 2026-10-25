@@ -1043,3 +1043,166 @@ fn reset_in_the_same_read_as_a_request_cancels_before_delivery() {
     assert_eq!(handler.cancelled, vec![id]);
     assert_eq!(server.active_calls(), 0);
 }
+
+/// A reset arrives while the server's output is pending: the call it names is
+/// cancelled once, and the pending reply of another call is kept for the
+/// transport. Polling again does not cancel it a second time.
+#[test]
+fn rx_reset_cancels_once_during_tx() {
+    let mut conn = Connection::client(Default::default());
+    let open = |conn: &mut Connection, path: &str| {
+        conn.open_stream(
+            vec![
+                field(":method", "POST"),
+                field(":scheme", "http"),
+                field(":path", path),
+                field("content-type", "application/grpc"),
+            ],
+            false,
+        )
+        .unwrap()
+    };
+    let bidi = open(&mut conn, "/test/Bidi");
+    conn.send_data(bidi, lpm::encode(b"m").unwrap(), false)
+        .unwrap();
+    let unary = open(&mut conn, "/test/Unary");
+    conn.send_data(unary, lpm::encode(b"u").unwrap(), true)
+        .unwrap();
+    let mut server = Server::new(ServerConfig::default());
+    let mut handler = HandlerState::default();
+    server.recv(&conn.take_output(), &mut handler).unwrap();
+    // The unary reply is queued and not written: the transmit is pending.
+    assert!(!server.pending_output().is_empty());
+    assert!(handler.cancelled.is_empty());
+
+    conn.reset_stream(bidi, ErrorCode::Cancel).unwrap();
+    server.recv(&conn.take_output(), &mut handler).unwrap();
+    assert_eq!(handler.cancelled, vec![bidi]);
+    assert!(
+        !server.pending_output().is_empty(),
+        "the pending reply was dropped by the reset"
+    );
+
+    let waker = core::task::Waker::noop();
+    let mut cx = core::task::Context::from_waker(waker);
+    server.poll(&mut handler, &mut cx);
+    assert_eq!(
+        handler.cancelled,
+        vec![bidi],
+        "the call was cancelled twice"
+    );
+}
+
+/// A graceful shutdown queues its GOAWAY, and input that arrives afterwards
+/// appends a PING acknowledgement. The connection is closed, but the drivers
+/// keep writing until none of those bytes is left: `has_output` stays true
+/// until the transport has taken them and the flush is acknowledged.
+#[test]
+fn shutdown_flushes_output_appended_by_rx() {
+    let mut conn = Connection::client(Default::default());
+    let mut server = Server::new(ServerConfig::default());
+    let mut handler = HandlerState::default();
+    server.recv(&conn.take_output(), &mut handler).unwrap();
+    // The server's own handshake is written first, so only the bytes below remain.
+    let _ = server.take_output();
+
+    server.shutdown();
+    assert!(server.is_closed());
+    assert!(server.has_output(), "the GOAWAY is still to be written");
+    // A PING arrives after the shutdown began: its acknowledgement is output too.
+    let ping = [0, 0, 8, 6, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8];
+    server.recv(&ping, &mut handler).unwrap();
+    let pending = server.pending_output().to_vec();
+    assert_eq!(pending.len(), 17 + 17);
+    assert_eq!(pending[3], 7, "the GOAWAY comes first");
+    assert_eq!(
+        (pending[20], pending[21]),
+        (6, 1),
+        "then the PING acknowledgement"
+    );
+
+    server.consume_output(17);
+    assert!(
+        server.has_output(),
+        "the PING acknowledgement is not written yet"
+    );
+    server.consume_output(17);
+    server.output_flushed();
+    assert!(!server.has_output());
+}
+
+/// A peer whose server limits its pending output to `limit` bytes.
+fn limited_peer(window: u32, limit: usize) -> Peer {
+    let mut peer = Peer {
+        conn: Connection::client(Config {
+            initial_window_size: window,
+            flow_control: FlowControl::Manual,
+            ..Config::default()
+        }),
+        server: Server::new(ServerConfig {
+            http2: Config {
+                max_pending_output_bytes: limit,
+                ..ServerConfig::default().http2
+            },
+            ..ServerConfig::default()
+        }),
+        handler: HandlerState {
+            response_size: 20,
+            ..HandlerState::default()
+        },
+        events: Vec::new(),
+    };
+    peer.exchange();
+    peer
+}
+
+#[test]
+fn output_limit_local_handler_poll_cancels_once() {
+    // Responses are not read, so a handler's output builds up until the limit
+    // refuses one of them, in `poll`, not in `recv`.
+    let limit = 1024;
+    let mut peer = limited_peer(1 << 16, limit);
+    let id = peer.open("/test/Infinite", b"request", true, false);
+    peer.recv_requests();
+    for _ in 0..200 {
+        peer.poll();
+        if peer.server.is_closed() {
+            break;
+        }
+    }
+    assert!(matches!(
+        peer.server.failure(),
+        Some(Error::OutputLimitExceeded { limit: l, .. }) if *l == limit
+    ));
+    assert!(peer.server.is_closed());
+    assert_eq!(peer.handler.cancelled, [id]);
+    assert!(peer.server.pending_output().len() <= limit);
+
+    // Later work on the dead connection neither serializes nor cancels again.
+    let pending = peer.server.pending_output().len();
+    peer.poll();
+    peer.server.tick(Duration::from_secs(1), &mut peer.handler);
+    assert!(peer.server.recv(&[], &mut peer.handler).is_err());
+    assert_eq!(peer.server.pending_output().len(), pending);
+    assert_eq!(peer.handler.cancelled, [id]);
+    assert_eq!(peer.server.active_calls(), 0);
+}
+
+#[test]
+fn server_recv_returns_handler_generated_output_limit() {
+    // A unary call answers with a message that does not fit the cap, and the
+    // streaming call open in the same input is cancelled once, by that failure.
+    let limit = 1024;
+    let mut peer = limited_peer(1 << 16, limit);
+    let streaming = peer.open("/test/Infinite", b"request", true, false);
+    let _unary = peer.open("/test/Unary", &[7; 2000], true, false);
+    let input = peer.conn.take_output();
+    let result = peer.server.recv(&input, &mut peer.handler);
+    assert!(matches!(
+        result,
+        Err(Error::OutputLimitExceeded { limit: l, .. }) if l == limit
+    ));
+    assert_eq!(peer.handler.cancelled, [streaming]);
+    assert!(peer.server.is_closed());
+    assert!(peer.server.pending_output().len() <= limit);
+}

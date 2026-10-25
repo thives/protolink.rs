@@ -7,6 +7,8 @@ extern crate std;
 use alloc::vec::Vec;
 use core::task::{Context, Poll, Waker};
 use core::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 
 use super::*;
 use crate::dispatch::Dispatcher;
@@ -419,5 +421,344 @@ fn a_held_request_cannot_replace_the_backend_status_through_the_router() {
     assert_eq!(status.code, Code::PermissionDenied);
     assert_eq!(status.message, "denied");
     assert_eq!(status.metadata.get("x-trail"), Some("t"));
+    assert_eq!(g.router.active_calls(), 0);
+}
+
+/// A gateway whose forwarded route is a pool of two downstreams: member `0`
+/// has `flooded_limit` bytes of output and is driven by hand, member `1` is a
+/// real server.
+struct PoolGateway {
+    caller: Client,
+    router: Router,
+    backend: Server,
+    service: Service,
+}
+
+impl PoolGateway {
+    fn new(script: Script, flooded_limit: usize) -> Self {
+        let flooded = Client::new(ClientConfig {
+            http2: crate::http2::Config {
+                max_pending_output_bytes: flooded_limit,
+                ..ClientConfig::default().http2
+            },
+            ..ClientConfig::default()
+        });
+        let members = alloc::vec![flooded, Client::new(ClientConfig::default())];
+        Self {
+            caller: Client::new(ClientConfig::default()),
+            router: Router::builder()
+                .with_service(Local::default())
+                .with_pool(REMOTE, members, usize::MAX)
+                .build()
+                .unwrap(),
+            backend: Server::new(ServerConfig::default()),
+            service: Service {
+                script,
+                ..Service::default()
+            },
+        }
+    }
+
+    /// Move bytes between the caller, the router and member `1` until nothing
+    /// moves. Member `0` is not served.
+    fn settle(&mut self) {
+        for _ in 0..256 {
+            let mut progress = false;
+            let out = self.caller.take_output();
+            if !out.is_empty() {
+                progress = true;
+                self.router.recv(&out).unwrap();
+            }
+            self.router.poll(&mut Context::from_waker(Waker::noop()));
+            let out = self.router.take_output();
+            if !out.is_empty() {
+                progress = true;
+                self.caller.recv(&out).unwrap();
+            }
+            let out = self.router.backend(1).unwrap().take_output();
+            if !out.is_empty() {
+                progress = true;
+                self.backend.recv(&out, &mut self.service).unwrap();
+            }
+            self.backend
+                .poll(&mut self.service, &mut Context::from_waker(Waker::noop()));
+            let out = self.backend.take_output();
+            if !out.is_empty() {
+                progress = true;
+                self.router.backend_recv(1, &out).unwrap();
+            }
+            if !progress {
+                return;
+            }
+        }
+        panic!("gateway did not settle");
+    }
+}
+
+#[test]
+fn output_limit_backend_failure_is_isolated() {
+    // Member 0 answers a SETTINGS frame and then PINGs, one 17-byte ACK each,
+    // into an output that has room for three of them.
+    let handshake = Client::new(ClientConfig::default()).pending_output().len();
+    let limit = handshake + 9 + 3 * 17 + 10;
+    let mut g = PoolGateway::new(
+        Script {
+            replies: alloc::vec![b"remote".to_vec()],
+            ..script()
+        },
+        limit,
+    );
+    let ping = |n: u8| [0, 0, 8, 6, 0, 0, 0, 0, 0, n, n, n, n, n, n, n, n];
+    g.router
+        .backend_recv(0, &[0, 0, 0, 4, 0, 0, 0, 0, 0])
+        .unwrap();
+    for n in 0..3 {
+        g.router.backend_recv(0, &ping(n)).unwrap();
+    }
+    let refused = g.router.backend_recv(0, &ping(3));
+    assert!(matches!(
+        refused,
+        Err(crate::http2::Error::OutputLimitExceeded { limit: l, .. }) if l == limit
+    ));
+    // The driver retires the member it failed on, and only that one.
+    g.router
+        .backend_failed(0, Status::unavailable("downstream output limit exceeded"));
+    assert!(g.router.backend_failure(0).is_some());
+    assert!(g.router.backend_failure(1).is_none());
+    assert!(g.router.gateway_failure().is_none());
+    assert!(!g.router.is_closed());
+
+    // A new call goes to the other member, and succeeds.
+    let id = g
+        .caller
+        .start_unary_with(REMOTE_UNARY, b"ping", &CallOptions::default())
+        .unwrap();
+    g.settle();
+    let response = g.caller.take_response(id).unwrap().unwrap();
+    assert_eq!(response.message, b"remote");
+}
+
+#[test]
+fn router_recv_returns_local_output_limit() {
+    // A local unary call answers with a message that does not fit the gateway's cap.
+    let limit = 1024;
+    let mut caller = Client::new(ClientConfig::default());
+    let mut router = Router::builder()
+        .with_config(ServerConfig {
+            http2: crate::http2::Config {
+                max_pending_output_bytes: limit,
+                ..ServerConfig::default().http2
+            },
+            ..ServerConfig::default()
+        })
+        .with_service(Local::default())
+        .build()
+        .unwrap();
+    caller
+        .start_unary_with("/test.Local/Upper", &[b'a'; 2000], &CallOptions::default())
+        .unwrap();
+    let result = router.recv(&caller.take_output());
+    assert!(matches!(
+        result,
+        Err(crate::http2::Error::OutputLimitExceeded { limit: l, .. }) if l == limit
+    ));
+    assert!(router.gateway_failure().is_some());
+    assert!(router.is_closed());
+}
+
+#[test]
+fn relay_poll_output_limit_retires_only_failed_lane() {
+    // Member 0 has room for the forwarded call's headers but not its body, and
+    // its output is never drained. The relay's failed send ends that call, and
+    // only member 0 is retired: a later call goes to member 1, and local
+    // services keep working.
+    let handshake = Client::new(ClientConfig::default()).pending_output().len();
+    let mut g = PoolGateway::new(
+        Script {
+            replies: alloc::vec![b"remote".to_vec()],
+            ..script()
+        },
+        handshake + 400,
+    );
+    let forwarded = g
+        .caller
+        .start_unary_with(REMOTE_UNARY, &[7; 2000], &CallOptions::default())
+        .unwrap();
+    g.settle();
+    let status = g.caller.take_response(forwarded).unwrap().unwrap_err();
+    assert_eq!(status.code, Code::Unavailable);
+    assert!(
+        status.message.contains("output limit"),
+        "{}",
+        status.message
+    );
+
+    assert!(g.router.backend_failure(0).is_some());
+    assert!(g.router.backend_failure(1).is_none());
+    assert!(g.router.gateway_failure().is_none());
+    assert!(!g.router.is_closed());
+
+    let later = g
+        .caller
+        .start_unary_with(REMOTE_UNARY, b"ping", &CallOptions::default())
+        .unwrap();
+    let local = g
+        .caller
+        .start_unary_with("/test.Local/Upper", b"hi", &CallOptions::default())
+        .unwrap();
+    g.settle();
+    assert_eq!(
+        g.caller.take_response(later).unwrap().unwrap().message,
+        b"remote"
+    );
+    assert_eq!(
+        g.caller.take_response(local).unwrap().unwrap().message,
+        b"HI"
+    );
+}
+
+/// A local service whose streaming call never answers. It counts the
+/// cancellations of its calls in a counter the test keeps.
+struct Hold {
+    cancelled: Arc<AtomicUsize>,
+}
+
+const HOLD: &[MethodDescriptor] = &[MethodDescriptor::new(
+    "/test.Local/Hold",
+    MethodKind::BidiStreaming,
+    0,
+)];
+
+impl Handler for Hold {
+    fn route(&self, path: &str) -> Option<Route> {
+        Route::find(HOLD, path)
+    }
+
+    fn on_message(&mut self, _: &mut CallContext<'_>, _: &[u8]) -> Result<(), Status> {
+        Ok(())
+    }
+
+    fn poll_response(
+        &mut self,
+        _: &mut CallContext<'_>,
+        _: &mut Context<'_>,
+    ) -> Poll<Next<Vec<u8>>> {
+        Poll::Pending
+    }
+
+    fn on_cancel(&mut self, _: &mut CallContext<'_>) {
+        self.cancelled.fetch_add(1, SeqCst);
+    }
+}
+
+impl Dispatcher for Hold {
+    fn methods(&self) -> &[MethodDescriptor] {
+        HOLD
+    }
+}
+
+/// A gateway that serves `Local` and `Hold` itself, forwards `REMOTE` to a
+/// downstream that answers with `reply`, and caps its own output at 1 KiB.
+fn capped_gateway(cancelled: Arc<AtomicUsize>, reply: Vec<u8>) -> Gateway {
+    let config = ServerConfig {
+        http2: crate::http2::Config {
+            max_pending_output_bytes: 1024,
+            ..ServerConfig::default().http2
+        },
+        ..ServerConfig::default()
+    };
+    Gateway {
+        caller: Client::new(ClientConfig::default()),
+        router: Router::builder()
+            .with_config(config)
+            .with_service(Local::default())
+            .with_service(Hold { cancelled })
+            .with_route(REMOTE, Client::new(ClientConfig::default()))
+            .build()
+            .unwrap(),
+        backend: Server::new(ServerConfig::default()),
+        service: Service {
+            script: Script {
+                replies: alloc::vec![reply],
+                ..script()
+            },
+            ..Service::default()
+        },
+    }
+}
+
+/// Move bytes between the caller, the router and the downstream until the
+/// gateway fails. Nothing more is given to the gateway after that, so the
+/// test sees what the failing operation itself left behind.
+fn run_until_gateway_fails(g: &mut Gateway) {
+    for _ in 0..256 {
+        let out = g.caller.take_output();
+        if !out.is_empty() {
+            g.router.recv(&out).unwrap();
+        }
+        g.router.poll(&mut Context::from_waker(Waker::noop()));
+        let out = g.router.take_output();
+        if !out.is_empty() {
+            g.caller.recv(&out).unwrap();
+        }
+        let out = g.router.backend(0).unwrap().take_output();
+        if !out.is_empty() {
+            g.backend.recv(&out, &mut g.service).unwrap();
+        }
+        g.backend
+            .poll(&mut g.service, &mut Context::from_waker(Waker::noop()));
+        let out = g.backend.take_output();
+        if !out.is_empty() {
+            g.router.backend_recv(0, &out).unwrap();
+            if g.router.gateway_failure().is_some() {
+                return;
+            }
+        }
+    }
+    panic!("the gateway did not fail");
+}
+
+#[test]
+fn relay_gateway_overflow_cancels_local_calls() {
+    // The downstream's 2,000-byte answer does not fit the gateway's cap, and
+    // the relay that writes it fails the gateway while a local call is active.
+    let cancelled = Arc::default();
+    let mut g = capped_gateway(Arc::clone(&cancelled), alloc::vec![b'r'; 2000]);
+    let _hold = g.caller.start_streaming(HOLD[0].path).unwrap();
+    g.caller
+        .start_unary_with(REMOTE_UNARY, b"ping", &CallOptions::default())
+        .unwrap();
+    run_until_gateway_fails(&mut g);
+
+    assert!(g.router.gateway_failure().is_some());
+    assert_eq!(
+        cancelled.load(SeqCst),
+        1,
+        "the local call was cancelled once, without a poll or a tick"
+    );
+    assert_eq!(g.router.active_calls(), 0, "no call is stranded");
+
+    // Later polls and cancellation do not cancel it again.
+    g.router.poll(&mut Context::from_waker(Waker::noop()));
+    g.router.cancel_all();
+    assert_eq!(cancelled.load(SeqCst), 1);
+}
+
+#[test]
+fn local_overflow_during_poll_cancels_every_local_call() {
+    // A local answer that does not fit the cap is produced by the poll, which
+    // cancels the other local call too.
+    let cancelled = Arc::default();
+    let mut g = capped_gateway(Arc::clone(&cancelled), Vec::new());
+    let hold = g.caller.start_streaming(HOLD[0].path).unwrap();
+    g.caller.send_message(hold, b"hold").unwrap();
+    let echo = g.caller.start_streaming(LOCAL[1].path).unwrap();
+    g.caller.send_message(echo, &[7; 2000]).unwrap();
+    g.router.recv(&g.caller.take_output()).unwrap();
+    assert!(g.router.gateway_failure().is_none());
+
+    g.router.poll(&mut Context::from_waker(Waker::noop()));
+    assert!(g.router.gateway_failure().is_some());
+    assert_eq!(cancelled.load(SeqCst), 1);
     assert_eq!(g.router.active_calls(), 0);
 }

@@ -13,8 +13,10 @@ use protolink::grpc::{CallContext, Code, Status};
 use protolink::{Handler, MultiDispatch, Registry, RouteConflict};
 use tokio::io::DuplexStream;
 
-type Transport =
-    protolink::Client<protolink::tokio::FromTokio<DuplexStream>, protolink::tokio::TokioTimer>;
+type Transport = protolink::Client<
+    protolink::Serial<protolink::tokio::FromTokio<DuplexStream>>,
+    protolink::tokio::TokioTimer,
+>;
 
 async fn with_timeout<F: Future>(f: F) -> F::Output {
     tokio::time::timeout(Duration::from_secs(10), f)
@@ -44,7 +46,7 @@ fn set_output(channel: u32) -> Command {
 /// A connected client transport, and the server end.
 fn connect() -> (Transport, DuplexStream) {
     let (a, b) = tokio::io::duplex(4096);
-    (protolink::tokio::client(b).build(), a)
+    (protolink::tokio::client_serial(b).build(), a)
 }
 
 /// Serve `services` on `io` until the client disconnects.

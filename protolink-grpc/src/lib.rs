@@ -381,4 +381,6 @@ mod tests_relay;
 #[cfg(test)]
 mod tests_router;
 #[cfg(test)]
+mod tests_sizing;
+#[cfg(test)]
 mod tests_streaming;

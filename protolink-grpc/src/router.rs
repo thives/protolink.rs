@@ -210,7 +210,15 @@ impl Router {
         self.flush();
         self.drive_locals(None);
         self.pump_relays();
-        result
+        // Local and relayed work can latch the gateway's failure after the input
+        // itself was accepted: that failure is this call's result too.
+        match result {
+            Err(error) => Err(error),
+            Ok(()) => self
+                .lifecycle
+                .failure()
+                .map_or(Ok(()), |error| Err(error.clone())),
+        }
     }
 
     /// Process received bytes from downstream `backend`, relaying the responses
@@ -335,6 +343,19 @@ impl Router {
         self.lifecycle.is_closed()
     }
 
+    /// The gateway connection's terminal failure, if it has one. It can be set
+    /// by a gateway call, or by relayed work done for a downstream response.
+    pub fn gateway_failure(&self) -> Option<&Error> {
+        self.lifecycle.failure()
+    }
+
+    /// The terminal failure of downstream `backend`'s own connection, if it has
+    /// one. Only that downstream is affected: its calls have ended, and the
+    /// driver retires its transport. `None` for an unknown backend.
+    pub fn backend_failure(&self, backend: usize) -> Option<&Error> {
+        self.backends.get(backend)?.failure()
+    }
+
     /// Start a graceful shutdown of the gateway connection (GOAWAY).
     pub fn shutdown(&mut self) {
         self.lifecycle.shutdown();
@@ -362,6 +383,10 @@ impl Router {
             self.locals.ids()
         };
         for id in ids {
+            // A failed gateway runs no more local handlers; its calls were cancelled.
+            if self.lifecycle.failure().is_some() {
+                break;
+            }
             self.locals.drive(
                 &mut self.lifecycle,
                 id,
@@ -451,6 +476,10 @@ impl Router {
                 break;
             }
         }
+        // A relayed response can fail the gateway, cancelling every call on it.
+        // The local calls are told now, whatever the caller does next, since
+        // the local-call loop does not run once the gateway has failed.
+        self.flush();
     }
 }
 

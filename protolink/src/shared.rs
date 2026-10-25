@@ -14,7 +14,7 @@ use core::cell::RefCell;
 
 /// A value that is accessed in short, non-reentrant sections.
 #[derive(Debug)]
-pub(crate) struct Shared<T> {
+pub struct Shared<T> {
     #[cfg(feature = "std")]
     cell: Mutex<T>,
     #[cfg(not(feature = "std"))]

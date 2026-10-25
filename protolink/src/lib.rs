@@ -130,11 +130,26 @@ pub use error::Error;
 #[cfg(feature = "async")]
 mod asynch;
 #[cfg(feature = "async")]
-pub use asynch::{Call, Client, ClientBuilder, Server, ServerBuilder, client, server};
+pub use asynch::{
+    Call, Client, ClientBuilder, Server, ServerBuilder, client, client_reliable, client_split,
+    server, server_reliable, server_split,
+};
 #[cfg(feature = "async")]
-mod driver;
+mod coordinator;
+/// Internal workers of the async drivers. Named by [`Mode`](crate::Mode), which
+/// is sealed; not part of the API.
+#[doc(hidden)]
 #[cfg(feature = "async")]
-mod shared;
+pub mod driver;
+#[cfg(feature = "async")]
+mod mode;
+#[cfg(feature = "async")]
+pub use mode::{CoordinatedReliable, Duplex, Mode, Serial};
+/// Interior mutability of the async drivers. Named by [`Mode`](crate::Mode);
+/// not part of the API.
+#[doc(hidden)]
+#[cfg(feature = "async")]
+pub mod shared;
 
 #[cfg(feature = "async")]
 pub mod link;

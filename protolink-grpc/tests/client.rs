@@ -784,3 +784,111 @@ fn terminal_failure_keeps_stream_messages_but_drops_partial_tail() {
     assert_eq!(status.code, Code::Internal);
     assert_eq!(client.retained_response_bytes(), 0);
 }
+
+/// A client with `limit` bytes of pending output, with one unary call whose
+/// response has been received but not taken, and one streaming call whose
+/// request message is queued but not drained. Returns both calls' ids.
+fn retained_result_scenario(limit: usize) -> (Client, Connection, CallId, CallId) {
+    let config = ClientConfig {
+        http2: Config {
+            max_pending_output_bytes: limit,
+            ..ClientConfig::default().http2
+        },
+        ..ClientConfig::default()
+    };
+    let (mut client, mut peer) = setup(config);
+    let unary = open(&mut client, &mut peer, true);
+    headers(&mut peer, unary);
+    peer.send_data(unary, encoded(b"reply"), false).unwrap();
+    finish(&mut peer, unary);
+    deliver(&mut client, &mut peer);
+    let streaming = client.start_streaming("/test.Client/Stream").unwrap();
+    client.send_message(streaming, &[1; 3000]).unwrap();
+    (client, peer, unary, streaming)
+}
+
+#[test]
+fn output_limit_result_consumption_retires_client() {
+    // Measure the output of the scenario, then set the limit so that it just
+    // fits: taking the unary result must then send a credit update, which does
+    // not. Data is admitted at its exact size, so the limit can be that tight.
+    let (measured, _, _, _) = retained_result_scenario(usize::MAX);
+    let pending = measured.pending_output().len();
+    let (mut client, _, unary, streaming) = retained_result_scenario(pending + 12);
+    assert_eq!(client.pending_output().len(), pending);
+    assert!(client.failure().is_none());
+
+    let result = client
+        .take_response(unary)
+        .expect("the response was received");
+    assert_eq!(result.unwrap().message, b"reply");
+    assert!(matches!(
+        client.failure(),
+        Some(protolink_grpc::http2::Error::OutputLimitExceeded { limit, .. }) if *limit == pending + 12
+    ));
+    assert!(client.is_closed());
+    assert_eq!(
+        client.pending_output().len(),
+        pending,
+        "no credit update was written"
+    );
+
+    // The other call ends as an overload, not a protocol error.
+    let Some(protolink_grpc::Next::Done(Err(status))) = client.try_next(streaming) else {
+        panic!("the call did not end with a status");
+    };
+    assert_eq!(status.code, Code::Unavailable);
+    assert!(
+        status.message.contains("output limit"),
+        "{}",
+        status.message
+    );
+    assert!(client.send_message(streaming, b"late").is_err());
+}
+
+#[test]
+fn unary_body_overflow_adopts_failure_for_other_calls() {
+    let limit = 1024;
+    let config = ClientConfig {
+        http2: Config {
+            max_pending_output_bytes: limit,
+            ..ClientConfig::default().http2
+        },
+        ..ClientConfig::default()
+    };
+    let (mut client, _peer) = setup(config);
+    let streaming = client.start_streaming("/test.Client/Stream").unwrap();
+
+    // The headers of this unary call fit; its body does not, so the call fails
+    // to start.
+    let status = client
+        .start_unary_with(
+            "/test.Client/Unary",
+            &[7; 2000],
+            &protolink_grpc::CallOptions::default(),
+        )
+        .unwrap_err();
+    assert_eq!(status.code, Code::Unavailable);
+    assert!(
+        status.message.contains("output limit"),
+        "{}",
+        status.message
+    );
+    assert!(matches!(
+        client.failure(),
+        Some(protolink_grpc::http2::Error::OutputLimitExceeded { limit: l, .. }) if *l == limit
+    ));
+    // The call that never started is not left behind, active or retained.
+    assert!(!client.is_pending(streaming + 2));
+    assert!(client.take_response(streaming + 2).is_none());
+    // The call that was already open learns of the failure without a tick.
+    let Some(protolink_grpc::Next::Done(Err(status))) = client.try_next(streaming) else {
+        panic!("the open call did not end with the connection's failure");
+    };
+    assert_eq!(status.code, Code::Unavailable);
+    assert!(
+        status.message.contains("output limit"),
+        "{}",
+        status.message
+    );
+}
