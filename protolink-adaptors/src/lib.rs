@@ -21,13 +21,13 @@
 //!
 //! ```no_run
 //! use core::future::Future;
-//! use embedded_hal_async::{delay::DelayNs, i2c::I2c};
+//! use embedded_hal_async::i2c::I2c;
 //! use embedded_io_async::{Read, Write};
-//! use protolink_adaptors::{Binding, ControllerState, i2c_controller};
+//! use protolink_adaptors::{Binding, ControllerState, Timer, i2c_controller};
 //!
-//! async fn demo<I: I2c, D: DelayNs>(i2c: I, delay: D) {
+//! async fn demo<I: I2c, T: Timer>(i2c: I, timer: T) {
 //!     let mut state = ControllerState::<1>::new();
-//!     let Binding { mut port, runner } = i2c_controller(i2c, delay)
+//!     let Binding { mut port, runner } = i2c_controller(i2c, timer)
 //!         .with_address(0x42)
 //!         .with_storage(&mut state)
 //!         .build()
@@ -41,7 +41,8 @@
 //!         # let _ = n;
 //!     };
 //!     // Poll both together, e.g. with `embassy_futures::select` or
-//!     // `futures::future::select`. The runner only returns on failure.
+//!     // `futures::future::select`. The controller runner never returns; a
+//!     // target runner returns only when its driver fails.
 //!     # async fn either<A: Future, B: Future>(_: A, _: B) {}
 //!     either(runner.run(), application).await;
 //! }
@@ -54,8 +55,10 @@
 //!
 //! # Three different timers
 //!
-//! - the controller *polling delay* (`DelayNs`, see
-//!   [`ControllerBuilder::with_poll_interval`]);
+//! - the controller *poll interval* and the per-route *retry deadlines*, both
+//!   measured on the [`Timer`] given to the controller (see
+//!   [`ControllerBuilder::with_poll_interval`] and
+//!   [`ControllerBuilder::with_open_retry_interval`]);
 //! - the ARQ *retransmission timer* of the reliable link;
 //! - the RPC *deadline timer* of the protolink client and server.
 //!
@@ -86,10 +89,17 @@
 // Without a bus feature nothing constructs a channel.
 #[cfg_attr(not(feature = "i2c"), allow(dead_code))]
 mod channel;
-pub use channel::{DEFAULT_BUFFER_SIZE, Port, PortError, PortReader, PortWriter};
+pub use channel::{
+    AttachError, Attachment, DEFAULT_BUFFER_SIZE, Port, PortError, PortReader, PortWriter,
+};
 
 pub mod pump;
 pub mod ring;
+
+pub mod supervision;
+
+pub mod timer;
+pub use timer::{Clock, Timer};
 
 /// A port and the runner that drives it, as returned by `build`.
 ///
@@ -113,9 +123,9 @@ pub struct NoStorage;
 mod i2c;
 #[cfg(feature = "i2c")]
 pub use i2c::{
-    AnyPeers, BuildError, Controller, ControllerBuilder, ControllerError, ControllerRunner,
-    ControllerState, SinglePeer, TargetBuilder, TargetError, TargetRunner, TargetState,
-    i2c_controller, i2c_target,
+    AnyPeers, BuildError, Controller, ControllerBuilder, ControllerRunner, ControllerState,
+    DEFAULT_OPEN_ATTEMPTS, DEFAULT_OPEN_RETRY_INTERVAL, RouteEvent, RouteFault, SinglePeer,
+    TargetBuilder, TargetError, TargetFault, TargetRunner, TargetState, i2c_controller, i2c_target,
 };
 
 #[cfg(feature = "uart")]

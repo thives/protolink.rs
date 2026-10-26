@@ -8,7 +8,8 @@ mod controller;
 mod target;
 
 pub use controller::{
-    AnyPeers, BuildError, Controller, ControllerBuilder, ControllerError, ControllerRunner,
-    ControllerState, SinglePeer, i2c_controller,
+    AnyPeers, BuildError, Controller, ControllerBuilder, ControllerRunner, ControllerState,
+    DEFAULT_OPEN_ATTEMPTS, DEFAULT_OPEN_RETRY_INTERVAL, RouteEvent, RouteFault, SinglePeer,
+    i2c_controller,
 };
-pub use target::{TargetBuilder, TargetError, TargetRunner, TargetState, i2c_target};
+pub use target::{TargetBuilder, TargetError, TargetFault, TargetRunner, TargetState, i2c_target};

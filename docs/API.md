@@ -50,7 +50,7 @@ The same words are used everywhere:
 | `protolink::link::reliable(raw)` | `with_retransmission_timer` | `ReliableLink` | used as the driver's byte stream |
 | `protolink::Registry::builder()` | `with_service(dispatcher)` | `Registry` (fails on duplicate paths) | passed to `serve` |
 | `protolink::MultiDispatch::builder(app)` | `with_service(<Service>Methods)` | `MultiDispatch` (fails on duplicate paths) | passed to `serve` |
-| `i2c_controller(i2c, delay)`, `i2c_target(driver)` | `with_address`, `with_poll_interval`, `with_storage` | `Binding { port, runner }` | `runner.run().await` |
+| `i2c_controller(i2c, timer)`, `i2c_target(driver, boot)` | `with_address`, `with_poll_interval`, `with_open_retry_interval`, `with_open_attempts`, `with_storage` | `Binding { port, runner }` | `runner.run().await` (never returns for a controller; a target returns only on driver failure) |
 | `uart(rx, tx)` | `with_storage` | `Binding { port, runner }` | `runner.run().await` |
 | `protolink_grpc_gen::Generator::{micropb, prost}()` | `with_*` | — | `compile_protos` |
 
@@ -69,7 +69,7 @@ The same words are used everywhere:
   clock need `WakeableReadTimeout`, which has no default implementation that could silently ignore
   the timeout.
 - **`build` returns `Result` only where construction can fail**: registries and multi-service
-  dispatchers (duplicate paths) and I2C controllers (addresses, capacity, poll interval). Drivers,
+  dispatchers (duplicate paths) and I2C controllers (addresses, capacity, poll interval, retry interval). Drivers,
   links and I2C targets cannot fail to build.
 - **Construction performs no I/O**: no HTTP/2 preface, no SETTINGS, no bus traffic. Clients send
   their preface with the first call; servers when `serve` starts; adaptors when the runner runs.
@@ -288,19 +288,19 @@ is spawned: the runner is polled next to the server.
 ```rust,no_run
 use core::time::Duration;
 use embedded_device_example::{Device, DiagnosticsMethods, ServiceMethods};
-use embedded_hal_async::{delay::DelayNs, i2c::I2c};
-use protolink_adaptors::{Binding, ControllerState, i2c_controller};
+use embedded_hal_async::i2c::I2c;
+use protolink_adaptors::{Binding, ControllerState, Timer, i2c_controller};
 
-async fn device_over_i2c<I, D, A, T>(i2c: I, delay: D, arq_timer: A, deadline_timer: T)
+async fn device_over_i2c<I, D, A, T>(i2c: I, timer: D, arq_timer: A, deadline_timer: T)
 where
     I: I2c,
-    D: DelayNs,
+    D: Timer,
     A: protolink::link::Timer,
     T: protolink::Timer,
 {
     // Caller-owned storage; a `static` (e.g. a `StaticCell`) on a device.
     let mut state = ControllerState::<1>::new();
-    let Binding { port, runner } = i2c_controller(i2c, delay)
+    let Binding { port, runner } = i2c_controller(i2c, timer)
         .with_address(0x42)
         .with_poll_interval(Duration::from_millis(1))
         .with_storage(&mut state)
@@ -522,10 +522,10 @@ Restrictions:
 | `Generator::compile_fdset_file_with_prost(fdset, config)` | `Generator::prost().compile_fdset_file(fdset, config)` |
 | `Generator::prost_service_generator()` | `Generator::prost().service_generator()` |
 | `ProstServiceGenerator::{runtime_path, server, client, blocking_client, service_module}` | the `with_*` equivalents |
-| `i2c_controller(i2c, delay).at(a).bind(&mut state)` | `i2c_controller(i2c, delay).with_address(a).with_storage(&mut state).build()` |
-| `i2c_controller(i2c, delay).bind(&mut state)` | `i2c_controller(i2c, delay).with_storage(&mut state).build()` |
+| `i2c_controller(i2c, timer).at(a).bind(&mut state)` | `i2c_controller(i2c, timer).with_address(a).with_storage(&mut state).build()` |
+| `i2c_controller(i2c, timer).bind(&mut state)` | `i2c_controller(i2c, timer).with_storage(&mut state).build()` |
 | `.poll_interval(d)` | `.with_poll_interval(d)` |
-| `i2c_target(driver).bind(&mut state)` | `i2c_target(driver).with_storage(&mut state).build()` |
+| `i2c_target(driver).bind(&mut state)` | `i2c_target(driver, boot).with_storage(&mut state).build()` |
 | `BindError`, `PeerBuilder` | `BuildError`; `ControllerBuilder` with `with_address` |
 | `Port::reliable_with_timer(timer)` | `protolink::link::reliable(port).with_retransmission_timer(timer).build()` |
 | `Port::split()` | `Port::into_split()` |

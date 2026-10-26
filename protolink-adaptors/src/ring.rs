@@ -46,10 +46,10 @@ use core::marker::PhantomData;
 use core::mem::MaybeUninit;
 use core::ptr;
 #[cfg(not(feature = "portable-atomic"))]
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::task::{Context, Poll};
 #[cfg(feature = "portable-atomic")]
-use portable_atomic::{AtomicUsize, Ordering};
+use portable_atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use atomic_waker::AtomicWaker;
 use embedded_io_async::{ErrorType, Read, Write};
@@ -94,13 +94,19 @@ pub struct RingBuffer<T, const S: usize> {
     data_waker: AtomicWaker,
     /// The writer waiting for free slots.
     space_waker: AtomicWaker,
+    /// A [`RingTx`] exists. Only [`claim_tx`](Self::claim_tx) and the halves
+    /// touch it, so a second writer can never be handed out.
+    tx_taken: AtomicBool,
+    /// A [`RingRx`] exists, as `tx_taken` for the reader.
+    rx_taken: AtomicBool,
 }
 
-// SAFETY: the slots are only reached through the two halves. `split` takes
-// `&mut self`, so there is at most one `RingTx` and one `RingRx`, and they only
-// ever touch disjoint slots (see the invariants above), handing slots over with
-// release/acquire stores and loads of `head` and `tail`. Items move between
-// threads, hence `T: Send`.
+// SAFETY: the slots are only reached through the two halves. There is at most
+// one `RingTx` and one `RingRx` at a time: `split` takes `&mut self`, and the
+// claims in `claim_tx` and `claim_rx` are compare-and-swap on `tx_taken` and
+// `rx_taken`. The halves only ever touch disjoint slots (see the invariants
+// above), handing slots over with release/acquire stores and loads of `head`
+// and `tail`. Items move between threads, hence `T: Send`.
 unsafe impl<T: Send, const S: usize> Sync for RingBuffer<T, S> {}
 
 impl<T: Copy, const S: usize> RingBuffer<T, S> {
@@ -116,6 +122,8 @@ impl<T: Copy, const S: usize> RingBuffer<T, S> {
             tail: AtomicUsize::new(0),
             data_waker: AtomicWaker::new(),
             space_waker: AtomicWaker::new(),
+            tx_taken: AtomicBool::new(false),
+            rx_taken: AtomicBool::new(false),
         }
     }
 
@@ -137,6 +145,9 @@ impl<T: Copy, const S: usize> RingBuffer<T, S> {
     /// buffer, so it cannot be split again until both are dropped. Items left
     /// in the ring are kept; use [`clear`](Self::clear) to discard them.
     pub fn split(&mut self) -> (RingTx<'_, T, S>, RingRx<'_, T, S>) {
+        // `&mut self` rules out live halves, so both claims are free.
+        *self.tx_taken.get_mut() = true;
+        *self.rx_taken.get_mut() = true;
         let ring = &*self;
         (
             RingTx {
@@ -235,6 +246,40 @@ impl<T: Copy, const S: usize> Default for RingBuffer<T, S> {
 /// `Cell` is `Send` but not `Sync`, which is what the halves should be.
 type NotSync = PhantomData<Cell<()>>;
 
+impl<T, const S: usize> RingBuffer<T, S> {
+    /// Claims the writing half while no other writing half exists. The claim
+    /// is released when the half is dropped, so a runner can keep its end of
+    /// a ring while the application's end comes and goes.
+    pub(crate) fn claim_tx(&self) -> Option<RingTx<'_, T, S>> {
+        self.tx_taken
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+            .then(|| RingTx {
+                ring: self,
+                _not_sync: PhantomData,
+            })
+    }
+
+    /// Claims the reading half while no other reading half exists, as
+    /// [`claim_tx`](Self::claim_tx) does for the writer.
+    pub(crate) fn claim_rx(&self) -> Option<RingRx<'_, T, S>> {
+        self.rx_taken
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+            .then(|| RingRx {
+                ring: self,
+                _not_sync: PhantomData,
+            })
+    }
+
+    /// Forgets every claim. Needs `&mut`, so no half can still be alive; this
+    /// only matters for a half that was leaked rather than dropped.
+    pub(crate) fn release_claims(&mut self) {
+        *self.tx_taken.get_mut() = false;
+        *self.rx_taken.get_mut() = false;
+    }
+}
+
 /// The writing half of a [`RingBuffer`], created by [`RingBuffer::split`].
 ///
 /// `Send` but not `Sync`. For `u8` it implements
@@ -242,6 +287,12 @@ type NotSync = PhantomData<Cell<()>>;
 pub struct RingTx<'a, T, const S: usize> {
     ring: &'a RingBuffer<T, S>,
     _not_sync: NotSync,
+}
+
+impl<T, const S: usize> Drop for RingTx<'_, T, S> {
+    fn drop(&mut self) {
+        self.ring.tx_taken.store(false, Ordering::Release);
+    }
 }
 
 impl<T: Copy, const S: usize> RingTx<'_, T, S> {
@@ -395,6 +446,12 @@ impl<const S: usize> Write for RingTx<'_, u8, S> {
 pub struct RingRx<'a, T, const S: usize> {
     ring: &'a RingBuffer<T, S>,
     _not_sync: NotSync,
+}
+
+impl<T, const S: usize> Drop for RingRx<'_, T, S> {
+    fn drop(&mut self) {
+        self.ring.rx_taken.store(false, Ordering::Release);
+    }
 }
 
 impl<T: Copy, const S: usize> RingRx<'_, T, S> {
@@ -652,6 +709,30 @@ mod tests {
         ring.clear();
         assert!(ring.split().1.is_empty());
         assert_eq!(ring.capacity(), 4);
+    }
+
+    #[test]
+    fn a_role_is_claimed_by_one_half_at_a_time_and_released_on_drop() {
+        let ring = RingBuffer::<u8, 4>::new();
+        let tx = ring.claim_tx().expect("the writer is free");
+        assert!(ring.claim_tx().is_none(), "a second writer is refused");
+        // The roles are independent: the reader can be claimed meanwhile.
+        let rx = ring.claim_rx().expect("the reader is free");
+        assert!(ring.claim_rx().is_none());
+        drop(tx);
+        assert!(ring.claim_tx().is_some(), "the writer is free again");
+        drop(rx);
+        assert!(ring.claim_rx().is_some(), "the reader is free again");
+    }
+
+    #[test]
+    fn items_survive_the_halves_that_carried_them() {
+        let ring = RingBuffer::<u8, 4>::new();
+        ring.claim_tx().unwrap().push_slice(b"ab");
+        // A new writer and reader continue where the old ones stopped.
+        assert_eq!(ring.claim_rx().unwrap().try_pop(), Some(b'a'));
+        assert_eq!(ring.claim_rx().unwrap().try_pop(), Some(b'b'));
+        assert_eq!(ring.claim_rx().unwrap().try_pop(), None);
     }
 
     #[tokio::test]

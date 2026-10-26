@@ -11,15 +11,15 @@ use std::time::Duration;
 use common::*;
 use embedded_io_async::{Read, Write};
 use protolink_adaptors::{
-    Binding, BuildError, ControllerState, DEFAULT_BUFFER_SIZE, Port, PortError, TargetState,
-    i2c_controller, i2c_target,
+    Attachment, Binding, BuildError, ControllerRunner, ControllerState, DEFAULT_BUFFER_SIZE, Port,
+    PortError, PortReader, PortWriter, TargetRunner, TargetState, i2c_controller, i2c_target,
 };
 use static_cell::StaticCell;
 
 #[tokio::test]
 async fn single_peer_controller_with_local_storage() {
     let mut state = ControllerState::<1>::new();
-    let Binding { mut port, runner } = i2c_controller(NullI2c, TokioDelay)
+    let Binding { mut port, runner } = i2c_controller(NullI2c, TokioTimer::default())
         .with_address(0x42)
         .with_storage(&mut state)
         .build()
@@ -38,7 +38,7 @@ async fn single_peer_controller_with_local_storage() {
 async fn target_with_local_storage() {
     let disarmed = Arc::new(AtomicUsize::new(0));
     let mut state = TargetState::new();
-    let Binding { port, runner } = i2c_target(NullTarget(disarmed.clone()))
+    let Binding { port, runner } = i2c_target(NullTarget(disarmed.clone()), BOOT)
         .with_storage(&mut state)
         .build();
     drop(runner);
@@ -56,8 +56,11 @@ async fn application(mut port: Port<'static>) -> Result<(), PortError> {
 
 #[tokio::test]
 async fn static_storage_and_separate_tasks() {
+    let bus = WireBus::default();
+    bus.add(0x42);
+    bus.add(0x43);
     let state = CONTROLLER_STATE.init(ControllerState::new());
-    let mut controller = i2c_controller(NullI2c, TokioDelay)
+    let mut controller = i2c_controller(bus.clone(), TokioTimer::default())
         .with_storage(state)
         .build()
         .unwrap();
@@ -73,7 +76,7 @@ async fn static_storage_and_separate_tasks() {
 
     let disarmed = Arc::new(AtomicUsize::new(0));
     let state = TARGET_STATE.init(TargetState::new());
-    let Binding { port, runner } = i2c_target(NullTarget(disarmed.clone()))
+    let Binding { port, runner } = i2c_target(NullTarget(disarmed.clone()), BOOT)
         .with_storage(state)
         .build();
     let runner_task = tokio::spawn(runner.run());
@@ -87,7 +90,7 @@ async fn static_storage_and_separate_tasks() {
 #[test]
 fn bind_validates_addresses_duplicates_and_capacity() {
     let mut state = ControllerState::<2>::new();
-    let mut controller = i2c_controller(NullI2c, TokioDelay)
+    let mut controller = i2c_controller(NullI2c, TokioTimer::default())
         .with_storage(&mut state)
         .build()
         .unwrap();
@@ -113,19 +116,11 @@ fn bind_validates_addresses_duplicates_and_capacity() {
     // The single-peer path validates too.
     let mut state = ControllerState::<1>::new();
     assert!(matches!(
-        i2c_controller(NullI2c, TokioDelay)
+        i2c_controller(NullI2c, TokioTimer::default())
             .with_address(0x01)
             .with_storage(&mut state)
             .build(),
         Err(BuildError::InvalidAddress(0x01))
-    ));
-    assert!(matches!(
-        i2c_controller(NullI2c, TokioDelay)
-            .with_poll_interval(Duration::from_secs(60 * 60 * 24))
-            .with_address(0x42)
-            .with_storage(&mut state)
-            .build(),
-        Err(BuildError::PollIntervalTooLong)
     ));
 }
 
@@ -133,7 +128,7 @@ fn bind_validates_addresses_duplicates_and_capacity() {
 fn state_is_reusable_once_everything_borrowed_is_dropped() {
     let mut state = ControllerState::<1>::new();
     for _ in 0..2 {
-        let Binding { port, runner } = i2c_controller(NullI2c, TokioDelay)
+        let Binding { port, runner } = i2c_controller(NullI2c, TokioTimer::default())
             .with_address(0x42)
             .with_storage(&mut state)
             .build()
@@ -142,7 +137,7 @@ fn state_is_reusable_once_everything_borrowed_is_dropped() {
     }
     let mut target = TargetState::new();
     for _ in 0..2 {
-        let binding = i2c_target(NullTarget(Arc::default()))
+        let binding = i2c_target(NullTarget(Arc::default()), BOOT)
             .with_storage(&mut target)
             .build();
         drop(binding);
@@ -152,7 +147,7 @@ fn state_is_reusable_once_everything_borrowed_is_dropped() {
 #[test]
 fn advanced_buffer_sizes_are_explicit() {
     let mut state = ControllerState::<1, 128, 32>::with_buffers();
-    let Binding { port, runner } = i2c_controller(NullI2c, TokioDelay)
+    let Binding { port, runner } = i2c_controller(NullI2c, TokioTimer::default())
         .with_address(0x42)
         .with_storage(&mut state)
         .build()
@@ -179,9 +174,15 @@ impl embedded_hal_async::i2c::I2c for Untouchable {
     }
 }
 
-impl embedded_hal_async::delay::DelayNs for Untouchable {
-    async fn delay_ns(&mut self, _: u32) {
-        panic!("building must not wait");
+impl protolink_adaptors::Clock for Untouchable {
+    fn now(&self) -> Duration {
+        panic!("building must not read the clock");
+    }
+}
+
+impl protolink_adaptors::Timer for Untouchable {
+    async fn sleep_until(&self, _: Duration) {
+        panic!("building must not wait")
     }
 }
 
@@ -225,5 +226,23 @@ fn building_touches_no_hardware() {
     drop((ports, controller.into_runner()));
 
     let mut target = TargetState::new();
-    drop(i2c_target(Untouchable).with_storage(&mut target).build());
+    drop(
+        i2c_target(Untouchable, BOOT)
+            .with_storage(&mut target)
+            .build(),
+    );
+}
+
+fn assert_send<T: Send>() {}
+
+/// Ports, attachments and both runners can move to other tasks and threads, as
+/// the buses they drive allow: the drivers here are `Send`.
+#[test]
+fn ports_attachments_and_runners_stay_send() {
+    assert_send::<Port<'static>>();
+    assert_send::<PortReader<'static>>();
+    assert_send::<PortWriter<'static>>();
+    assert_send::<Attachment<'static>>();
+    assert_send::<ControllerRunner<'static, WireBus, TokioTimer, 1>>();
+    assert_send::<TargetRunner<'static, NullTarget>>();
 }

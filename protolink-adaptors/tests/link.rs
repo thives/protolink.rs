@@ -63,13 +63,13 @@ fn sustained_bidirectional_traffic_arrives_complete_and_in_order() {
         let Binding {
             port: target_port,
             runner: target_runner,
-        } = i2c_target(SimTarget(bus.clone()))
+        } = i2c_target(SimTarget(bus.clone()), BOOT)
             .with_storage(&mut target_state)
             .build();
         let Binding {
             port: controller_port,
             runner: controller_runner,
-        } = i2c_controller(SimController(bus.clone()), RecordingDelay::default())
+        } = i2c_controller(SimController(bus.clone()), VirtualTimer::default())
             .with_address(ADDRESS)
             .with_storage(&mut controller_state)
             .build()
@@ -121,13 +121,13 @@ fn reliable_stack_carries_data_in_both_directions() {
         let Binding {
             port: target_port,
             runner: target_runner,
-        } = i2c_target(SimTarget(bus.clone()))
+        } = i2c_target(SimTarget(bus.clone()), BOOT)
             .with_storage(&mut target_state)
             .build();
         let Binding {
             port: controller_port,
             runner: controller_runner,
-        } = i2c_controller(SimController(bus.clone()), TokioDelay)
+        } = i2c_controller(SimController(bus.clone()), TokioTimer::default())
             .with_address(ADDRESS)
             .with_storage(&mut controller_state)
             .build()
@@ -198,13 +198,13 @@ fn rpc_runs_over_i2c_in_both_role_assignments() {
             let Binding {
                 port: target_port,
                 runner: target_runner,
-            } = i2c_target(SimTarget(bus.clone()))
+            } = i2c_target(SimTarget(bus.clone()), BOOT)
                 .with_storage(&mut target_state)
                 .build();
             let Binding {
                 port: controller_port,
                 runner: controller_runner,
-            } = i2c_controller(SimController(bus.clone()), TokioDelay)
+            } = i2c_controller(SimController(bus.clone()), TokioTimer::default())
                 .with_address(ADDRESS)
                 .with_storage(&mut controller_state)
                 .build()
@@ -296,13 +296,13 @@ fn split_port_halves_carry_rpc_in_both_role_assignments() {
             let Binding {
                 port: target_port,
                 runner: target_runner,
-            } = i2c_target(SimTarget(bus.clone()))
+            } = i2c_target(SimTarget(bus.clone()), BOOT)
                 .with_storage(&mut target_state)
                 .build();
             let Binding {
                 port: controller_port,
                 runner: controller_runner,
-            } = i2c_controller(SimController(bus.clone()), TokioDelay)
+            } = i2c_controller(SimController(bus.clone()), TokioTimer::default())
                 .with_address(ADDRESS)
                 .with_storage(&mut controller_state)
                 .build()
@@ -338,13 +338,13 @@ fn withheld_credit_holds_writes_while_inbound_traffic_flows() {
         let Binding {
             port: target_port,
             runner: target_runner,
-        } = i2c_target(SimTarget(bus.clone()))
+        } = i2c_target(SimTarget(bus.clone()), BOOT)
             .with_storage(&mut target_state)
             .build();
         let Binding {
             port: controller_port,
             runner: controller_runner,
-        } = i2c_controller(SimController(bus.clone()), TokioDelay)
+        } = i2c_controller(SimController(bus.clone()), TokioTimer::default())
             .with_address(ADDRESS)
             .with_storage(&mut controller_state)
             .build()
@@ -408,13 +408,14 @@ fn reading_restores_receive_space_and_wakes_an_idle_controller() {
         let Binding {
             port: target_port,
             runner: target_runner,
-        } = i2c_target(SimTarget(bus.clone()))
+        } = i2c_target(SimTarget(bus.clone()), BOOT)
             .with_storage(&mut target_state)
             .build();
         let Binding {
             port: controller_port,
             runner: controller_runner,
-        } = i2c_controller(SimController(bus.clone()), NeverDelay)
+        } = i2c_controller(SimController(bus.clone()), NeverTimer)
+            .with_open_retry_interval(Duration::ZERO)
             .with_address(ADDRESS)
             .with_storage(&mut controller_state)
             .build()
@@ -464,13 +465,13 @@ fn reliable_i2c_duplex_exceeds_engine_receive_storage() {
         let Binding {
             port: target_port,
             runner: target_runner,
-        } = i2c_target(SimTarget(bus.clone()))
+        } = i2c_target(SimTarget(bus.clone()), BOOT)
             .with_storage(&mut target_state)
             .build();
         let Binding {
             port: controller_port,
             runner: controller_runner,
-        } = i2c_controller(SimController(bus.clone()), RecordingDelay::default())
+        } = i2c_controller(SimController(bus.clone()), VirtualTimer::default())
             .with_address(ADDRESS)
             .with_storage(&mut controller_state)
             .build()

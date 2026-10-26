@@ -98,7 +98,7 @@ Leaving the deadline policy out does not compile.
 use protolink_adaptors::{Binding, ControllerState, i2c_controller};
 
 static STATE: StaticCell<ControllerState<1>> = StaticCell::new();
-let Binding { port, runner } = i2c_controller(i2c, delay)  // bus adaptor; no traffic yet
+let Binding { port, runner } = i2c_controller(i2c, timer)  // bus adaptor; no traffic yet
     .with_address(0x42)
     .with_storage(STATE.init(ControllerState::new()))
     .build()?;
