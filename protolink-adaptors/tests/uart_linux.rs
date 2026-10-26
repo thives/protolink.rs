@@ -265,34 +265,33 @@ async fn backpressured_writes_wait_and_then_complete() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn flush_and_shutdown_complete_without_waiting_for_the_peer() {
-    // The peer does not read yet, so the accepted bytes are still queued below
-    // the wrapper. Flush must return at once, and must not discard them: the
-    // peer reads every accepted byte afterwards.
+    // The peer does not read, so the accepted bytes stay queued below the
+    // wrapper. Flush and shutdown must return at once without discarding them:
+    // the peer reads every accepted byte afterwards.
+    //
+    // A single `Pending` write is not proof of backpressure. The first write can
+    // wait only for its initial writability event, so `fill_output` treats the
+    // queue as full only after repeated stalls.
     //
     // A PTY does not model baud rate, so it cannot show a drain taking long.
-    // The multi-threaded runtime makes a blocking flush fail the timeout
-    // instead of hanging the test.
+    // Tokio timeouts bound the awaited setup and drain below. They cannot preempt
+    // a blocking call inside a poll, so a regression of that kind hangs the test
+    // and must be bounded by an external time limit.
     let (mut master, mut uart) = pair();
-    let mut sent = 0;
-    let data = all_bytes(1 << 16);
-    while let Some(n) = poll_once(uart.write(&data[sent..])) {
-        sent += n.unwrap();
-    }
-    assert!(sent > 0, "some bytes were accepted");
+    let data = all_bytes(1 << 20);
+    let sent = fill_output(&mut uart, &data).await;
+    assert!(sent < data.len(), "some input remains unsent");
 
-    with_timeout(async {
-        uart.flush().await.unwrap();
-        uart.shutdown().await.unwrap();
-    })
-    .await;
+    // Each operation is polled once. Pending would mean it waits for the peer.
+    poll_once(uart.flush())
+        .expect("flush completes on its first poll")
+        .unwrap();
+    poll_once(uart.shutdown())
+        .expect("shutdown completes on its first poll")
+        .unwrap();
 
-    let got = with_timeout(async {
-        let mut got = vec![0u8; sent];
-        master.read_exact(&mut got).await.unwrap();
-        got
-    })
-    .await;
-    assert_eq!(got, data[..sent]);
+    // The wrapper is still alive. Every accepted byte is readable, and no other.
+    assert_drained(&mut master, &data[..sent]).await;
 }
 
 #[tokio::test]
