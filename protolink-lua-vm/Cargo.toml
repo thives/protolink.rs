@@ -1,0 +1,20 @@
+[package]
+name = "protolink-lua-vm"
+version = "0.0.1"
+authors = ["Thomas Ivesdal-Tronstad"]
+edition = "2024"
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
+description = "Reduced, bounded Lua VM for remote nodes: no garbage collector, fuel and heap budgets, and a single-value native ABI."
+readme = "README.md"
+
+[lib]
+name = "protolink_lua_vm"
+crate-type = [ "rlib" ]
+test = true
+doctest = true
+bench = false
+
+[dependencies]
+protolink-lua-bytecode = { version = "0.0.1", path = "../protolink-lua-bytecode" }
+protolink-lua = { version = "0.0.1", path = "../protolink-lua" }

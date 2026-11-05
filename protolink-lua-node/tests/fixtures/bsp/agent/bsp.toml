@@ -1,0 +1,300 @@
+# Consumer BSP manifest: the ESP32-C6 agent. It declares a `remote` child that runs the DUT contract.
+# Its native surface is the ESP base BSP's chip and reset modules, the OTA module, and the `dut` module, which drives the
+# DUT over its UART: boot mode, RAM writes, start, connect and the embedded stub. The `storage` module keeps named files
+# in the `storage` data partition, and the `nvs` module keeps key/value pairs in the `nvs` partition. `storage` is implemented
+# by lib/agent_store and `nvs` by the BSP's key/value surface, lib/esp_bsp/src/kvp.rs, on sequential-storage. Both are
+# documented in docs/AGENT-STORAGE-NVS-IMPLEMENTATION.md. The envelope is sized for 256 KiB of
+# node memory: see docs/AGENT-NODE-IMPLEMENTATION.md for the sum. The DUT operations are described in docs/DUT-STUB-IMPLEMENTATION.md.
+schema_version = 1
+
+[contract]
+name = "example.fixture.remote"
+id = "2bdbdeef-600a-46de-82b5-1936195c2d11"
+version = "2.1.0"
+language_profile = "lua54-bounded-v1"
+remote_data_profile = "remote-data-v1"
+privileges = [
+  "remote.execute",
+  "base.read",
+  "base.reset",
+  "ota.read",
+  "ota.write",
+  "ota.activate",
+  "ota.verify",
+  "dut.control",
+  "storage.control",
+  "nvs.control",
+]
+
+[contract.limits]
+max_string_bytes = 256
+max_tuple_items = 8
+max_capture_bytes = 512
+max_result_bytes = 512
+max_spawn_depth = 2
+
+[[imports]]
+alias = "remote"
+path = "../dut/bsp.toml"
+contract_id = "78240354-a109-42a2-9b91-e0497fbd55d0"
+version = "=2.0.0"
+
+[[imports]]
+alias = "base"
+path = "../base-esp32c6/bsp.toml"
+contract_id = "bfec1a2c-f5a4-41aa-aab5-5d9dd663dc08"
+version = "=2.0.0"
+
+[[imports]]
+alias = "ota"
+path = "../ota/bsp.toml"
+contract_id = "8923159d-10fa-4bd7-beee-5bd457cfc5d1"
+version = "=2.0.0"
+
+[[module_imports]]
+alias = "base"
+module = "chip"
+
+[[module_imports]]
+alias = "base"
+module = "reset"
+
+[[module_imports]]
+alias = "ota"
+module = "ota"
+
+[[modules]]
+name = "dut"
+id = 3
+
+[[modules.enums]]
+name = "Mode"
+id = 1
+variants = [
+  { name = "normal", id = 1, symbol = "normal" },
+  { name = "bootloader", id = 2, symbol = "bootloader" },
+]
+
+[[modules.operations]]
+name = "set_boot_mode"
+id = 1
+execution = "sync"
+params = [{ name = "mode", type = "enum", ref = "Mode" }]
+requires = ["dut.control"]
+
+[[modules.operations]]
+name = "get_boot_mode"
+id = 2
+execution = "sync"
+results = [{ name = "mode", type = "enum", ref = "Mode" }]
+requires = ["dut.control"]
+
+[[modules.operations]]
+name = "write_ram"
+id = 3
+execution = "sync"
+params = [{ name = "address", type = "integer" }, { name = "data", type = "bytes", max_bytes = 256 }]
+requires = ["dut.control"]
+
+[[modules.operations]]
+name = "start"
+id = 4
+execution = "sync"
+params = [{ name = "address", type = "integer" }]
+requires = ["dut.control"]
+
+[[modules.operations]]
+name = "connect"
+id = 5
+execution = "sync"
+requires = ["dut.control"]
+
+[[modules.operations]]
+name = "load_stub"
+id = 6
+execution = "sync"
+requires = ["dut.control"]
+
+# Named files in the `storage` data partition. A file has a fixed capacity, reserved by `create`. A file is written
+# sequentially: a write starts at or before the current length, so a file never has a hole. `open` returns a handle, which
+# `close` releases. `digest` hashes the file's current length on the device.
+[[modules]]
+name = "storage"
+id = 4
+
+[[modules.errors]]
+name = "BadName"
+id = 1
+
+[[modules.errors]]
+name = "BadLength"
+id = 2
+
+[[modules.errors]]
+name = "NotFound"
+id = 3
+
+[[modules.errors]]
+name = "Exists"
+id = 4
+
+[[modules.errors]]
+name = "NoSpace"
+id = 5
+
+[[modules.errors]]
+name = "BadHandle"
+id = 6
+
+[[modules.errors]]
+name = "OutOfRange"
+id = 7
+
+[[modules.errors]]
+name = "InUse"
+id = 8
+
+[[modules.errors]]
+name = "IoFailure"
+id = 9
+
+[[modules.operations]]
+name = "create"
+id = 1
+execution = "sync"
+params = [{ name = "name", type = "bytes", max_bytes = 16 }, { name = "capacity", type = "integer" }]
+errors = ["BadName", "BadLength", "Exists", "NoSpace", "IoFailure"]
+requires = ["storage.control"]
+
+[[modules.operations]]
+name = "delete"
+id = 2
+execution = "sync"
+params = [{ name = "name", type = "bytes", max_bytes = 16 }]
+errors = ["BadName", "NotFound", "InUse", "IoFailure"]
+requires = ["storage.control"]
+
+[[modules.operations]]
+name = "open"
+id = 3
+execution = "sync"
+params = [{ name = "name", type = "bytes", max_bytes = 16 }]
+results = [{ name = "handle", type = "integer" }]
+errors = ["BadName", "NotFound", "NoSpace", "IoFailure"]
+requires = ["storage.control"]
+
+[[modules.operations]]
+name = "close"
+id = 4
+execution = "sync"
+params = [{ name = "handle", type = "integer" }]
+errors = ["BadHandle"]
+requires = ["storage.control"]
+
+# Reads `length` bytes at `offset`. The range must lie inside the file's current length.
+[[modules.operations]]
+name = "read"
+id = 5
+execution = "sync"
+params = [
+  { name = "handle", type = "integer" },
+  { name = "offset", type = "integer" },
+  { name = "length", type = "integer" },
+]
+results = [{ name = "blob", type = "bytes", max_bytes = 256 }]
+errors = ["BadHandle", "BadLength", "OutOfRange", "IoFailure"]
+requires = ["storage.control"]
+
+# Writes 1 to 256 bytes at `offset`. The offset must be at most the current length, and the write must end inside the
+# capacity. The store aligns the write to 4 bytes itself. A failure can leave the bytes of the write partly changed.
+[[modules.operations]]
+name = "write"
+id = 6
+execution = "sync"
+params = [
+  { name = "handle", type = "integer" },
+  { name = "offset", type = "integer" },
+  { name = "blob", type = "bytes", max_bytes = 256 },
+]
+errors = ["BadHandle", "BadLength", "OutOfRange", "IoFailure"]
+requires = ["storage.control"]
+
+# SHA-256 of the file's current length, computed with the device's SHA accelerator.
+[[modules.operations]]
+name = "digest"
+id = 7
+execution = "sync"
+params = [{ name = "handle", type = "integer" }]
+results = [{ name = "digest", type = "bytes", max_bytes = 32 }]
+errors = ["BadHandle", "IoFailure"]
+requires = ["storage.control"]
+
+# Key/value records in the `nvs` partition. A key is 1 to 16 bytes and a value 1 to 44 bytes. `get` returns an empty
+# string for a key that is not set, so a script needs no nil check.
+[[modules]]
+name = "nvs"
+id = 6
+
+[[modules.errors]]
+name = "BadName"
+id = 1
+
+[[modules.errors]]
+name = "BadLength"
+id = 2
+
+[[modules.errors]]
+name = "NoSpace"
+id = 3
+
+[[modules.errors]]
+name = "IoFailure"
+id = 4
+
+[[modules.operations]]
+name = "get"
+id = 1
+execution = "sync"
+params = [{ name = "key", type = "bytes", max_bytes = 16 }]
+results = [{ name = "value", type = "bytes", max_bytes = 44 }]
+errors = ["BadName", "IoFailure"]
+requires = ["nvs.control"]
+
+[[modules.operations]]
+name = "set"
+id = 2
+execution = "sync"
+params = [{ name = "key", type = "bytes", max_bytes = 16 }, { name = "value", type = "bytes", max_bytes = 44 }]
+errors = ["BadName", "BadLength", "NoSpace", "IoFailure"]
+requires = ["nvs.control"]
+
+[[child_execution]]
+name = "remote"
+id = 1
+index = 1
+child_contract = "remote"
+intrinsic = "task.spawn.v1"
+requires = ["remote.execute"]
+delegates = []
+max_capture_bytes = 512
+max_result_bytes = 512
+
+[resources]
+max_artifact_bytes = 12288
+max_chunk_bytes = 256
+max_uploads = 1
+max_sessions = 4
+max_executions = 3
+max_answer_bytes = 256
+slice_fuel = 128
+total_fuel = 2000000
+max_frames = 16
+max_objects = 4096
+max_heap_bytes = 32768
+session_idle_ms = 30000
+max_artifacts = 4
+retired_window = 32
+max_child_tasks = 8
+call_timeout_ms = 2000
+cleanup_ms = 5000
+max_request_bytes = 1536

@@ -1,0 +1,19 @@
+[package]
+name = "protolink-lua-bytecode"
+version = "0.0.1"
+authors = ["Thomas Ivesdal-Tronstad"]
+edition = "2024"
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
+description = "Portable artifact format of the reduced remote Lua VM: canonical encoding, bounded decoding, verification and admission."
+readme = "README.md"
+
+[lib]
+name = "protolink_lua_bytecode"
+crate-type = [ "rlib" ]
+test = true
+doctest = true
+bench = false
+
+[dependencies]
+sha2 = { version = "0.10", default-features = false }

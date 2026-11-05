@@ -2,7 +2,7 @@
 //!
 //! A connection is driven by one coordinator future, which alone owns the
 //! protocol state, its handlers and the clock. Each transport has workers that
-//! borrow it and report their completions through a [`Port`]; the coordinator
+//! borrow it and report their completions through a [`crate::driver::Port`]; the coordinator
 //! asks for work through the port and never touches the transport itself.
 //!
 //! There are three ways a transport is served:

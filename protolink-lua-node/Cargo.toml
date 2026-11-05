@@ -1,0 +1,27 @@
+[package]
+name = "protolink-lua-node"
+version = "0.0.1"
+authors = ["Thomas Ivesdal-Tronstad"]
+edition = "2024"
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
+description = "One execution node for lua.execution.v1: lifecycle, uploads, artifact store, native operations and child links, for no_std targets."
+readme = "README.md"
+
+[lib]
+name = "protolink_lua_node"
+crate-type = [ "rlib" ]
+test = true
+doctest = true
+bench = false
+
+[dependencies]
+protolink-lua-bytecode = { version = "0.0.1", path = "../protolink-lua-bytecode" }
+protolink-lua-vm = { version = "0.0.1", path = "../protolink-lua-vm" }
+protolink = { version = "=0.0.5", path = "../protolink", default-features = false, features = ["async", "micropb"] }
+protolink-lua = { version = "0.0.1", path = "../protolink-lua" }
+micropb = { version = "0.6", features = ["alloc"] }
+
+[dev-dependencies]
+protolink-lua-compiler = { version = "0.0.1", path = "../protolink-lua-compiler" }
+protolink-lua-plugin-gen = { version = "0.0.1", path = "../protolink-lua-plugin-gen" }

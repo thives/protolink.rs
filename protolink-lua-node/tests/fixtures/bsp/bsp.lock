@@ -1,0 +1,73 @@
+lock_version = 3
+
+[[contract]]
+name = "example.fixture.host"
+id = "1b0a8e2c-7d4f-4e6a-9c1b-5a2f3e4d6c70"
+version = "1.0.0"
+digest = "sha256:079142fdb57c70d9c0991bccb852b657d5f46a551a4994ae5fac9e13fa60cebb"
+source = "host/bsp.toml"
+source_sha256 = "5d4ac63632ab2578cc965af730793401192ee8f5bd11b821c34e1a36b9751326"
+language_profile = "lua54-bounded-v1"
+profile_sha256 = "126146085b29cfbf28b4e5d7fb6cc0e5333c3aa17dea35b524510bb8ffabf43a"
+profile_fingerprint = "ab6e79fbd80963cae1ab7e6e5cfd541f0d984aa66d40050eeb77a1f09d4960f7"
+imports = ["remote=2bdbdeef-600a-46de-82b5-1936195c2d11"]
+
+[[contract]]
+name = "example.fixture.remote"
+id = "2bdbdeef-600a-46de-82b5-1936195c2d11"
+version = "2.1.0"
+digest = "sha256:3afc082576bb8445f230cb7251c989a0d556ed5dd71c3bea9724596ba8bec002"
+source = "agent/bsp.toml"
+source_sha256 = "61269a93f5c50a1d44e4b0061394565834276e8e722e3fcbf78f2fb0224dc9ae"
+language_profile = "lua54-bounded-v1"
+profile_sha256 = "126146085b29cfbf28b4e5d7fb6cc0e5333c3aa17dea35b524510bb8ffabf43a"
+profile_fingerprint = "ab6e79fbd80963cae1ab7e6e5cfd541f0d984aa66d40050eeb77a1f09d4960f7"
+imports = ["base=bfec1a2c-f5a4-41aa-aab5-5d9dd663dc08", "ota=8923159d-10fa-4bd7-beee-5bd457cfc5d1", "remote=78240354-a109-42a2-9b91-e0497fbd55d0"]
+
+[[contract]]
+name = "example.fixture.remote"
+id = "78240354-a109-42a2-9b91-e0497fbd55d0"
+version = "2.0.0"
+digest = "sha256:ebdcca448cfc534decb2c6c8483ea191f3fed5c7f44feda9557a7b0b26c04ef3"
+source = "dut/bsp.toml"
+source_sha256 = "d9e29213adc1259054b74ea97d3cc21e45bd1da719c3e33285de8206a1db4c20"
+language_profile = "lua54-bounded-v1"
+profile_sha256 = "126146085b29cfbf28b4e5d7fb6cc0e5333c3aa17dea35b524510bb8ffabf43a"
+profile_fingerprint = "ab6e79fbd80963cae1ab7e6e5cfd541f0d984aa66d40050eeb77a1f09d4960f7"
+imports = ["base=7f60e12e-2e3a-46b3-8235-fec9683e3419"]
+
+[[contract]]
+name = "esp.base.esp32"
+id = "7f60e12e-2e3a-46b3-8235-fec9683e3419"
+version = "2.0.0"
+digest = "sha256:a741d5aee586050c1f9dfbaa1ae5d125ac25bd63f8caa043e14c88b3b2f87c59"
+source = "base-esp32/bsp.toml"
+source_sha256 = "06c9f2f8f482a866f102f9c6f8a2426b1e27bbb52e770fb6e7e4dc58aa905039"
+language_profile = "lua54-bounded-v1"
+profile_sha256 = "126146085b29cfbf28b4e5d7fb6cc0e5333c3aa17dea35b524510bb8ffabf43a"
+profile_fingerprint = "ab6e79fbd80963cae1ab7e6e5cfd541f0d984aa66d40050eeb77a1f09d4960f7"
+imports = []
+
+[[contract]]
+name = "esp.ota"
+id = "8923159d-10fa-4bd7-beee-5bd457cfc5d1"
+version = "2.0.0"
+digest = "sha256:78a415a13d3b84e3004c9f55feb87b71ee4e7b2120c5d18495422e65bd14c8ab"
+source = "ota/bsp.toml"
+source_sha256 = "9774876220809e91c194385c5189b3eff9269e5368de46336ff5a57d33b52b5d"
+language_profile = "lua54-bounded-v1"
+profile_sha256 = "126146085b29cfbf28b4e5d7fb6cc0e5333c3aa17dea35b524510bb8ffabf43a"
+profile_fingerprint = "ab6e79fbd80963cae1ab7e6e5cfd541f0d984aa66d40050eeb77a1f09d4960f7"
+imports = []
+
+[[contract]]
+name = "esp.base.esp32c6"
+id = "bfec1a2c-f5a4-41aa-aab5-5d9dd663dc08"
+version = "2.0.0"
+digest = "sha256:7f2fa15dfeb897a66e1dc97c39b31c06741a0a276aea0c1013f83fbafe402aab"
+source = "base-esp32c6/bsp.toml"
+source_sha256 = "52bf1ae27763d0299444e6a2c81277525629edfbd67e71e2c29337c7ecd3762b"
+language_profile = "lua54-bounded-v1"
+profile_sha256 = "126146085b29cfbf28b4e5d7fb6cc0e5333c3aa17dea35b524510bb8ffabf43a"
+profile_fingerprint = "ab6e79fbd80963cae1ab7e6e5cfd541f0d984aa66d40050eeb77a1f09d4960f7"
+imports = []

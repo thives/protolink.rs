@@ -7,6 +7,13 @@ members = [
     "protolink-grpc",
     "protolink-grpc-gen",
     "protolink-alloc-track",
+    "protolink-lua-api",
+    "protolink-lua",
+    "protolink-lua-bytecode",
+    "protolink-lua-plugin-gen",
+    "protolink-lua-vm",
+    "protolink-lua-compiler",
+    "protolink-lua-node",
     "examples/embedded-device"
 ]
 exclude = ["examples/embedded-smoke"]

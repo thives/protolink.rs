@@ -1,0 +1,35 @@
+[package]
+name = "protolink-lua-api"
+version = "0.0.1"
+authors = ["Thomas Ivesdal-Tronstad"]
+edition = "2024"
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+description = "Canonical lua.execution.v1 and lua.plugin.v1 schemas with their generated Rust bindings."
+
+[lib]
+name = "protolink_lua_api"
+crate-type = [ "rlib" ]
+test = true
+doctest = true
+bench = false
+
+[features]
+default = []
+# lua.execution.v1 messages. No service glue: nodes and proxies route raw bytes themselves.
+execution = ["dep:micropb"]
+# lua.plugin.v1 messages and the Protolink bridge service glue.
+plugin = ["dep:micropb", "dep:protolink"]
+
+[dependencies]
+micropb = { version = "0.6", features = ["alloc"], optional = true }
+protolink = { version = "=0.0.5", path = "../protolink", default-features = false, features = ["async", "micropb"], optional = true }
+
+[build-dependencies]
+micropb-gen = "0.6"
+protolink-grpc-gen = { version = "=0.0.4", path = "../protolink-grpc-gen" }
+
+# docs.rs documents both public protocol modules. Runtime defaults are unchanged: `default = []` above.
+[package.metadata.docs.rs]
+features = ["execution", "plugin"]

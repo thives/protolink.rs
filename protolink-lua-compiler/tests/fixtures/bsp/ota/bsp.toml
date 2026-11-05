@@ -1,0 +1,136 @@
+# OTA BSP manifest: update slots and device-side verification of an application image.
+# A slot is named by an opaque identifier, the partition label. The host never sees offsets, partition types or the boot
+# data. The identifier is stable across reboot while the partition table is unchanged, so the host can keep it to confirm
+# an update after a reset. Writes are slot-relative and exactly 256 bytes. The host pads the last chunk with 0xff.
+# The implementation is lib/esp_bsp (src/update.rs), with lib/ota_client for the image checks. docs/AGENT-OTA-CONTRACT-V2.md
+# records the design and the migration.
+schema_version = 1
+
+[contract]
+name = "esp.ota"
+id = "8923159d-10fa-4bd7-beee-5bd457cfc5d1"
+version = "2.0.0"
+language_profile = "lua54-bounded-v1"
+remote_data_profile = "remote-data-v1"
+privileges = ["ota.read", "ota.write", "ota.activate", "ota.verify"]
+
+[contract.limits]
+max_string_bytes = 256
+max_tuple_items = 8
+max_capture_bytes = 512
+max_result_bytes = 512
+max_spawn_depth = 1
+
+[[modules]]
+name = "ota"
+id = 5
+
+[[modules.errors]]
+name = "OutOfRange"
+id = 1
+
+[[modules.errors]]
+name = "UnknownSlot"
+id = 2
+
+[[modules.errors]]
+name = "BadLength"
+id = 3
+
+[[modules.errors]]
+name = "BadImage"
+id = 4
+
+[[modules.errors]]
+name = "Mismatch"
+id = 5
+
+[[modules.errors]]
+name = "IoFailure"
+id = 6
+
+[[modules.errors]]
+name = "NotWritable"
+id = 7
+
+[[modules.errors]]
+name = "NoTarget"
+id = 8
+
+# Checks that the first `length` bytes of the application slot `slot` hash to `digest` (SHA-256). `length` must be positive
+# and no larger than the slot. The ESP implementation also requires the ESP application magic byte at the start of the image.
+# A BSP may add its own image checks, and the digest comparison is the one that this contract names. A success returns no
+# value. A failure is raised in Lua, so the workflow stops before it activates the slot.
+[[modules.operations]]
+name = "verify"
+id = 1
+execution = "sync"
+params = [
+  { name = "slot", type = "bytes", max_bytes = 16 },
+  { name = "length", type = "integer" },
+  { name = "digest", type = "bytes", max_bytes = 32 },
+]
+errors = ["UnknownSlot", "BadLength", "BadImage", "Mismatch", "OutOfRange", "IoFailure"]
+requires = ["ota.verify"]
+
+# The slot that runs the image now.
+[[modules.operations]]
+name = "booted"
+id = 2
+execution = "sync"
+results = [{ name = "slot", type = "bytes", max_bytes = 16 }]
+errors = ["IoFailure"]
+requires = ["ota.read"]
+
+# The slot that the boot selection names for the next reset.
+[[modules.operations]]
+name = "selected"
+id = 3
+execution = "sync"
+results = [{ name = "slot", type = "bytes", max_bytes = 16 }]
+errors = ["IoFailure"]
+requires = ["ota.read"]
+
+# The inactive OTA slot that an update may write: neither the running slot nor the selected one. Fails with NoTarget when
+# no OTA slot is free.
+[[modules.operations]]
+name = "target"
+id = 4
+execution = "sync"
+results = [{ name = "slot", type = "bytes", max_bytes = 16 }]
+errors = ["NoTarget", "IoFailure"]
+requires = ["ota.read"]
+
+# The writable size of a slot in bytes.
+[[modules.operations]]
+name = "capacity"
+id = 5
+execution = "sync"
+params = [{ name = "slot", type = "bytes", max_bytes = 16 }]
+results = [{ name = "capacity", type = "integer" }]
+errors = ["UnknownSlot", "IoFailure"]
+requires = ["ota.read"]
+
+# Writes exactly 256 bytes at `offset` within the slot. Only an OTA slot that is neither running nor selected can be
+# written, and only inside the flash regions the embedding authorizes. The write is not atomic: a failure can leave the
+# sector partly rewritten. A success returns no value.
+[[modules.operations]]
+name = "write"
+id = 6
+execution = "sync"
+params = [
+  { name = "slot", type = "bytes", max_bytes = 16 },
+  { name = "offset", type = "integer" },
+  { name = "blob", type = "bytes", max_bytes = 256 },
+]
+errors = ["UnknownSlot", "NotWritable", "OutOfRange", "BadLength", "IoFailure"]
+requires = ["ota.write"]
+
+# Selects the slot for the next reset and sets its image state to new. The slot must be an application slot.
+[[modules.operations]]
+name = "activate"
+id = 7
+execution = "sync"
+params = [{ name = "slot", type = "bytes", max_bytes = 16 }]
+errors = ["UnknownSlot", "IoFailure"]
+requires = ["ota.activate"]

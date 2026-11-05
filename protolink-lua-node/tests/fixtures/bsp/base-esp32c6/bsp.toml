@@ -1,0 +1,114 @@
+# Base BSP manifest for the ESP32-C6: chip identity and reset.
+# Version 2.0.0 removes partition access, flash.write and the flash reads. Slot selection, reads and writes are the OTA module's
+# (bsp/ota/bsp.toml), which names slots by opaque identifiers and keeps the partition layout inside the BSP
+# (docs/AGENT-OTA-CONTRACT-V2.md).
+# Version 1.2.0 adds the boot selection and reset.restart. Version 1.1.0 adds flash.write (docs/ESP-BASE-BSP-FLASH-WRITE.md).
+# The modules are identical in bsp/base-esp32c6 and bsp/base-esp32, and tests/bsp_repository.rs enforces that parity.
+schema_version = 1
+
+[contract]
+name = "esp.base.esp32c6"
+id = "bfec1a2c-f5a4-41aa-aab5-5d9dd663dc08"
+version = "2.0.0"
+language_profile = "lua54-bounded-v1"
+remote_data_profile = "remote-data-v1"
+privileges = ["base.read", "base.reset"]
+
+[contract.limits]
+max_string_bytes = 256
+max_tuple_items = 8
+max_capture_bytes = 512
+max_result_bytes = 512
+max_spawn_depth = 1
+
+[[modules]]
+name = "chip"
+id = 1
+
+[[modules.enums]]
+name = "Model"
+id = 1
+variants = [
+  { name = "esp32", id = 1, symbol = "esp32" },
+  { name = "esp32c6", id = 2, symbol = "esp32c6" },
+]
+
+[[modules.operations]]
+name = "model"
+id = 1
+execution = "sync"
+results = [{ name = "model", type = "enum", ref = "Model" }]
+requires = ["base.read"]
+
+[[modules.operations]]
+name = "revision_major"
+id = 2
+execution = "sync"
+results = [{ name = "major", type = "integer" }]
+requires = ["base.read"]
+
+[[modules.operations]]
+name = "revision_minor"
+id = 3
+execution = "sync"
+results = [{ name = "minor", type = "integer" }]
+requires = ["base.read"]
+
+[[modules.operations]]
+name = "mac"
+id = 4
+execution = "sync"
+results = [{ name = "mac", type = "bytes", max_bytes = 6 }]
+requires = ["base.read"]
+
+[[modules]]
+name = "reset"
+id = 2
+
+[[modules.enums]]
+name = "Reason"
+id = 1
+variants = [
+  { name = "power_on", id = 1, symbol = "power_on" },
+  { name = "software", id = 2, symbol = "software" },
+  { name = "deep_sleep", id = 3, symbol = "deep_sleep" },
+  { name = "watchdog", id = 4, symbol = "watchdog" },
+  { name = "brownout", id = 5, symbol = "brownout" },
+  { name = "unknown", id = 6, symbol = "unknown" },
+]
+
+[[modules.enums]]
+name = "Wakeup"
+id = 2
+variants = [
+  { name = "undefined", id = 1, symbol = "undefined" },
+  { name = "timer", id = 2, symbol = "timer" },
+  { name = "ext0", id = 3, symbol = "ext0" },
+  { name = "ext1", id = 4, symbol = "ext1" },
+  { name = "gpio", id = 5, symbol = "gpio" },
+  { name = "touch", id = 6, symbol = "touch" },
+  { name = "ulp", id = 7, symbol = "ulp" },
+  { name = "uart", id = 8, symbol = "uart" },
+  { name = "other", id = 9, symbol = "other" },
+]
+
+[[modules.operations]]
+name = "reason"
+id = 1
+execution = "sync"
+results = [{ name = "reason", type = "enum", ref = "Reason" }]
+requires = ["base.read"]
+
+[[modules.operations]]
+name = "wakeup"
+id = 2
+execution = "sync"
+results = [{ name = "wakeup", type = "enum", ref = "Wakeup" }]
+requires = ["base.read"]
+
+# Resets the device. The call does not return, so the caller gets no reply and must treat the outcome as uncertain.
+[[modules.operations]]
+name = "restart"
+id = 3
+execution = "sync"
+requires = ["base.reset"]

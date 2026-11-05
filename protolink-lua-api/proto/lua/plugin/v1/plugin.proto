@@ -1,0 +1,75 @@
+syntax = "proto3";
+
+package lua.plugin.v1;
+
+service Bridge {
+  rpc Describe (DescribeRequest) returns (DescribeResponse);
+  rpc Invoke (InvokeRequest) returns (stream InvokeOutcome);
+}
+
+enum ValueKind {
+  VALUE_KIND_UNSPECIFIED = 0;
+  VALUE_KIND_BOOLEAN = 1;
+  VALUE_KIND_INTEGER = 2;
+  VALUE_KIND_FLOAT = 3;
+}
+
+message Nil {}
+
+message Value {
+  oneof kind {
+    Nil nil = 1;
+    bool boolean = 2;
+    sint64 integer = 3;
+    double float = 4;
+  }
+}
+
+message Export {
+  string name = 1;
+  repeated ValueKind arguments = 2;
+}
+
+message Module {
+  string name = 1;
+  uint32 major = 2;
+  uint32 minor = 3;
+  repeated Export exports = 4;
+}
+
+message Limits {
+  uint32 max_arguments = 1;
+  uint32 max_message_bytes = 2;
+}
+
+message DescribeRequest {
+  uint32 protocol = 1;
+}
+
+message DescribeResponse {
+  uint32 protocol = 1;
+  Limits limits = 2;
+  repeated Module modules = 3;
+}
+
+message InvokeRequest {
+  uint32 protocol = 1;
+  uint64 sequence = 2;
+  string module = 3;
+  uint32 major = 4;
+  uint32 minor = 5;
+  string export = 6;
+  repeated Value arguments = 7;
+}
+
+message Failure {
+  uint32 code = 1;
+  uint32 detail = 2;
+}
+
+message InvokeOutcome {
+  oneof outcome {
+    Value result = 1;
+    Failure failure = 2;
+  }
+}

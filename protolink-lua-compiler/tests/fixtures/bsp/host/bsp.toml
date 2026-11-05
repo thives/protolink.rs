@@ -1,0 +1,34 @@
+# Consumer BSP manifest: the central host. It has no native modules and one `remote` child.
+schema_version = 1
+
+[contract]
+name = "example.fixture.host"
+id = "1b0a8e2c-7d4f-4e6a-9c1b-5a2f3e4d6c70"
+version = "1.0.0"
+language_profile = "lua54-bounded-v1"
+remote_data_profile = "remote-data-v1"
+privileges = ["host.execute", "remote.execute"]
+
+[contract.limits]
+max_string_bytes = 256
+max_tuple_items = 8
+max_capture_bytes = 512
+max_result_bytes = 512
+max_spawn_depth = 3
+
+[[imports]]
+alias = "remote"
+path = "../agent/bsp.toml"
+contract_id = "2bdbdeef-600a-46de-82b5-1936195c2d11"
+version = "=2.1.0"
+
+[[child_execution]]
+name = "remote"
+id = 1
+index = 0
+child_contract = "remote"
+intrinsic = "task.spawn.v1"
+requires = ["remote.execute"]
+delegates = ["remote.execute"]
+max_capture_bytes = 512
+max_result_bytes = 512

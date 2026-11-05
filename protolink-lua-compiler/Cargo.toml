@@ -1,0 +1,26 @@
+[package]
+name = "protolink-lua-compiler"
+version = "0.0.1"
+authors = ["Thomas Ivesdal-Tronstad"]
+edition = "2024"
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
+description = "Host-side checker and compiler for the remote regions of a stock Lua 5.4 workflow."
+readme = "README.md"
+
+[lib]
+name = "protolink_lua_compiler"
+crate-type = [ "rlib" ]
+test = true
+doctest = true
+bench = false
+
+[dependencies]
+full_moon = { version = "=3.0.0", default-features = false, features = ["lua54"] }
+protolink-lua-bytecode = { version = "0.0.1", path = "../protolink-lua-bytecode" }
+protolink-lua-plugin-gen = { version = "0.0.1", path = "../protolink-lua-plugin-gen" }
+sha2 = "0.10"
+
+[dev-dependencies]
+protolink-lua-vm = { version = "0.0.1", path = "../protolink-lua-vm" }
+protolink-lua = { version = "0.0.1", path = "../protolink-lua" }

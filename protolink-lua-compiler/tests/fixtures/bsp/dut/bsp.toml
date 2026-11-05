@@ -1,0 +1,49 @@
+# Consumer BSP manifest: the ESP32 DUT, the leaf node that the agent spawns. Its surface is the ESP base chip module
+# (bsp/base-esp32) and nothing else. There is no GPIO, OTA, reset or flash write operation. The contract is the stub's
+# contract: lib/lua_stub generates its node configuration and native table from this file.
+schema_version = 1
+
+[contract]
+name = "example.fixture.remote"
+id = "78240354-a109-42a2-9b91-e0497fbd55d0"
+version = "2.0.0"
+language_profile = "lua54-bounded-v1"
+remote_data_profile = "remote-data-v1"
+privileges = ["remote.execute", "base.read"]
+
+[contract.limits]
+max_string_bytes = 256
+max_tuple_items = 8
+max_capture_bytes = 512
+max_result_bytes = 512
+max_spawn_depth = 1
+
+[[imports]]
+alias = "base"
+path = "../base-esp32/bsp.toml"
+contract_id = "7f60e12e-2e3a-46b3-8235-fec9683e3419"
+version = "=2.0.0"
+
+[[module_imports]]
+alias = "base"
+module = "chip"
+
+[resources]
+max_artifact_bytes = 8192
+max_chunk_bytes = 256
+max_uploads = 2
+max_sessions = 16
+max_executions = 4
+max_answer_bytes = 512
+slice_fuel = 64
+total_fuel = 1000000
+max_frames = 8
+max_objects = 1024
+max_heap_bytes = 32768
+session_idle_ms = 30000
+max_artifacts = 5
+retired_window = 128
+max_child_tasks = 1
+call_timeout_ms = 2000
+cleanup_ms = 5000
+max_request_bytes = 1536

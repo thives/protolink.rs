@@ -16,6 +16,13 @@ on:
           - protolink-grpc-gen
           - protolink-i2c
           - protolink-adaptors
+          - protolink-lua
+          - protolink-lua-api
+          - protolink-lua-bytecode
+          - protolink-lua-compiler
+          - protolink-lua-node
+          - protolink-lua-plugin-gen
+          - protolink-lua-vm
 
 permissions:
   contents: read

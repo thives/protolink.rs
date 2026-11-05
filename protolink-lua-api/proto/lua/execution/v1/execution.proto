@@ -1,0 +1,284 @@
+syntax = "proto3";
+
+package lua.execution.v1;
+
+// The one execution lifecycle used by every node: the agent, the DUT, and the
+// proxy path in front of them. See docs/LUA-DISTRIBUTED-EXECUTION-PLAN.md
+// sections 6 and 7 for the semantics.
+//
+// Protocol failures (unknown epoch, malformed request, unknown execution) are
+// reported as gRPC statuses. Outcomes of Lua execution are carried in fields,
+// so a returned Lua error is never confused with a transport failure.
+service Execution {
+  rpc Describe (DescribeRequest) returns (DescribeResponse);
+  rpc BeginUpload (BeginUploadRequest) returns (BeginUploadResponse);
+  rpc PutChunk (PutChunkRequest) returns (PutChunkResponse);
+  rpc CommitArtifact (CommitArtifactRequest) returns (CommitArtifactResponse);
+  rpc Start (StartRequest) returns (StartResponse);
+  rpc Resume (ResumeRequest) returns (ResumeResponse);
+  rpc QueryOutcome (QueryOutcomeRequest) returns (QueryOutcomeResponse);
+  rpc Status (StatusRequest) returns (StatusResponse);
+  rpc Cancel (CancelRequest) returns (CancelResponse);
+  rpc Release (ReleaseRequest) returns (ReleaseResponse);
+}
+
+// Identifies one call on a link.
+//
+// epoch is the node incarnation reported by Describe. A request with another
+// epoch is stale and is rejected. session_id is chosen by the caller for each
+// upload or execution, is echoed on the response, and must never repeat on the
+// node: draw it at or above session_floor from Describe, and never u64::MAX,
+// which is reserved. sequence orders mutating calls within one session; an
+// identical method and exact encoded request retransmission returns the recorded answer. A session ends with
+// its final call, or when it goes idle.
+message Context {
+  uint64 epoch = 1;
+  uint64 session_id = 2;
+  uint64 sequence = 3;
+}
+
+// Lifecycle of one execution record on the node.
+enum State {
+  STATE_UNSPECIFIED = 0;
+  STATE_READY = 1;
+  STATE_RUNNING = 2;
+  STATE_NATIVE_WAIT = 3;
+  STATE_FUEL_SUSPENDED = 4;
+  STATE_LUA_YIELDED = 5;
+  STATE_CANCELLING = 6;
+  STATE_RETURNED = 7;
+  STATE_FAILED = 8;
+  STATE_RELEASED = 9;
+}
+
+// One Lua value of the remote-data v1 profile. A Value is always present in a
+// tuple, so nil values keep their position and trailing nils are preserved.
+message Value {
+  oneof kind {
+    Nil nil = 1;
+    bool boolean = 2;
+    sint64 integer = 3;
+    double float = 4;
+    bytes bytes = 5;
+  }
+}
+
+message Nil {}
+
+// An ordered tuple. Its arity is the number of values, including nils.
+message Tuple {
+  repeated Value values = 1;
+}
+
+enum FailureCode {
+  FAILURE_CODE_UNSPECIFIED = 0;
+  FAILURE_CODE_RUNTIME_ERROR = 1;
+  FAILURE_CODE_NATIVE_FAILED = 2;
+  FAILURE_CODE_CHILD_UNKNOWN = 3;
+  FAILURE_CODE_CANCELLED = 4;
+  FAILURE_CODE_BUDGET_EXHAUSTED = 5;
+  FAILURE_CODE_CAPACITY = 6;
+}
+
+message Failure {
+  FailureCode code = 1;
+  bytes message = 2;
+}
+
+// The tagged outcome of one resume turn.
+message Outcome {
+  oneof kind {
+    Tuple yielded = 1;
+    Tuple returned = 2;
+    Failure failed = 3;
+  }
+  // Set when this node or a descendant may have performed a side effect whose
+  // result is unknown. A Lua return cannot clear it.
+  bool uncertain = 4;
+}
+
+message DescribeRequest {
+  Context context = 1;
+}
+
+message DescribeResponse {
+  Context context = 1;
+  string contract = 2;
+  uint32 artifact_format = 3;
+  uint32 profile = 4;
+  uint32 max_artifact_bytes = 5;
+  uint32 max_chunk_bytes = 6;
+  uint32 max_tuple_items = 7;
+  uint32 max_string_bytes = 8;
+  uint32 max_executions = 9;
+  bool has_child = 10;
+  // The first session id this node has never seen. A caller that draws its session ids at or above it never reuses one.
+  // u64::MAX is reserved and is never a session id. A floor of u64::MAX means every usable id has been seen, so no new
+  // session can start. Live sessions are still served.
+  uint64 session_floor = 11;
+  // Field 12 was a draft field that was never released.
+  reserved 12;
+  // Revision of the execution semantics the node implements. A caller refuses a node whose revision it does not
+  // implement, before it uploads or starts anything. Revision 2 adds bounded session retirement, dispositions on
+  // Status and Cancel, artifact format 3 and the request size cap. A node that does not set it (revision 0) predates
+  // these semantics. Revision 3 adds method-bound fingerprints, session ownership, receipts, release disposition,
+  // and the advertised session idle timeout. Revision 4 keeps the answers of final calls for replay, in the number of
+  // slots that final_replay_slots states, and makes an active retransmission count as session activity.
+  uint32 protocol_revision = 13;
+  // The lowest session id a new session may use. A first call below it is refused and never runs, whether or not the id
+  // was used before. It only moves up. It is not the next-id suggestion; use session_floor for that.
+  uint64 admission_floor = 14;
+  // Width of the node's retirement window, in session ids. A first call delayed by more than this many newer sessions
+  // may be refused.
+  uint64 retired_window = 15;
+  // Largest request the node accepts, in encoded bytes. A larger request is refused before it is decoded.
+  uint32 max_request_bytes = 16;
+  // Idle timeout of this node's sessions, in milliseconds.
+  uint32 session_idle_ms = 17;
+  // How many final answers the node keeps for replay. The answer of a final call (CommitArtifact that ends its session,
+  // or a successful Release) is replayed to an identical retransmission while it is among the newest this many. Older
+  // final answers are evicted oldest first, and a retransmission of an evicted call is refused and never runs again.
+  uint32 final_replay_slots = 18;
+}
+
+// An upload belongs to the session that opened it. A session holds at most one
+// upload, and the upload's id is meaningful only on that session: PutChunk and
+// CommitArtifact naming an upload that session does not hold are refused as
+// NotFound, with no effect on the caller's session or on the upload.
+//
+// CommitArtifact consumes the upload whatever its result, and ends the session
+// whatever its result. A commit that names no upload of the caller's session
+// changes nothing. A session that goes idle discards its upload.
+//
+// A successful CommitArtifact is a final call. An identical retransmission gets
+// the recorded CommitArtifactResponse back, for as long as the node keeps final
+// answers (DescribeResponse.final_replay_slots). Once that answer is evicted, the
+// retransmission is refused and never runs again.
+message BeginUploadRequest {
+  Context context = 1;
+  bytes digest = 2;
+  uint32 total_length = 3;
+}
+
+message BeginUploadResponse {
+  Context context = 1;
+  uint64 upload_id = 2;
+}
+
+message PutChunkRequest {
+  Context context = 1;
+  uint64 upload_id = 2;
+  uint32 offset = 3;
+  bytes data = 4;
+}
+
+message PutChunkResponse {
+  Context context = 1;
+  uint32 received = 2;
+}
+
+message CommitArtifactRequest {
+  Context context = 1;
+  uint64 upload_id = 2;
+}
+
+message CommitArtifactResponse {
+  Context context = 1;
+  bytes digest = 2;
+}
+
+message StartRequest {
+  Context context = 1;
+  bytes digest = 2;
+  uint32 entry = 3;
+  Tuple captures = 4;
+  Tuple arguments = 5;
+  // Absolute lease of the execution, in milliseconds of the node's clock from the Start. When it passes, the node
+  // cancels the execution. Reads and other calls do not extend it. Zero means no lease.
+  uint32 lease_ms = 6;
+}
+
+message StartResponse {
+  Context context = 1;
+  uint64 execution_id = 2;
+  State state = 3;
+}
+
+message ResumeRequest {
+  Context context = 1;
+  uint64 execution_id = 2;
+  uint32 turn = 3;
+  Tuple values = 4;
+}
+
+message ResumeResponse {
+  Context context = 1;
+  bool accepted = 2;
+  State state = 3;
+}
+
+message QueryOutcomeRequest {
+  Context context = 1;
+  uint64 execution_id = 2;
+  uint32 turn = 3;
+}
+
+// Last committed mutation of the live execution session. The fingerprint is
+// SHA-256 over the revision-3 domain, method identifier and exact request bytes.
+message MutationReceipt {
+  uint64 sequence = 1;
+  bytes fingerprint = 2;
+}
+
+message QueryOutcomeResponse {
+  Context context = 1;
+  State state = 2;
+  bool available = 3;
+  Outcome outcome = 4;
+  // The record's disposition when the reply was made, whether or not an outcome is available. It never goes from true
+  // back to false.
+  bool uncertain = 5;
+  MutationReceipt last_mutation = 6;
+}
+
+message StatusRequest {
+  Context context = 1;
+  uint64 execution_id = 2;
+}
+
+message StatusResponse {
+  Context context = 1;
+  State state = 2;
+  uint32 turn = 3;
+  // The record's disposition. See QueryOutcomeResponse.uncertain.
+  bool uncertain = 4;
+  MutationReceipt last_mutation = 5;
+}
+
+message CancelRequest {
+  Context context = 1;
+  uint64 execution_id = 2;
+}
+
+// Cancel starts cancellation. STATE_CANCELLING means cleanup is still running; the caller observes the terminal state
+// with QueryOutcome or Status. An acknowledgement is not proof that the work stopped.
+message CancelResponse {
+  Context context = 1;
+  State state = 2;
+  // The record's disposition. See QueryOutcomeResponse.uncertain.
+  bool uncertain = 3;
+}
+
+// A successful Release is a final call, replayed like CommitArtifact. Release
+// that the node refuses, because the execution is not finished, keeps its session.
+message ReleaseRequest {
+  Context context = 1;
+  uint64 execution_id = 2;
+}
+
+message ReleaseResponse {
+  Context context = 1;
+  bool released = 2;
+  // Terminal disposition captured before disposal. Trust only after revision 3 negotiation.
+  bool uncertain = 3;
+}

@@ -462,3 +462,183 @@ docs for when to use it, its caveats, and a usage example.
 `protolink_adaptors::uart` is the buffered UART factory over this pump: it adds the `with_storage` /
 `build` vocabulary and buffer defaults, not a second buffer. The UART contract, including flush
 meanings for each layer, is in [docs/UART.md](docs/UART.md).
+
+# lua
+
+Shared Lua crates for remote execution nodes, and the host-side compiler and generator for them. The legacy `lua` and
+`lua_plugin_grpc` crates were removed on 2026-11-03.
+
+**Status (2026-11-04): release hardening implemented and verified on the host.** The contracts, admission, ledger,
+lifecycle and VM changes, the packaging of all seven crates, and the support policy are in place. Hardware integration and
+publication are still open gates. See `docs/LUA-RELEASE-CONTRACTS.md` for what the crates promise, and
+`docs/LUA-RELEASE-READINESS-2026-11-04.md` for the verified guarantees, the known limitations and the open gates. Neither
+document is in this repository yet.
+
+## Versions and compatibility
+
+| Item | Value | Meaning |
+| --- | --- | --- |
+| Crates | `0.0.1`, all seven | Unpublished. The owner publishes them. |
+| Artifact format | **4** | Canonical encoding of an artifact. Unchanged by this release. |
+| Instruction ABI | **3** | The VM's instruction set and native ABI. Unchanged by this release. |
+| Language profile | **1** | The Lua 5.4 subset the remote profile accepts. Unchanged by this release. |
+| Protocol revision | **4** | `lua.execution.v1` semantics, negotiated in `Describe`. Raised by this release. |
+
+**Recompilation.** This release does not change the artifact format or ABI, so an artifact compiled for the same contract is
+still admitted. The node configuration changed: each node carries its contract's native operation table, so every
+deployment regenerates its node configuration. A protocol revision 3 node is refused by a revision 4 caller, and the reverse, so
+nodes and callers move together. See `docs/LUA-RELEASE-CONTRACTS.md`, section 6.
+
+## Support policy
+
+| Question | Answer | Evidence |
+| --- | --- | --- |
+| Minimum supported Rust | **1.89** (`rust-version` in every manifest) | Every test target compiles on 1.89. Rust 1.88 fails on `smol_str` 0.3.7, which `full_moon` depends on. CI job `msrv` |
+| Edition | 2024 | All crates |
+| Toolchain for development | the pinned nightly in `rust-toolchain.toml`, with `rust-src` and the riscv32 target | CI and local runs use the same file |
+| Host operating system | Linux x86_64 | All tests, the package check and the consumers run here and in CI |
+| Embedded target | `riscv32imac-unknown-none-elf`, compile checks only | The `no_std` crates and consumers of them. No binary runs on hardware |
+| Xtensa and ESP targets | Not checked by this workspace | Not built or checked here |
+| Hardware validation | **None** in this release | Allocator, stack and timing measurements on each board are open gates |
+| Publication | Manual, by the owner, after the checks pass | The package check verifies every archive as a registry consumer sees it |
+
+## Using the crates
+
+The crates are unpublished at version `0.0.1`. After the owner publishes them, depend on them by version:
+
+```toml
+[dependencies]
+protolink-lua-api = { version = "0.0.1", features = ["execution"] }   # the wire schema only
+protolink-lua-node = "0.0.1"                                          # one execution node
+protolink-lua-compiler = "0.0.1"                                      # host-side compiler
+```
+
+Inside this repository, depend on the paths and keep the same version requirement, so the manifests stay valid when they
+are published:
+
+```toml
+protolink-lua-node = { version = "0.0.1", path = "../../protolink-lua-node" }
+```
+
+`protolink-lua-api` owns both schemas, so no other directory has to sit beside it. A consumer that uses the `plugin` feature
+also needs `protolink` `=0.0.5`, which its manifest already pins.
+
+### Publication order
+
+A crate is published after every sibling it depends on, including its dev-dependencies, because the archive's own tests
+need them:
+
+1. `protolink-lua-api`
+2. `protolink-lua`
+3. `protolink-lua-bytecode`
+4. `protolink-lua-plugin-gen`
+5. `protolink-lua-vm`
+6. `protolink-lua-compiler`
+7. `protolink-lua-node`
+
+`scripts/package-check.sh` follows this order. It stages each archive before the next crate is packaged, and it checks that
+each archive contains its licences, README and schemas, and no relative path in its manifest. The generator's BSP test reads
+a tree outside its crate, so it is excluded from its archive. The compiler and node tests read copies of one BSP tree under
+`tests/fixtures/bsp`, and the script fails when the two copies differ.
+
+### Working here
+
+The Lua crates are members of the root workspace, so these commands run from the repository root and also cover the other
+crates.
+
+```sh
+cargo test  --locked --workspace --features protolink-lua-api/plugin
+cargo clippy --locked --workspace --all-targets --features protolink-lua-api/plugin -- -D warnings
+cargo fmt --all -- --check
+cargo check --locked -p protolink-lua -p protolink-lua-bytecode -p protolink-lua-vm -p protolink-lua-node --target riscv32imac-unknown-none-elf
+cargo tree --locked -e normal,features -p protolink-lua-node --target riscv32imac-unknown-none-elf | grep 'feature "std"'   # must print nothing
+sh scripts/package-check.sh   # vendors the locked dependencies: needs network the first time
+```
+
+The `cargo tree` audit uses `-e normal,features`: the protobuf generators are build dependencies that run on the host,
+so their `std` features do not reach the target.
+
+Where the regressions live:
+
+| Area | Tests |
+| --- | --- |
+| Admission: native table, depth, in-memory limits, canonical children | `protolink-lua-bytecode/src/tests.rs` |
+| Admission of a forged or mismatched reference, before any provider starts | `protolink-lua-node/src/tests/remediation.rs` |
+| Ledger: exclusive reservations, stale records, final-answer table and eviction | `protolink-lua/src/ledger.rs` (`finals` module) |
+| Lost commit and release replies, uncertain orphans, discard, child retention | `protolink-lua-node/src/tests/remediation.rs`, `review.rs` |
+| Concatenation: golden values including floats, measured allocation, fault injection, closures, protected calls | `protolink-lua-vm/src/tests.rs`, `src/number.rs`, `tests/allocation.rs` |
+| Nested-artifact verification: heap linear in size, flat stack, tree-order errors | `protolink-lua-bytecode/tests/resources.rs`, `src/tests.rs` |
+| Quarantine and explicit recovery of lost children, discard during cleanup | `protolink-lua-node/src/tests/review.rs`, `remediation.rs` |
+
+Nothing here needs `protoc`.
+
+
+
+| Crate | Purpose | Targets |
+| --- | --- | --- |
+| [`protolink-lua-api`](protolink-lua-api) | Canonical `lua.execution.v1` and `lua.plugin.v1` schemas, with their generated bindings behind the `execution` and `plugin` features. | `no_std` + `alloc` |
+| [`protolink-lua`](protolink-lua) | Execution protocol core: values and tuples, outcomes and dispositions, the session ledger with its bounded retirement window, pre-decode frame checks, and the poll-based child client. | `no_std` + `alloc` |
+| [`protolink-lua-bytecode`](protolink-lua-bytecode) | Artifact format 4 and instruction ABI 3: canonical encoding, bounded decoding and verification, and `admit`, the one admission check that the compiler and every node run. Admission also checks every native reference against the destination's operation table. | `no_std` + `alloc` |
+| [`protolink-lua-vm`](protolink-lua-vm) | The reduced VM shared by both remote nodes: bounded arena without GC, fuel, single-value native ABI, and checks before copying at the boundary. | `no_std` + `alloc` |
+| [`protolink-lua-node`](protolink-lua-node) | One execution node: the lifecycle, upload, artifact store, poll-driven natives and child links, and descendant cleanup. | `no_std` + `alloc`; checked for `riscv32imac-unknown-none-elf` |
+| [`protolink-lua-plugin-gen`](protolink-lua-plugin-gen) | Resolves BSP manifests and profiles, writes `bsp.lock`, and generates the bindings. | host |
+| [`protolink-lua-compiler`](protolink-lua-compiler) | Host-only checker and compiler for the remote regions of a stock Lua workflow. | host |
+
+## Layout and dependency direction
+
+```mermaid
+flowchart TD
+    API[protolink-lua-api<br/>proto/ holds the only copy of both schemas] --> PL[protolink-lua<br/>protocol core]
+    PL --> VM[protolink-lua-vm]
+    BC[protolink-lua-bytecode] --> VM
+    VM --> NODE[protolink-lua-node]
+    PL --> NODE
+    BC --> NODE
+    VM --> COMP[protolink-lua-compiler]
+    BC --> COMP
+    GEN[protolink-lua-plugin-gen] --> COMP
+    PL --> COMP
+```
+
+Dependencies point one way: consumers depend on the crates above, and those crates know nothing about any consumer. Anything
+that needs a consumer's code lives with the consumer:
+
+- The protobuf schemas are `protolink-lua-api/proto/lua/{execution,plugin}/v1/*.proto`. The `protolink-lua-api` build script
+  reads them from inside its own directory, so no `proto/` directory beside the crates is required.
+
+## Crate names
+
+Six packages were renamed on 2026-11-03. The directory and the Cargo package use the hyphenated name. Rust code uses the
+underscore identifier. For the last two rows the identifier did not change, because those crates keep their `[lib]` names:
+
+| Previous directory and package | Current directory and package | Rust identifier |
+|---|---|---|
+| `lua_bytecode` | `protolink-lua-bytecode` | `protolink_lua_bytecode` (was `lua_bytecode`) |
+| `lua_compiler` | `protolink-lua-compiler` | `protolink_lua_compiler` (was `lua_compiler`) |
+| `lua_node` | `protolink-lua-node` | `protolink_lua_node` (was `lua_node`) |
+| `lua_vm` | `protolink-lua-vm` | `protolink_lua_vm` (was `lua_vm`) |
+| `protolink_lua` | `protolink-lua` | `protolink_lua` (unchanged) |
+| `protolink_lua_plugin_gen` | `protolink-lua-plugin-gen` | `protolink_lua_plugin_gen` (unchanged) |
+
+Dependencies follow the same mapping: `lua_vm = { path = "../lua_vm" }` becomes `protolink-lua-vm = { path = "../protolink-lua-vm" }`,
+and `use lua_vm::VmLimits;` becomes `use protolink_lua_vm::VmLimits;`. `protolink-lua-api` is unchanged. The legacy `lua` and `lua_plugin_grpc`
+crates were removed on 2026-11-03. The full record, with the reasons and the verification, is in `docs/LUA-CRATE-RENAME.md`.
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option. Each member crate carries a copy of both license files, so a published package contains them.
+
+Licence and package-check state:
+
+- The seven Lua crates at the repository root declare `MIT OR Apache-2.0` and each carries both licence files. `scripts/package-check.sh`
+  fails when an archive is missing either licence, its README, or the schema or fixture files its own tests read, and when
+  its packaged manifest still names a relative path dependency.
+- The crates it packages are the ones the BSP fixtures allow: the compiler's and the node's archives carry a copy of the BSP
+  tree under `tests/fixtures/bsp`, and the script fails if the two copies differ or if the fixture tree contains anything but
+  TOML, Markdown and the lock file, a link, or a copyright, licence or confidentiality notice. Whether the author may license
+  that material is the owner's confirmation, not something a check can decide.

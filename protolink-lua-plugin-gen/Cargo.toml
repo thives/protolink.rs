@@ -1,0 +1,28 @@
+[package]
+name = "protolink-lua-plugin-gen"
+version = "0.0.1"
+authors = ["Thomas Ivesdal-Tronstad"]
+edition = "2024"
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+description = "Host-only generator for Lua plugin capability contracts."
+# The BSP tests read the compiler's fixture tree, which is outside this crate, so they stay out of the archive.
+exclude = ["/tests/bsp_repository.rs"]
+
+[lib]
+name = "protolink_lua_plugin_gen"
+crate-type = [ "rlib" ]
+test = true
+doctest = true
+bench = false
+
+[[bin]]
+name = "protolink-lua-plugin-gen"
+path = "src/bin/protolink-lua-plugin-gen.rs"
+
+[dependencies]
+protolink-lua-bytecode = { version = "0.0.1", path = "../protolink-lua-bytecode" }
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+sha2 = "0.10"

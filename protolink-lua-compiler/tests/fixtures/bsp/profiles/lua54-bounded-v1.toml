@@ -1,0 +1,42 @@
+# Consumer-owned language profile input for protolink-lua-plugin-gen.
+# Each feature names one syntactic or semantic construct the remote checker allows. Anything not listed is rejected in
+# remote regions. This profile lists the implemented subset of lua54-bounded-v1 (docs/LUA-IMPLEMENTATION-STATUS.md).
+schema_version = 1
+name = "lua54-bounded-v1"
+version = "1.0.0"
+
+[features]
+allowed = [
+    "local_assignment",
+    "assignment",
+    "local_function",
+    "function_literal",
+    "call",
+    "method_call_await",
+    "native_call",
+    "spawn",
+    "pcall",
+    "coroutine_yield",
+    "error_call",
+    "if",
+    "while",
+    "numeric_for",
+    "break",
+    "return",
+    "arithmetic",
+    "comparison",
+    "logic",
+    "concat",
+    "length",
+    "string_literal",
+    "number_literal",
+    "boolean_literal",
+    "nil_literal",
+    "enum_symbol",
+]
+
+# The remote VM carries one value back from a native call, or none. An operation that declares more results is refused
+# when its contract is resolved, so generated adapters never meet a signature the VM cannot carry.
+[native_abi]
+name = "single-value-v1"
+max_results = 1
